@@ -4,7 +4,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
 import pandas as pd
 import redis
@@ -53,19 +53,19 @@ class OrderStatus(Enum):
 class Order:
     def __init__(
         self,
-        long_symbol: str = None,
-        order_type: str = None,
-        price_type: str = None,
-        quantity: int = None,
-        exchange: str = None,
-        exchange_segment: Optional[str] = None,
+        long_symbol: str = "",
+        order_type: str = "",
+        price_type: float = 0.0,
+        quantity: int = 0,
+        exchange: str = "",
+        exchange_segment: str = "",
         price: float = float("nan"),
-        is_intraday: Optional[bool] = None,
-        internal_order_id: str = None,
+        is_intraday: bool = True,
+        internal_order_id: str = "",
         remote_order_id: str = "",
-        scrip_code: Optional[int] = None,
-        exch_order_id: Optional[str] = "0",
-        broker_order_id: Optional[str] = "0",
+        scrip_code: int = 0,
+        exch_order_id: str = "0",
+        broker_order_id: str = "0",
         stoploss_price: float = 0.0,
         is_stoploss_order: bool = False,
         ioc_order: bool = False,
@@ -73,14 +73,14 @@ class Order:
         orderRef: str = "",
         order_id: int = 0,
         local_order_id: int = 0,
-        disqty: Optional[int] = None,
+        disqty: int = 0,
         message: str = "",
         status: str = "UNDEFINED",
         vtd: str = f"/Date({NEXT_DAY_TIMESTAMP})/",
         ahplaced: str = "N",
         IsGTCOrder: bool = False,
         IsEOSOrder: bool = False,
-        paper: Optional[bool] = None,
+        paper: bool = True,
         broker: str = "UNDEFINED",
         additional_info: str = "",
         **kwargs: Any,
@@ -145,14 +145,14 @@ class Order:
         except KeyError:
             return Brokers.UNDEFINED
 
-    def _convert_to_int(self, value: Any) -> Optional[int]:
+    def _convert_to_int(self, value: Any) -> int:
         """
         Convert a value to an integer if possible, otherwise return None.
         """
         try:
             return int(float(value))
         except (TypeError, ValueError):
-            return None
+            return 0
 
     def _convert_to_float(self, value: Any) -> float:
         """
@@ -187,13 +187,13 @@ class Price:
         self,
         bid: float = float("nan"),
         ask: float = float("nan"),
-        bid_volume: int = float("nan"),
-        ask_volume: int = float("nan"),
+        bid_volume: int = 0,
+        ask_volume: int = 0,
         prior_close: float = float("nan"),
         last: float = float("nan"),
         high: float = float("nan"),
         low: float = float("nan"),
-        volume: int = float("nan"),
+        volume: int = 0,
         symbol: str = "",
         exchange: str = "",
         src: str = "",
@@ -269,13 +269,13 @@ class Price:
         return cls(
             bid=data.get("bid", float("nan")),
             ask=data.get("ask", float("nan")),
-            bid_volume=data.get("bid_volume", float("nan")),
-            ask_volume=data.get("ask_volume", float("nan")),
+            bid_volume=data.get("bid_volume", 0),
+            ask_volume=data.get("ask_volume", 0),
             prior_close=data.get("prior_close", float("nan")),
             last=data.get("last", float("nan")),
             high=data.get("high", float("nan")),
             low=data.get("low", float("nan")),
-            volume=data.get("volume", float("nan")),
+            volume=data.get("volume", 0),
             symbol=data.get("symbol", ""),
             exchange=data.get("exchange", ""),
             src=data.get("src", ""),
@@ -304,8 +304,8 @@ class Position:
 class OrderInfo:
     def __init__(
         self,
-        order_size: int = None,
-        order_price: float = None,
+        order_size: int = 0,
+        order_price: float = float("nan"),
         fill_size: int = 0,
         fill_price: float = 0,
         status: OrderStatus = OrderStatus.UNDEFINED,
@@ -342,12 +342,6 @@ class BrokerBase(ABC):
     @abstractmethod
     def __init__(self, **kwargs):
         self.broker = Brokers.UNDEFINED
-        # self.symbol_map = {}
-        # self.contractsize_map = {}
-        # self.exchange_map = {}
-        # self.exchangetype_map = {}
-        # self.contracttick_map = {}
-        # self.symbol_map_reversed = {}
         self.starting_order_ids_int = {}
         self.redis_o = redis.Redis(db=0, charset="utf-8", decode_responses=True)
         self.exchange_mappings = {
@@ -392,21 +386,29 @@ class BrokerBase(ABC):
         pass
 
     @abstractmethod
-    def get_historical(self, **kwargs) -> Dict[str, List[HistoricalData]]:
+    def get_historical(
+        self,
+        symbols: Union[str, pd.DataFrame, dict],
+        date_start: str,
+        date_end: str = dt.datetime.today().strftime("%Y-%m-%d"),
+        exchange: str = "N",
+        periodicity: str = "1m",
+        market_close_time: str = "15:30:00",
+    ) -> Dict[str, List[HistoricalData]]:
         pass
 
     @abstractmethod
-    def map_exchange_for_api(self, **kwargs) -> str:
+    def map_exchange_for_api(self, long_symbol, exchange) -> str:
         """maps exchange to exchange code needed by broker API."""
         pass
 
     @abstractmethod
-    def map_exchange_for_db(self, **kwargs) -> str:
+    def map_exchange_for_db(self, long_symbol, exchange) -> str:
         """maps exchange to NSE or BSE or MCX. The long form exchange name."""
         pass
 
     @abstractmethod
-    def get_quote(self, **kwargs) -> Price:
+    def get_quote(self, long_symbol: str, exchange="NSE") -> Price:
         pass
 
     @abstractmethod
@@ -426,5 +428,5 @@ class BrokerBase(ABC):
         pass
 
     @abstractmethod
-    def get_min_lot_size(self, long_symbol: str) -> int:
+    def get_min_lot_size(self, long_symbol: str, exchange: str) -> int:
         pass

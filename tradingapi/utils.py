@@ -4,22 +4,19 @@ import json
 import logging
 import math
 import os
-import random
 import re
+import secrets
 import sys
 import time
 import traceback
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import asdict, dataclass
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
 import redis
-from chameli.dateutils import (advance_by_biz_days, business_days_between,
-                               calc_fractional_business_days, get_expiry,
-                               is_business_day, valid_datetime)
+from chameli.dateutils import calc_fractional_business_days, valid_datetime
 from chameli.europeanoptions import BlackScholesDelta, BlackScholesIV
 from requests import Session
 from selenium import webdriver
@@ -28,10 +25,8 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from tradingapi2.broker_base import (BrokerBase, Brokers, HistoricalData,
-                                     Order, OrderInfo, OrderStatus, Position,
-                                     Price)
-
+from .broker_base import (BrokerBase, HistoricalData, Order, OrderInfo,
+                          OrderStatus, Position, Price)
 from .config import get_config
 
 logger = logging.getLogger(__name__)
@@ -101,9 +96,9 @@ def get_all_strategy_names(redis_db) -> set:
     return out
 
 
-def set_starting_internal_ids_int(redis_db) -> None:
+def set_starting_internal_ids_int(redis_db) -> dict:
     """Sets the internal_ids for each strategy. New orders start from the values defined by this function"""
-    out = {}
+    out: dict[str, int] = {}
     strategies = get_all_strategy_names(redis_db)
     for s in strategies:
         for key in redis_db.scan_iter(s + "_" + "*"):
@@ -221,9 +216,9 @@ def get_pnl_table(
             exit_time = ""
         additional_info = _merge_additional_info(additional_info_entry, additional_info_exit)
         entry_quantity = 0
-        entry_price = 0
+        entry_price: float = 0.0
         exit_quantity = 0
-        exit_price = 0
+        exit_price: float = 0.0
         commission = 0
         if refresh_status:
             for entry_key in entry_keys:
@@ -235,7 +230,7 @@ def get_pnl_table(
         position_combo_info = calculate_extra_combo_positions(entry_position, base_position)
         entry_quantity = position_combo_info.get("total_in_progress", 0)
         entry_price = (
-            sum(position.value for position in entry_position.values()) / entry_quantity if entry_quantity != 0 else 0
+            sum(position.value for position in entry_position.values()) / entry_quantity if entry_quantity != 0 else 0.0
         )
 
         if refresh_status:
@@ -328,9 +323,6 @@ def contains_earlier_date(input_string: str, comparison_date: str, market_close_
             return date_obj < comparison_date_obj
         else:
             return date_obj <= comparison_date_obj
-
-    # List to store all matching dates
-    matching_dates = []
 
     for pattern in date_patterns:
         # Find all substrings that match the pattern
@@ -432,7 +424,6 @@ def get_open_position_by_order(
             exchange = hget_with_default(broker, entry_key, "exchange", "NSE")
             exit_price = broker.get_quote(symbol, exchange).last
             exit_quantity = abs(size)
-            exit_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             sq_off_order = Order(
                 order_type="SELL" if size > 0 else "COVER",
                 quantity=exit_quantity,
@@ -442,9 +433,11 @@ def get_open_position_by_order(
                 price=exit_price,
                 ahplaced="N",
             )
-            sq_off_order.exch_order_id = str(random.randint(1000000000000000, 9000000000000000)) + "P"
+            sq_off_order.exch_order_id = (
+                str(secrets.randbelow(9000000000000000 - 1000000000000000) + 1000000000000000) + "P"
+            )
             sq_off_order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
-            sq_off_order.broker_order_id = str(random.randint(10000000, 99999999)) + "P"
+            sq_off_order.broker_order_id = str(secrets.randbelow(90000000) + 10000000) + "P"
             sq_off_order.orderRef = internal_order_id
             sq_off_order.internal_order_id = internal_order_id
             sq_off_order.message = "Expiration Paper Order"
@@ -531,7 +524,7 @@ def get_limit_price(
     price_type=None,
     order_type=None,
     symbol=None,
-    price_broker: List[BrokerBase] = None,
+    price_broker: Optional[List[BrokerBase]] = None,
     exchange="NSE",
     mds=False,
 ):
@@ -623,10 +616,11 @@ def get_combo_sub_order_type(order: Order, sub_order_qty: int) -> str:
             return "COVER"
         else:
             return "SELL"
+    return "UNDEFINED"
 
 
 def transmit_entry_order(
-    broker: BrokerBase, strategy: str, order: Order, paper: bool = True, price_broker: List[BrokerBase] = None
+    broker: BrokerBase, strategy: str, order: Order, paper: bool = True, price_broker: Optional[List[BrokerBase]] = None
 ) -> Union[str, None]:
     """Entry order sent to broker
 
@@ -654,7 +648,6 @@ def transmit_entry_order(
     order.paper = paper
 
     if "?" in order.long_symbol:
-        combo_order = True
         combo_symbols = parse_combo_symbol(order.long_symbol)
         symbols = list(combo_symbols.keys())
         quantities = [
@@ -671,7 +664,7 @@ def transmit_entry_order(
         price_types = [order.price_type]
         additional_infos = [order.additional_info]
     symbols, quantities, price_types, additional_infos = _sort_list(symbols, quantities, price_types, additional_infos)
-    out = None
+    int_order_id = ""
     for symbol, quantity, price_type, additional_info in zip(symbols, quantities, price_types, additional_infos):
         temp_order = deepcopy(order)
         temp_order.order_type = get_combo_sub_order_type(order, quantity)
@@ -687,8 +680,8 @@ def transmit_entry_order(
         )
         temp_order.price = lmt_price
         out = broker.place_order(temp_order)
-        out = _process_broker_order_update(broker, out, order.long_symbol)
-    return out
+        int_order_id = _process_broker_order_update(broker, out, order.long_symbol)
+    return int_order_id
 
 
 def transmit_exit_order(
@@ -697,8 +690,8 @@ def transmit_exit_order(
     order: Order,
     validate_db_position=True,
     paper=True,
-    price_broker: List[BrokerBase] = None,
-    int_order_id: str = None,
+    price_broker: Optional[List[BrokerBase]] = None,
+    int_order_id: str = "",
 ) -> None:
     """Exit order sent to broker
 
@@ -863,13 +856,13 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
         str: internal order id
     """
     if order is None:
-        logger.error(f"Order Not placed for {order.long_symbol}. Mother symbol: {long_symbol}. Are you logged in??")
-        return None
+        logger.error(f"Order Not placed as None was received. Mother symbol: {long_symbol}. Are you logged in??")
+        return ""
     if order.status in [OrderStatus.REJECTED]:
         logger.error(
             f"Order not placed for {order.long_symbol}. Status was {order.status}. Message was {order.message}. Mother symbol was: {long_symbol}"
         )
-        return None
+        return ""
 
     if order.order_type in ["BUY", "SHORT"]:
         current_orders = broker.redis_o.hget(order.internal_order_id, "entry_keys")
@@ -914,7 +907,7 @@ def exit_is_expiration(broker: BrokerBase, internal_order_id: str) -> bool:
 def delete_broker_order_id(
     broker,
     internal_order_id: str,
-    broker_order_id: str = None,
+    broker_order_id: str = "0",
 ):
     """Safely removes broker_order_id from redis and updates internal_order_id with keys
 
@@ -922,7 +915,7 @@ def delete_broker_order_id(
         internal_order_id (str): internal  order id
         broker_order_id (str): broker order id
     """
-    if broker_order_id is None:
+    if broker_order_id == "0":
         logger.info(f"Deleting internal order id: {internal_order_id} and linked broker order ids")
         order_mapping = broker.redis_o.hgetall(internal_order_id)
         entry_keys = order_mapping.get("entry_keys")
@@ -1051,7 +1044,7 @@ def update_order_status(
     return fills
 
 
-def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = None, exchange: str = "NSE") -> list[str]:
+def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = "", exchange: str = "NSE") -> list[str]:
     """Get option chain
 
     Args:
@@ -1067,7 +1060,7 @@ def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = None,
     symbols = list(broker.exchange_mappings[exchange]["symbol_map"].keys())
     short_symbol = symbol_name.split("_")[0]
     linked_options = []
-    if expiry is not None:
+    if expiry:
         expiry, _ = valid_datetime(expiry, "%Y%m%d")
         symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_{expiry}")]
     else:
@@ -1076,7 +1069,7 @@ def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = None,
     return linked_options
 
 
-def get_linked_futures(symbol_name: str, expiry: str = None, file_path: str = None) -> list[str]:
+def get_linked_futures(symbol_name: str, expiry: str = "", file_path: str = "") -> list[str]:
     """Get futures chain
 
     Args:
@@ -1087,13 +1080,13 @@ def get_linked_futures(symbol_name: str, expiry: str = None, file_path: str = No
     Returns:
         list[str]: List containing longnames of available option symbols
     """
-    if file_path is not None:
+    if file_path:
         symbols = pd.read_csv(file_path)
     else:
         return []
     short_symbol = symbol_name.split("_")[0]
     linked_futures = []
-    if expiry is not None:
+    if expiry:
         symbols = symbols.loc[symbols["long_symbol"].str.contains(f"\\b{short_symbol}_FUT_{expiry}"), "long_symbol"]
     else:
         symbols = symbols.loc[symbols["long_symbol"].str.contains(f"\\b{short_symbol}_FUT_"), "long_symbol"]
@@ -1110,11 +1103,11 @@ def get_latest_symbol_file(directory_path="/home/psharma/onedrive/rfiles/data/st
     return latest_file
 
 
-def get_universe(file_path: str = None, product_types=["OPT", "FUT"], exchanges=["N", "B"], expiry=None):
+def get_universe(file_path: str = "", product_types=["OPT", "FUT"], exchanges=["N", "B"], expiry=None):
     """Get list of all symbols for a given product type and exchange
 
     Args:
-        file_path (str, optional): _description_. Defaults to None.
+        file_path (str, optional): _description_. Defaults to empty string.
         product_types (list, optional): _description_. Defaults to ["OPT", "FUT"].
         exchanges (list, optional): _description_. Defaults to ["N", "B"].
         expiry (str, optional): expiry formatted as yyyymmdd
@@ -1122,10 +1115,10 @@ def get_universe(file_path: str = None, product_types=["OPT", "FUT"], exchanges=
     Returns:
         list: list of long names
     """
-    if file_path is None:
+    if file_path:
         file_path = get_latest_symbol_file()
     symbols = pd.read_csv(file_path)
-    out = []
+    out: List[str] = []
 
     for exchange in exchanges:
         for prod_type in product_types:
@@ -1141,17 +1134,21 @@ def get_universe(file_path: str = None, product_types=["OPT", "FUT"], exchanges=
     return out
 
 
-def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str = None) -> list[str]:
-    """Get a list of all short symbol names for a specified exchange and security type
+def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str = "") -> list[str]:
+    """Get a list of all short symbol names for a specified exchange and security type.
 
     Args:
-        exchange (str): Exchange name. Either 'N' for NSE or 'M' for MCX
-        sec_type (str): security type like 'IND",'STK','FUT','OPT'
-        file_path (str, optional): path to symbols file if historical information needed. Defaults to None.
+        exchange (str): Exchange name. Either 'N' for NSE or 'M' for MCX.
+        sec_type (str): Security type like 'IND', 'STK', 'FUT', 'OPT'.
+        file_path (str, optional): Path to symbols file. Defaults to an empty string.
 
     Returns:
-        list[str]: list of short symbol names
+        list[str]: List of short symbol names.
     """
+    if not file_path:
+        logger.error("File path is empty. Please provide a valid file path.")
+        return []
+
     if os.path.isdir(file_path):
         # Get list of files in directory sorted by modification time in descending order
         files = sorted(os.listdir(file_path), reverse=True)
@@ -1160,21 +1157,27 @@ def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str =
             first_file = files[0]
             symbols = pd.read_csv(os.path.join(file_path, first_file))
         else:
+            logger.error("No files found in the specified directory.")
             return []
     elif os.path.isfile(file_path):
         # Read CSV from the given file
         symbols = pd.read_csv(file_path)
     else:
+        logger.error("Invalid file path provided.")
         return []
 
-    unique_short_names = []
-    symbols = symbols[(symbols.Exch == exchange) & (symbols.long_symbol.str.contains(f"_{sec_type}"))]
-    short_name = symbols["long_symbol"].str.split("_").str[0]
-    unique_short_names = list(short_name.unique())
-    return unique_short_names
+    # Ensure required columns exist
+    if "Exch" not in symbols.columns or "long_symbol" not in symbols.columns:
+        logger.error("Missing required columns 'Exch' or 'long_symbol' in the symbols file.")
+        return []
+
+    # Filter and extract unique short names
+    filtered_symbols = symbols[(symbols.Exch == exchange) & (symbols.long_symbol.str.contains(f"_{sec_type}"))]
+    short_names = filtered_symbols["long_symbol"].str.split("_").str[0].unique()
+    return list(short_names)
 
 
-def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = None, exchange="NSE") -> int:
+def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = "", exchange="NSE") -> int:
     """Get margin from Zerodha for option contracts
 
     Args:
@@ -1193,7 +1196,7 @@ def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = None, 
     BASE_URL = "https://zerodha.com/margin-calculator/SPAN"
     scrip = symbol + dt.datetime.strptime(expiry, "%Y%m%d").strftime("%y%b").upper()
     z_option_type = "CE" if option_type == "CALL" else "PE"
-    strike_price = ("%f" % strike_price).rstrip("0").rstrip(".")
+    strike_price_str = ("%f" % strike_price).rstrip("0").rstrip(".")
     #     long_symbol = f'{symbol}_OPT_{expiry}_{option_type}_{strike_price}'
     quantity = broker.get_min_lot_size(long_symbol, exchange)
     payload = {
@@ -1202,13 +1205,13 @@ def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = None, 
         "product[]": "OPT",
         "scrip[]": scrip,
         "option_type[]": z_option_type,
-        "strike_price[]": strike_price,
+        "strike_price[]": strike_price_str,
         "qty[]": quantity,
         "trade[]": "sell",
     }
     try:
         session = Session()
-        if proxy is not None:
+        if proxy:
             proxies = {"http": "https://" + proxy}
             res = session.post(BASE_URL, data=payload, proxies=proxies)
         else:
@@ -1222,11 +1225,12 @@ def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = None, 
         logger.info(f"margin for {long_symbol}:{output}")
         session.close()
         return output
-    except Exception as e:
+    except Exception:
         logger.exception("Error")
+        return 1000000
 
 
-def get_margin_samco(long_symbol: str, driver_path: str = None, proxy: str = None) -> int:
+def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: str = "") -> int:
     """Get margin from SAMCO for option contracts
 
     Args:
@@ -1246,9 +1250,9 @@ def get_margin_samco(long_symbol: str, driver_path: str = None, proxy: str = Non
     try:
         margin_url = "https://www.samco.in/span"
         op = webdriver.FirefoxOptions()
-        if driver_path is None:
+        if not driver_path:
             driver_path = "/home/psharma/Downloads/geckodriver"
-        if proxy is not None:
+        if proxy:
             op.add_argument("--proxy-server=%s" % proxy)
         op.add_argument("--headless")
         driver = webdriver.Firefox(executable_path=driver_path, options=op)
@@ -1328,7 +1332,7 @@ def get_margin_samco(long_symbol: str, driver_path: str = None, proxy: str = Non
     return output
 
 
-def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = None, proxy: str = None) -> int:
+def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = "", proxy: str = "") -> int:
     output = 1000000
     strike = long_symbol.split("_")[4]
     type = long_symbol.split("_")[3].lower()
@@ -1338,9 +1342,9 @@ def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = No
     try:
         margin_url = "https://zerodha.com/margin-calculator/SPAN"
         op = webdriver.FirefoxOptions()
-        if driver_path is None:
+        if not driver_path:
             driver_path = "/home/psharma/Downloads/geckodriver"
-        if proxy is not None:
+        if proxy:
             op.add_argument("--proxy-server=%s" % proxy)
         op.add_argument("--headless")
         driver = webdriver.Firefox(executable_path=driver_path, options=op)
@@ -1415,7 +1419,7 @@ def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = No
     return output
 
 
-def get_free_proxy(driver_path: str = None) -> str:
+def get_free_proxy(driver_path: str = "") -> str:
     """Get working proxy. This requires firefox driver (geckodriver) to be available in specified driver path
 
     Args:
@@ -1426,7 +1430,7 @@ def get_free_proxy(driver_path: str = None) -> str:
     """
     op = webdriver.FirefoxOptions()
     op.add_argument("--headless")
-    if driver_path is None:
+    if not driver_path:
         driver_path = "/home/psharma/Downloads/geckodriver"
     driver = webdriver.Firefox(executable_path=driver_path, options=op)
     driver.get("https://sslproxies.org")
@@ -1460,11 +1464,11 @@ def get_free_proxy(driver_path: str = None) -> str:
                 if WebDriverWait(dr, 5).until(EC.visibility_of_element_located((By.ID, "loginUser"))):
                     dr.close()
                     break
-        except Exception as e:
+        except Exception:
             logger.exception("Error")
             continue
     logger.info(f"Proxy selected: {proxies[i]}")
-    return proxies[i].get("IP Address") + ":" + proxies[i].get("Port")
+    return proxies[i].get("IP Address", "127.0.0.1") + ":" + proxies[i].get("Port", "0")
 
 
 def get_yield(broker: BrokerBase, long_symbol: str, proxy=None, exchange="NSE") -> list[float]:
@@ -1477,18 +1481,18 @@ def get_yield(broker: BrokerBase, long_symbol: str, proxy=None, exchange="NSE") 
     Returns:
         list[float]: [midprice, bid, ask,yield,margin]
     """
-    mid = 0
+    mid = 0.0
     margin = get_margin_zerodha(broker, long_symbol, proxy)
     size = broker.get_min_lot_size(long_symbol, exchange)
     quote = broker.get_quote(long_symbol, exchange)
-    if quote["BidRate"] > 0 and quote["OffRate"] > 0:
-        mid = (quote["BidRate"] + quote["OffRate"]) / 2
+    if quote.bid > 0 and quote.ask > 0:
+        mid = (quote.bid + quote.ask) / 2
     mid = mid if mid > 0 else -1
-    if size is not None and quote["BidRate"] > 0 and quote["OffRate"] > 0:
+    if size is not None and quote.bid > 0 and quote.ask > 0:
         max_return = (mid * size) / margin
-        return [mid, quote["BidRate"], quote["OffRate"], max_return, margin]
+        return [mid, quote.bid, quote.ask, max_return, margin]
     else:
-        return [mid, quote["BidRate"], quote["BidRate"], 100, margin]
+        return [mid, quote.bid, quote.ask, 100, margin]
 
 
 def review_price_history(symbol: str, exchange: str = "NSE", count: int = 1):
@@ -1604,7 +1608,7 @@ def get_price(
 
 
 def get_option_underlying_price(
-    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = None, exchange="NSE", mds=False
+    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = "", exchange="NSE", mds=False
 ) -> float:
     """Retrieve underlying price for a symbol and interpolates, if if needed
 
@@ -1616,7 +1620,7 @@ def get_option_underlying_price(
     Returns:
         float: price of underlying
     """
-    if fut_expiry is None:
+    if not fut_expiry:
         price_f = get_price(brokers, symbol, exchange=exchange, mds=mds).last
     else:
         underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
@@ -1626,7 +1630,7 @@ def get_option_underlying_price(
         else:
             price_f = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).prior_close
         if price_f is None:
-            return None
+            return float("nan")
 
     if "NIFTY" in symbol and fut_expiry is not None:
         t_o = calc_fractional_business_days(
@@ -1640,7 +1644,7 @@ def get_option_underlying_price(
         if last_price is not None:
             price_u = last_price
         else:
-            price_u = get_price(brokers, underlying_ind, checks="prior_close", exchange=exchange, mds=mds).prior_close
+            price_u = get_price(brokers, underlying_ind, checks=["prior_close"], exchange=exchange, mds=mds).prior_close
         price_f = price_u + (price_f - price_u) * t_o / t_f
     return price_f
 
@@ -1829,7 +1833,7 @@ def get_delta_strike(
 
 def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds=False) -> dict:
     ticker = get_price(brokers, symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
-    impact_cost = (ticker.ask - ticker.bi) / ((ticker.ask + ticker.bid) / 2)
+    impact_cost = (ticker.ask - ticker.bid) / ((ticker.ask + ticker.bid) / 2)
     return {"ticker": ticker, "impact_cost": impact_cost}
 
 
@@ -1883,9 +1887,9 @@ def place_combo_order(
     quantities: list[int],
     entry: bool,
     additional_infos: list[str] = [""],
-    exchanges: list[str] = "NSE",
-    price_broker: list[BrokerBase] = None,
-    price_types: list = None,
+    exchanges: list[str] = ["NSE"],
+    price_broker: Optional[List[BrokerBase]] = None,
+    price_types: list = [],
     validate_db_position: bool = True,
     paper: bool = True,
 ) -> dict:
@@ -2028,32 +2032,6 @@ def get_expiry_from_FormattedExpiryTime(timestamp_str) -> str:
     return formatted_date
 
 
-def get_opt_chain(broker: BrokerBase, short_symbol: str, expiry: str) -> list:
-    """Returns a list of option chains for given expiry
-
-    Args:
-        broker : broker object
-        short_symbol (str): short symbol
-        expiry (str): formatted as yyyy-mm-dd
-
-    Returns:
-        list: list of option long names
-    """
-
-    if broker.broker == "IB":
-        pass
-    elif broker.broker == "FivePaisa":
-        expiries = pd.DataFrame(broker.fp.get_expiry("N", short_symbol)["Expiry"])
-        expiries["expiry"] = expiries["ExpiryDate"].apply(get_expiry_from_FormattedExpiryTime)
-        expiry_timestamp = expiries.loc[expiries.expiry == expiry, "ExpiryDate"].item()
-        opt_chain = broker.api.get_option_chain(
-            "N", short_symbol, int(expiry_timestamp.replace("/Date(", "").replace("+0530)/", ""))
-        )
-        opt_chain = pd.DataFrame(opt_chain["Options"])
-        opt_chain["long_symbol"] = broker.get_long_name_from_broker_identifier(opt_chain.Name)
-        return list(opt_chain.long_symbol)
-
-
 def historical_to_dataframes(historical_data: Dict[str, List[HistoricalData]]) -> List[pd.DataFrame]:
     """
     Converts a dictionary of lists of HistoricalData to a list of pandas DataFrames.
@@ -2100,10 +2078,10 @@ def _get_active_commission_config(entry_date: str, config) -> str:
             return effective_date
 
     # Return None if no effective date is found
-    return None
+    return "1970-01-01"
 
 
-def _update_commissions(dataframe: pd.DataFrame, brok: BrokerBase = None):
+def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = None):
     """get commission values in trades dataframe
 
     Args:
@@ -2111,7 +2089,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: BrokerBase = None):
         brok (BrokerBase, optional): BrokerBase containing database with trades. Defaults to None.
     """
 
-    def get_redis_price(broker_order_id: str, long_symbol: str, brok: BrokerBase):
+    def get_redis_price(broker_order_id: str, long_symbol: str, brok: Optional[BrokerBase] = None):
         """Fetch the price from Redis using the broker_order_id and ensure it matches the long_symbol."""
         if brok is None:
             return 0
@@ -2141,7 +2119,6 @@ def _update_commissions(dataframe: pd.DataFrame, brok: BrokerBase = None):
         total_commission = 0
         if len(legs) > 1 and brok is None:
             raise ValueError("brok needs to be specfied for combo trades")
-            return
         for leg in legs:
             leg_parts = leg.split("?")
             leg_symbol = leg_parts[0]
@@ -2246,7 +2223,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: BrokerBase = None):
     return dataframe
 
 
-def calc_pnl(trades: pd.DataFrame, brok: BrokerBase = None):
+def calc_pnl(trades: pd.DataFrame, brok: Optional[BrokerBase] = None):
     """Calculates absolute profit /loss arising from a trade object
     This function  adds/amends pnl column to input dataframe.
 

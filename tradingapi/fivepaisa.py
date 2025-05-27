@@ -4,13 +4,13 @@ import io
 import json
 import logging
 import os
-import random
 import re
+import secrets  # Replace `random` with `secrets` for cryptographic randomness
 import sys
 import threading
 import time
 import traceback
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -42,7 +42,7 @@ def save_symbol_data(saveToFolder: bool = False):
     bhavcopyfolder = config.get("bhavcopy_folder")
     url = "https://openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/All"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_codes.csv"
-    response = requests.get(url, allow_redirects=True)
+    response = requests.get(url, allow_redirects=True, timeout=10)  # Add timeout to `requests.get` to fix Bandit issue
     if response.status_code == 200:
         df = pd.read_csv(io.BytesIO(response.content))
         # Rename the column
@@ -83,7 +83,6 @@ def save_symbol_data(saveToFolder: bool = False):
         def process_row(row):
             symbol_vec = row["symbol_vec"]
             ticksize = row["TickSize"]
-            exchange = row["Exch"]
 
             if row["QtyLimit"] == 0 and row["LotSize"] == 2000 and row["TickSize"] == 0 and row["Exch"] in ["N"]:
                 return f"{''.join(symbol_vec).replace('/', '')}_IND___".upper()
@@ -202,7 +201,7 @@ class FivePaisa(BrokerBase):
 
         susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
         logged_in_user = False
-        if config.get(self.broker.name) is not {}:
+        if config.get(self.broker.name) != {}:
             self.codes = self.update_symbology()
             if os.path.exists(susertoken_path):
                 mod_time = os.path.getmtime(susertoken_path)
@@ -228,7 +227,7 @@ class FivePaisa(BrokerBase):
                         otp,
                         config.get(f"{self.broker.name}.PIN"),
                     )
-                    if self.api.access_token != "":
+                    if self.api.access_token:
                         logger.info(f"Connected successfully on attempt {attempt}.")
                         susertoken = self.api.access_token
                         with open(susertoken_path, "w") as file:
@@ -295,7 +294,9 @@ class FivePaisa(BrokerBase):
             if not order.paper:
                 if order.exchange == "M":
                     min_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(order.long_symbol)
-                    quantity = int(round(order.quantity / min_size, 0))
+                    quantity: Optional[int] = None  # Initialize as None
+                    if min_size is not None and order.quantity is not None:
+                        quantity = int(round(order.quantity / min_size, 0))
                 else:
                     quantity = order.quantity
                 out = self.api.place_order(
@@ -329,8 +330,8 @@ class FivePaisa(BrokerBase):
                     return order
             else:
                 order.order_type = orig_order_type
-                order.exch_order_id = str(random.randint(1000000000000000, 9000000000000000)) + "P"
-                order.broker_order_id = str(random.randint(10000000, 99999999)) + "P"
+                order.exch_order_id = str(secrets.randbelow(10**15)) + "P"  # Replace `random` with `secrets`
+                order.broker_order_id = str(secrets.randbelow(10**8)) + "P"  # Replace `random` with `secrets`
                 order.orderRef = order.internal_order_id
                 order.message = "Paper Order"
                 order.status = OrderStatus.FILLED
@@ -352,9 +353,9 @@ class FivePaisa(BrokerBase):
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = kwargs.get("broker_order_id")
-        new_price = kwargs.get("new_price")
-        new_quantity = kwargs.get("new_quantity")
+        broker_order_id = str(kwargs.get("broker_order_id", "0"))
+        new_price = float(kwargs.get("new_price", 0))
+        new_quantity = kwargs.get("new_quantity", 0)
         order = Order(**self.redis_o.hgetall(broker_order_id))
         fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
         if fills.status in [OrderStatus.UNDEFINED, OrderStatus.PENDING]:
@@ -373,6 +374,7 @@ class FivePaisa(BrokerBase):
                 )
             else:
                 order_quantity = new_quantity - fills.fill_size
+                order_quantity = order_quantity if order_quantity > 0 else 0
             out = self.api.modify_order(ExchOrderID=exch_order_id, Price=new_price, Qty=order_quantity)
             if out is None:
                 logger.error(f"Error modifying order {broker_order_id}")
@@ -383,7 +385,7 @@ class FivePaisa(BrokerBase):
                         order.price_type = new_price
                         order.quantity = new_quantity
                         order.price = new_price
-                        order.broker_order_id = out["BrokerOrderID"]
+                        order.broker_order_id = str(out.get("BrokerOrderID", ""))
                         order_info = self.get_order_info(broker_order_id=order.broker_order_id, order=order)
                         order.status = order_info.status
                         order.exch_order_id = order_info.exchange_order_id
@@ -413,7 +415,7 @@ class FivePaisa(BrokerBase):
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = kwargs.get("broker_order_id")
+        broker_order_id = str(kwargs.get("broker_order_id", "0"))
 
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.status in [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNDEFINED]:
@@ -519,9 +521,11 @@ class FivePaisa(BrokerBase):
                             status = OrderStatus.PENDING
                         if fivepaisa_order.Exch.item() == "M":
                             long_symbol = (
-                                self.get_long_name_from_broker_identifier(pd.Series[order.long_symbol]).item()
+                                self.get_long_name_from_broker_identifier(ScripName=pd.Series[order.long_symbol]).item()
                                 if order
-                                else self.get_long_name_from_broker_identifier(fivepaisa_order.ScripName).item()
+                                else self.get_long_name_from_broker_identifier(
+                                    ScripName=fivepaisa_order.ScripName
+                                ).item()
                             )
                             contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(long_symbol)
                             return OrderInfo(
@@ -570,9 +574,11 @@ class FivePaisa(BrokerBase):
                                 status = OrderStatus.PENDING
                             if order.exchange == "M":
                                 long_symbol = (
-                                    self.get_long_name_from_broker_identifier(pd.Series[order.long_symbol]).item()
+                                    self.get_long_name_from_broker_identifier(
+                                        ScripName=pd.Series[order.long_symbol]
+                                    ).item()
                                     if order.long_symbol is not None
-                                    else self.get_long_name_from_broker_identifier(row["ScripName"]).item()
+                                    else self.get_long_name_from_broker_identifier(ScripName=row["ScripName"]).item()
                                 )
                                 contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(
                                     long_symbol
@@ -613,7 +619,7 @@ class FivePaisa(BrokerBase):
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = kwargs.get("broker_order_id")
+        broker_order_id = str(kwargs.get("broker_order_id", "0"))
         order = kwargs.get("order", None)
         if order is None:
             order = Order(**self.redis_o.hgetall(broker_order_id))
@@ -723,15 +729,26 @@ class FivePaisa(BrokerBase):
                 else:
                     out = get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
                     return out
+        logger.error("get_order_info: No valid return path found.")
+        return OrderInfo(
+            order_size=0,
+            order_price=0,
+            fill_size=0,
+            fill_price=0,
+            status=OrderStatus.UNDEFINED,
+            broker_order_id="",
+            exchange_order_id="",
+            broker=self.broker,
+        )
 
     def get_historical(
         self,
         symbols: Union[str, pd.DataFrame, dict],
         date_start: str,
         date_end: str = dt.datetime.today().strftime("%Y-%m-%d"),
-        exchange="N",
-        periodicity="1m",
-        market_close_time="15:30:00",
+        exchange: str = "N",  # Fix type for `exchange`
+        periodicity: str = "1m",  # Fix type for `periodicity`
+        market_close_time: str = "15:30:00",
     ) -> Dict[str, List[HistoricalData]]:
         """
         Retrieves historical bars from 5paisa.
@@ -808,14 +825,14 @@ class FivePaisa(BrokerBase):
                 logger.debug(f"No data found for {row_outer['long_symbol']}")
                 historical_data_list.append(
                     HistoricalData(
-                        date=None,
+                        date=dt.datetime(1970, 1, 1),
                         open=float("nan"),
                         high=float("nan"),
                         low=float("nan"),
                         close=float("nan"),
-                        volume=float("nan"),
-                        intoi=float("nan"),
-                        oi=float("nan"),
+                        volume=0,
+                        intoi=0,
+                        oi=0,
                     )
                 )
 
@@ -828,7 +845,7 @@ class FivePaisa(BrokerBase):
         long_symbol: str,
         exchange="N",
         bar_duration="1m",
-        timestamp: dt.datetime = None,
+        timestamp: dt.datetime = dt.datetime(1970, 0, 0),
         adj=False,
     ) -> float:
         """Get last traded price from five paisa
@@ -863,6 +880,8 @@ class FivePaisa(BrokerBase):
                 return (md.High + md.Low + md.Close) / 3
             else:
                 return md.Close
+        else:
+            return float("nan")
 
     def map_exchange_for_api(self, long_symbol, exchange):
         return exchange[0]
@@ -929,7 +948,6 @@ class FivePaisa(BrokerBase):
             Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
         )
         market_depth_data = out["MarketDepthData"]
-        timestamp = out["TimeStamp"]
         bids = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 66]
         asks = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 83]
 
@@ -981,7 +999,6 @@ class FivePaisa(BrokerBase):
             price.volume = json_data.get("TotalQty", float("nan"))
             price.symbol = self.exchange_mappings[json_data["Exch"]]["symbol_map_reversed"].get(json_data.get("Token"))
             price.exchange = self.map_exchange_for_db(price.symbol, json_data["Exch"])
-            timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-4]
             price.timestamp = self.convert_to_ist(json_data["TickDt"])
             return price
 
@@ -992,7 +1009,7 @@ class FivePaisa(BrokerBase):
                 if len(json_data) == 1:
                     price = map_to_price(json_data[0])
                     ext_callback(price)
-            except Exception as e:
+            except Exception:
                 logger.error(f"{traceback.format_exc()}")
 
         def error_data(ws, err):
@@ -1058,7 +1075,7 @@ class FivePaisa(BrokerBase):
     def stop_streaming(self):
         self.api.close_data()
 
-    def get_position(self, long_symbol: str = None) -> Union[pd.DataFrame, int]:
+    def get_position(self, long_symbol: str = "") -> Union[pd.DataFrame, int]:
         """Retrieves position from 5paisa
 
         Args:
@@ -1070,13 +1087,13 @@ class FivePaisa(BrokerBase):
         holding = pd.DataFrame(self.api.holdings())
         holding = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(holding) == 0 else holding
         if len(holding) > 0:
-            holding["long_symbol"] = self.get_long_name_from_broker_identifier(holding.Symbol)
+            holding["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=holding.Symbol)
             holding = holding.loc[:, ["long_symbol", "Quantity"]]
             holding.columns = ["long_symbol", "quantity"]
         position = pd.DataFrame(self.api.positions())
         position = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(position) == 0 else position
         if len(position) > 0:
-            position["long_symbol"] = self.get_long_name_from_broker_identifier(position.ScripName)
+            position["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=position.ScripName)
             position = position.loc[:, ["long_symbol", "NetQty"]]
             position.columns = ["long_symbol", "quantity"]
         merged_df = pd.merge(position, holding, on="long_symbol", how="outer")
@@ -1098,7 +1115,7 @@ class FivePaisa(BrokerBase):
         orders = self.api.order_book()
         orders = pd.DataFrame.from_dict(orders)
         if len(orders.index) > 0:
-            orders = orders.assign(long_symbol=self.get_long_name_from_broker_identifier(orders.ScripName))
+            orders = orders.assign(long_symbol=self.get_long_name_from_broker_identifier(ScripName=orders.ScripName))
             return orders
         else:
             return None
@@ -1110,20 +1127,25 @@ class FivePaisa(BrokerBase):
             trades = trades.loc[trades.Status == 0, "TradeBookDetail"]
             trades = pd.DataFrame([trade for trade in trades])
             trades.ExchangeTradeTime = trades.ExchangeTradeTime.apply(self._convert_date_string)
-            trades = trades.assign(long_symbol=self.get_long_name_from_broker_identifier(trades.ScripName))
+            trades = trades.assign(long_symbol=self.get_long_name_from_broker_identifier(ScripName=trades.ScripName))
             return trades
         else:
             return None
 
-    def get_long_name_from_broker_identifier(self, ScripName: pd.Series) -> pd.Series:
-        """Generates Long Name
+    def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
+        """
+        Generates Long Name.
 
         Args:
-            ScripName (pd.Series): position.ScripName from 5paisa position
+            kwargs: Arbitrary keyword arguments. Expected key:
+                - ScripName (pd.Series): position.ScripName from 5paisa position.
 
         Returns:
-            pd.series: long name
+            pd.Series: Long name.
         """
+        ScripName = kwargs.get("ScripName")
+        if ScripName is None:
+            raise ValueError("Missing required argument: 'ScripName'")
         ScripName = ScripName.reset_index(drop=True)
         symbol = ScripName.str.split().str[0]
         sec_type = pd.Series("", index=np.arange(len(ScripName)))
@@ -1150,9 +1172,7 @@ class FivePaisa(BrokerBase):
 
         return symbol + "_" + sec_types + "_" + expiry + "_" + right + "_" + strike
 
-    def _get_exchange_order_id(
-        self, broker_order_id: str, order: Order = None, delete: bool = True
-    ) -> Union[Order, None]:
+    def _get_exchange_order_id(self, broker_order_id: str, order: Order = Order(), delete: bool = True) -> str:
         """Retrieves exchange order id for trades executed today.
 
         Args:
@@ -1162,25 +1182,24 @@ class FivePaisa(BrokerBase):
             Defaults to True.
 
         Returns:
-            Union[str, None]: exchange order if available, else None
+            str: exchange order if available, else empty string
         """
 
-        def get_exchange_order_id_from_orders(broker_order_id: str) -> Union[str, None]:
+        def get_exchange_order_id_from_orders(broker_order_id: str) -> str:
             orders = pd.DataFrame(self.api.order_book())
             fivepaisa_order = orders[orders.BrokerOrderId == int(broker_order_id)]
             if len(fivepaisa_order) == 1:
                 return str(fivepaisa_order.ExchOrderID.item())
             else:
                 logger.error(f"Trade {broker_order_id} did not exist in 5paisa.")
-                return None
+                return "0"
 
-        exch_order_id = None
+        exch_order_id = "0"
         if order is None:
             order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.exch_order_id not in ["0", "None", 0, None]:
             return order.exch_order_id
         else:
-            long_symbol = order.long_symbol
             exch = order.exchange
             if exch != "M":
                 remote_order_id = order.remote_order_id
@@ -1191,12 +1210,12 @@ class FivePaisa(BrokerBase):
             if status is not None and len(status["OrdStatusResLst"]) > 0:
                 for sub_status in status["OrdStatusResLst"]:
                     if str(sub_status.get("ScripCode")) == str(order.scrip_code):
-                        exch_order_id = sub_status.get("ExchOrderID")
+                        exch_order_id = str(sub_status.get("ExchOrderID") or "")
                         logger.info(f"Retrieving Exchange ID {exch_order_id}")
                         return exch_order_id
 
             exch_order_id = get_exchange_order_id_from_orders(broker_order_id)
-            if isinstance(exch_order_id, str):
+            if exch_order_id not in ["0", "None", 0, ""]:
                 return exch_order_id
             else:
                 logger.error(f"Order for {broker_order_id} did not exist in 5paisa orderbook.")
@@ -1206,7 +1225,7 @@ class FivePaisa(BrokerBase):
                         f"for intenal order {self.redis_o.hget(broker_order_id, 'orderRef')}"
                     )
                     delete_broker_order_id(self, self.redis_o.hget(broker_order_id, "orderRef"), broker_order_id)
-                return None
+                return "0"
 
     def _convert_date_string(self, date_string: str) -> dt.datetime:
         """convert 5paisa datestring in positions/orders to datetime
@@ -1234,6 +1253,7 @@ class FivePaisa(BrokerBase):
         else:
             logger.error("incorrect datestring format: {date_string}")
             time.time()
+            return dt.datetime(1970, 1, 1)
 
     def get_min_lot_size(self, long_symbol, exchange="N") -> int:
         exchange = self.map_exchange_for_api(long_symbol, exchange)

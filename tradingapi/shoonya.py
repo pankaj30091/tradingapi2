@@ -5,8 +5,8 @@ import io
 import json
 import logging
 import os
-import random
 import re
+import secrets
 import signal
 import sys
 import threading
@@ -61,7 +61,7 @@ def save_symbol_data(saveToFolder: bool = True):
     bhavcopyfolder = config.get("bhavcopy_folder")
     url = "https://api.shoonya.com/NSE_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_shoonyacodes_nse_cash.zip"
-    response = requests.get(url, allow_redirects=True)
+    response = requests.get(url, allow_redirects=True, timeout=10)
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -115,7 +115,7 @@ def save_symbol_data(saveToFolder: bool = True):
 
     url = "https://api.shoonya.com/BSE_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_shoonyacodes_bse_cash.zip"
-    response = requests.get(url, allow_redirects=True)
+    response = requests.get(url, allow_redirects=True, timeout=10)
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -181,7 +181,7 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes_bse_cash = pd.concat([codes_bse_cash, sensex_row])
     url = "https://api.shoonya.com/NFO_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_shoonyacodes_fno.zip"
-    response = requests.get(url, allow_redirects=True)
+    response = requests.get(url, allow_redirects=True, timeout=10)
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -228,7 +228,7 @@ def save_symbol_data(saveToFolder: bool = True):
 
     url = "https://api.shoonya.com/BFO_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_shoonyacodes_bse_fno.zip"
-    response = requests.get(url, allow_redirects=True)
+    response = requests.get(url, allow_redirects=True, timeout=10)
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -364,7 +364,6 @@ class Shoonya(BrokerBase):
             vc = config.get(f"{self.broker.name}.VC")
             app_key = config.get(f"{self.broker.name}.APPKEY")
             token = config.get(f"{self.broker.name}.TOKEN")
-            factor2 = pyotp.TOTP(token).now()
             self.api = ShoonyaApiPy()
             out = self.api.login(
                 userid=user,
@@ -378,7 +377,7 @@ class Shoonya(BrokerBase):
             with open(susertoken_path, "w") as file:
                 file.write(susertoken)
 
-        if config.get(f"{self.broker.name}") is not {}:
+        if config.get(f"{self.broker.name}") != {}:
             self.codes = self.update_symbology()
             susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
             fresh_login_needed = True
@@ -512,8 +511,8 @@ class Shoonya(BrokerBase):
                             logger.info(f"Placed Order: {order}")
             else:
                 order.order_type = orig_order_type
-                order.exch_order_id = str(random.randint(10000000, 99999999)) + "P"
-                order.broker_order_id = str(random.randint(10000000, 99999999)) + "P"
+                order.exch_order_id = str(secrets.randbelow(10**15)) + "P"  # Replace `random` with `secrets`
+                order.broker_order_id = str(secrets.randbelow(10**8)) + "P"  # Replace `random` with `secrets`
                 order.orderRef = order.internal_order_id
                 order.message = "Paper Order"
                 order.status = OrderStatus.FILLED
@@ -536,8 +535,8 @@ class Shoonya(BrokerBase):
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
         broker_order_id = kwargs.get("broker_order_id")
-        new_price = kwargs.get("new_price")
-        new_quantity = kwargs.get("new_quantity")
+        new_price = float(kwargs.get("new_price", 0.0))
+        new_quantity = int(kwargs.get("new_quantity", 0))
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.broker_order_id != "0":
             fills = self.get_order_info(broker_order_id=broker_order_id)
@@ -579,6 +578,7 @@ class Shoonya(BrokerBase):
                 )
                 self.log_and_return(order)
                 return order
+        return Order()
 
     def cancel_order(self, **kwargs):
         """
@@ -638,7 +638,7 @@ class Shoonya(BrokerBase):
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = kwargs.get("broker_order_id")
+        broker_order_id = kwargs.get("broker_order_id", "0")
         order_info = OrderInfo()
         status_mapping = {
             "PENDING": OrderStatus.PENDING,
@@ -725,7 +725,7 @@ class Shoonya(BrokerBase):
             # Search for digits in the string
             match = re.search(r"\d+", s)
             # Convert to integer if match is found, else return None
-            return int(match.group()) if match else None
+            return int(match.group()) if match else 1  # default return 1 if no number found
 
         scripCode = None
         # Determine the format of symbols and create a DataFrame
@@ -758,20 +758,21 @@ class Shoonya(BrokerBase):
             row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
             # we do the above remapping for downloading permin data to database for legacy reasons.
             # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
-            date_start, _ = valid_datetime(date_start, None)
+
+            date_start_dt, _ = valid_datetime(date_start, None)
             date_end, _ = valid_datetime(date_end, "%Y%m%d")
-            date_end, _ = valid_datetime(date_end + " " + market_close_time, None)
-            if isinstance(date_start, dt.date) and not isinstance(date_start, dt.datetime):
-                date_start = dt.datetime.combine(date_start, dt.datetime.min.time())
-            if isinstance(date_end, dt.date) and not isinstance(date_end, dt.datetime):
-                date_end = dt.datetime.combine(date_end, dt.datetime.min.time())
+            date_end_dt, _ = valid_datetime(date_end + " " + market_close_time, None)
+            if isinstance(date_start_dt, dt.date) and not isinstance(date_start_dt, dt.datetime):
+                date_start_dt = dt.datetime.combine(date_start_dt, dt.datetime.min.time())
+            if isinstance(date_end_dt, dt.date) and not isinstance(date_end_dt, dt.datetime):
+                date_end_dt = dt.datetime.combine(date_end_dt, dt.datetime.min.time())
             try:
                 if periodicity.endswith("m"):
                     data = self.api.get_time_price_series(
                         exchange=exch,
                         token=str(row_outer["Scripcode"]),
-                        starttime=date_start.timestamp(),
-                        endtime=date_end.timestamp(),
+                        starttime=date_start_dt.timestamp(),
+                        endtime=date_end_dt.timestamp(),
                         interval=extract_number(periodicity),
                     )
                 elif periodicity == "1d":
@@ -795,8 +796,8 @@ class Shoonya(BrokerBase):
                             data = self.api.get_daily_price_series(
                                 exchange=exch,
                                 tradingsymbol=trading_symbol,
-                                startdate=date_start.timestamp(),
-                                enddate=date_end.timestamp(),
+                                startdate=date_start_dt.timestamp(),
+                                enddate=date_end_dt.timestamp(),
                             )
                             # If call succeeds, break out of loop
                             break
@@ -829,26 +830,26 @@ class Shoonya(BrokerBase):
                         high=float(d.get("inth", "nan")),
                         low=float(d.get("intl", "nan")),
                         close=float(d.get("intc", "nan")),
-                        volume=float(d.get("intv", "nan")),
-                        intoi=float(d.get("intoi", "nan")),
-                        oi=float(d.get("oi", "nan")),
+                        volume=int(float((d.get("intv", 0)))),
+                        intoi=int(float(d.get("intoi", 0))),
+                        oi=int(float(d.get("oi", 0))),
                     )
                     historical_data_list.append(historical_data)
             else:
                 logger.debug(f"No data found for {row_outer['long_symbol']}")
                 historical_data_list.append(
                     HistoricalData(
-                        date=None,
+                        date=dt.datetime(1970, 1, 1),
                         open=float("nan"),
                         high=float("nan"),
                         low=float("nan"),
                         close=float("nan"),
-                        volume=float("nan"),
-                        intoi=float("nan"),
-                        oi=float("nan"),
+                        volume=0,
+                        intoi=0,
+                        oi=0,
                     )
                 )
-            if periodicity == "1d" and date_end.date() == dt.datetime.today().date():
+            if periodicity == "1d" and date_end_dt.date() == dt.datetime.today().date():
                 # make a call to permin data for start date and end date of today
                 if historical_data_list:
                     last_date = historical_data_list[0].date
@@ -981,10 +982,10 @@ class Shoonya(BrokerBase):
                 else float(tick_data.get("sp1"))
             )
             market_feed.bid_volume = (
-                float("nan") if tick_data.get("bq1") in [None, 0, "0", float("nan")] else float(tick_data.get("bq1"))
+                0 if tick_data.get("bq1") in [None, 0, "0", float("nan")] else int(float(tick_data.get("bq1")))
             )
             market_feed.ask_volume = (
-                float("nan") if tick_data.get("sq1") in [None, 0, "0", float("nan")] else float(tick_data.get("sq1"))
+                0 if tick_data.get("sq1") in [None, 0, "0", float("nan")] else int(float(tick_data.get("sq1")))
             )
             market_feed.prior_close = (
                 float("nan")
@@ -1006,9 +1007,7 @@ class Shoonya(BrokerBase):
                 if tick_data.get("l") in [None, 0, "0", "0.00", float("nan")]
                 else float(tick_data.get("l"))
             )
-            market_feed.volume = (
-                float("nan") if tick_data.get("v") in [None, float("nan")] else float(tick_data.get("v"))
-            )
+            market_feed.volume = 0 if tick_data.get("v") in [None, float("nan")] else int(float(tick_data.get("v")))
             market_feed.exchange = self.map_exchange_for_db(long_symbol, tick_data.get("exch"))
             # market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-4]
             market_feed.timestamp = self.convert_ft_to_ist(int(tick_data.get("lut", 0)))
@@ -1178,7 +1177,7 @@ class Shoonya(BrokerBase):
     def get_position(self, long_symbol: str):
         pos = pd.DataFrame(self.api.get_positions())
         if len(pos) > 0:
-            pos["long_symbol"] = self.get_long_name_from_broker_identifier(pos.tsym)
+            pos["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=pos.tsym)
             if long_symbol is None:
                 return pos
             else:
