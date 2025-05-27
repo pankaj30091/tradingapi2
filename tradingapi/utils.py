@@ -1,0 +1,2273 @@
+import datetime as dt
+import glob
+import json
+import logging
+import math
+import os
+import random
+import re
+import sys
+import time
+import traceback
+from collections import OrderedDict
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Union
+
+import numpy as np
+import pandas as pd
+import redis
+from chameli.dateutils import (advance_by_biz_days, business_days_between,
+                               calc_fractional_business_days, get_expiry,
+                               is_business_day, valid_datetime)
+from chameli.europeanoptions import BlackScholesDelta, BlackScholesIV
+from requests import Session
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+from tradingapi2.broker_base import (BrokerBase, Brokers, HistoricalData,
+                                     Order, OrderInfo, OrderStatus, Position,
+                                     Price)
+
+from .config import get_config
+
+logger = logging.getLogger(__name__)
+r = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+
+
+# Exception handler
+def my_handler(typ, value, trace):
+    logger.error("%s %s %s", typ.__name__, value, "".join(traceback.format_tb(trace)))
+
+
+sys.excepthook = my_handler
+config = get_config()
+mds_history = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+pubsub = mds_history.pubsub()
+
+empty_trades = {
+    "symbol": pd.Series(dtype="object"),
+    "side": pd.Series(dtype="object"),
+    "entry_time": pd.Series(dtype="string"),
+    "entry_quantity": pd.Series(dtype="float64"),
+    "entry_price": pd.Series(dtype="float64"),
+    "exit_time": pd.Series(dtype="string"),
+    "exit_quantity": pd.Series(dtype="float64"),
+    "exit_price": pd.Series(dtype="float64"),
+    "commission": pd.Series(dtype="int64"),
+    "int_order_id": pd.Series(dtype="object"),
+    "entry_keys": pd.Series(dtype="object"),
+    "exit_keys": pd.Series(dtype="object"),
+    "additional_info": pd.Series(dtype="object"),
+    "realized_pnl": pd.Series(dtype="float64"),
+    "gross_pnl": pd.Series(dtype="float64"),
+    "mtm": pd.Series(dtype="float64"),
+    "pnl": pd.Series(dtype="float64"),
+}
+
+empty_trades = pd.DataFrame(empty_trades)
+
+empty_md = {
+    "date": pd.Series(dtype="datetime64[ns]"),
+    "open": pd.Series(dtype="float64"),
+    "high": pd.Series(dtype="float64"),
+    "low": pd.Series(dtype="float64"),
+    "close": pd.Series(dtype="float64"),
+    "volume": pd.Series(dtype="int64"),
+}
+empty_md = pd.DataFrame(empty_md)
+
+
+def hget_with_default(brok: BrokerBase, hash_name: str, key: str, default_value):
+    value = brok.redis_o.hget(hash_name, key)
+    if value is None:
+        return default_value
+    else:
+        return value
+
+
+def get_all_strategy_names(redis_db) -> set:
+    """
+    Returns a set of strategies used within the database of the trading system.
+    :return:
+    """
+    out = set()
+    if redis_db is not None:
+        for key in redis_db.scan_iter("[A-Z]*_[0-9]*"):
+            out.add(key.split("_")[0])
+    return out
+
+
+def set_starting_internal_ids_int(redis_db) -> None:
+    """Sets the internal_ids for each strategy. New orders start from the values defined by this function"""
+    out = {}
+    strategies = get_all_strategy_names(redis_db)
+    for s in strategies:
+        for key in redis_db.scan_iter(s + "_" + "*"):
+            if out.get(s, 1) <= int(key.split("_")[1]):
+                out[s] = int(key.split("_")[1]) + 1
+    logger.debug(f"Starting internal ids : {out} ")
+    return out
+
+
+def _merge_additional_info(old_info, new_info):
+    """
+    Merge two JSON strings. Duplicate keys in new_info will be renamed
+    with a suffix '_1', '_2', etc., to avoid conflicts.
+
+    Args:
+        old_info (str): JSON string representing the original information.
+        new_info (str): JSON string representing the new information.
+
+    Returns:
+        str: Merged JSON string.
+
+    Raises:
+        ValueError: If either input is not a valid JSON string.
+    """
+    try:
+        # Parse the JSON strings into dictionaries
+        old_dict = json.loads(old_info) if old_info.strip() else {}
+        new_dict = json.loads(new_info) if new_info.strip() else {}
+
+        if not isinstance(old_dict, dict) or not isinstance(new_dict, dict):
+            logger.error("Both inputs must be JSON objects (dictionaries).")
+            return old_info
+
+        # Create a merged dictionary
+        merged_dict = old_dict.copy()
+
+        for key, value in new_dict.items():
+            if key not in merged_dict:
+                # If the key is unique, add it
+                merged_dict[key] = value
+            else:
+                # If key exists, generate a new key with a numeric suffix
+                suffix = 1
+                new_key = f"{key}_{suffix}"
+                while new_key in merged_dict:
+                    suffix += 1
+                    new_key = f"{key}_{suffix}"
+                merged_dict[new_key] = value
+
+        # Convert the merged dictionary back to JSON string
+        return json.dumps(merged_dict)
+
+    except Exception as e:
+        logger.error(f"An error occurred: {str(e)}")
+        return old_info
+
+
+def is_not_int_order_id(s):
+    return not bool(re.match(r"^.*_\d+$", s))
+
+
+def get_pnl_table(
+    broker: BrokerBase,
+    strategy: str,
+    start_time: str = "1970-01-01 00:00:00",
+    end_time: str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    refresh_status=False,
+    market_close_time="15:30:00",
+    eod=False,
+) -> pd.DataFrame:
+    """get pnl table for a specified strategy
+
+    Args:
+        redis_db (redis): redis instance holding strategy details
+        strategy (str): strategy name
+        start_time (str, optional): Start Date for strategy pnl. Defaults to "1970-01-01 00:00:00".
+        end_time (str, optional): End Date for strategy pnl. Defaults to dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        app=None (tradingAPI.App, optional) : broker app
+        market_close_time(str, optional): closing time for option expiry, defaults to "15:30:00"
+    Returns:
+        pd.DataFrame: strategy pnl
+    """
+    int_order_ids = []
+    trades = []
+    for int_order_id in broker.redis_o.scan_iter(strategy + "_" + "*"):
+        int_order_ids.append(int_order_id)
+    int_order_ids.sort()
+    for int_order_id in int_order_ids:
+        if is_not_int_order_id(int_order_id):
+            continue
+        symbol = broker.redis_o.hget(int_order_id, "long_symbol")
+        entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
+        exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+        additional_info_entry = ""
+        additional_info_exit = ""
+        if len(entry_keys) == 0:
+            logger.error(f"No entry key found for int_order_id: {int_order_id}")
+            continue
+        if len(entry_keys) > 0:
+            order_1 = Order(**broker.redis_o.hgetall(entry_keys[0]))
+            side = order_1.order_type if "?" not in symbol else "BUY"
+            entry_time, _ = valid_datetime(order_1.remote_order_id[:-2], "%Y-%m-%d %H:%M:%S")
+            for ek in entry_keys:
+                additional_info_entry = _merge_additional_info(
+                    additional_info_entry, hget_with_default(broker, ek, "additional_info", "")
+                )
+        if len(exit_keys) > 0:
+            order_1 = Order(**broker.redis_o.hgetall(exit_keys[-1]))
+            exit_time, _ = valid_datetime(order_1.remote_order_id[:-2], "%Y-%m-%d %H:%M:%S")
+            for ek in exit_keys:
+                additional_info_exit = _merge_additional_info(
+                    additional_info_exit, hget_with_default(broker, ek, "additional_info", "")
+                )
+        else:
+            exit_time = ""
+        additional_info = _merge_additional_info(additional_info_entry, additional_info_exit)
+        entry_quantity = 0
+        entry_price = 0
+        exit_quantity = 0
+        exit_price = 0
+        commission = 0
+        if refresh_status:
+            for entry_key in entry_keys:
+                order = Order(**broker.redis_o.hgetall(entry_key))
+                broker_order_id = order.broker_order_id
+                update_order_status(broker, int_order_id, broker_order_id, eod=eod)
+        entry_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["entry"])
+        base_position = parse_combo_symbol(symbol)
+        position_combo_info = calculate_extra_combo_positions(entry_position, base_position)
+        entry_quantity = position_combo_info.get("total_in_progress", 0)
+        entry_price = (
+            sum(position.value for position in entry_position.values()) / entry_quantity if entry_quantity != 0 else 0
+        )
+
+        if refresh_status:
+            for exit_key in exit_keys:
+                order = Order(**broker.redis_o.hgetall(exit_key))
+                broker_order_id = order.broker_order_id
+                update_order_status(broker, int_order_id, broker_order_id, eod=eod)
+        exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
+        base_position = parse_combo_symbol(symbol)
+        position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
+        exit_quantity = position_combo_info.get("total_in_progress", 0)
+        exit_price = (
+            sum(position.value for position in exit_position.values()) / exit_quantity if exit_quantity != 0 else 0
+        )
+        if abs(exit_quantity) > abs(entry_quantity):
+            logger.error(f"Exit Quantity > Entry Quantity!! for internal order id: {int_order_id}")
+            # raise ValueError("exit quantity greater than entry quantity")
+        if exit_quantity + entry_quantity != 0 and contains_earlier_date(
+            symbol, dt.datetime.today().strftime("%Y%m%d"), market_close_time
+        ):
+            # are options expiration needed?
+            get_open_position_by_order(broker=broker, int_order_id=int_order_id, market_close_time=market_close_time)
+            exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+            exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
+            base_position = parse_combo_symbol(symbol)
+            position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
+            exit_quantity = position_combo_info.get("total_in_progress", 0)
+            exit_price = (
+                sum(position.value for position in exit_position.values()) / exit_quantity if exit_quantity != 0 else 0
+            )
+            exit_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # create trade row for internal order id
+        row = {
+            "symbol": symbol,
+            "side": side,
+            "entry_time": entry_time,
+            "entry_quantity": entry_quantity,
+            "entry_price": float(entry_price),
+            "exit_time": exit_time,
+            "exit_quantity": exit_quantity,
+            "exit_price": float(exit_price),
+            "commission": commission,
+            "int_order_id": int_order_id,
+            "entry_keys": " ".join(entry_keys),
+            "exit_keys": " ".join(exit_keys),
+            "additional_info": additional_info,
+        }
+        trades.append(row)
+    out = pd.DataFrame(trades)
+    if len(out) > 0:
+        out.loc[
+            ((out.entry_time >= start_time) | (out.entry_time == ""))
+            & ((out.exit_time <= end_time) | (out.exit_time == 0)),
+        ]
+        # pnl = (out.exit_price + out.entry_price) * out.exit_quantity
+        # pnl = np.where(out["side"] == "BUY", pnl, -pnl)
+        out["mtm"] = np.where(out["exit_quantity"] != 0, out["exit_price"], out["entry_price"])
+        out["gross_pnl"] = -1 * (
+            out["exit_price"] * out["exit_quantity"]
+            + out["mtm"] * -1 * (out["entry_quantity"] + out["exit_quantity"])
+            + out["entry_quantity"] * out["entry_price"]
+        )
+        out["pnl"] = out["gross_pnl"]
+        out.sort_values(["entry_time", "symbol"], ascending=[1, 1], inplace=True)
+        out.reset_index(drop=True, inplace=True)
+    else:
+        out = empty_trades
+    return out
+
+
+def contains_earlier_date(input_string: str, comparison_date: str, market_close_time: str) -> bool:
+    # Regular expressions to match dates in various formats
+    date_patterns = [
+        re.compile(r"\d{8}"),  # YYYYMMDD
+        re.compile(r"\d{4}-\d{2}-\d{2}"),  # YYYY-MM-DD
+        re.compile(r"\d{2}/\d{2}/\d{4}"),  # MM/DD/YYYY
+    ]
+
+    # Convert the comparison date to a datetime object
+    comparison_date_obj = dt.datetime.strptime(comparison_date, "%Y%m%d")
+
+    # Get the current datetime and convert market close time to datetime object
+    current_datetime = dt.datetime.now()
+    market_close_time_obj = dt.datetime.strptime(market_close_time, "%H:%M:%S").time()
+
+    # Define the comparison operator function based on market close time
+    def comparison_operator(date_obj):
+        if current_datetime.time() < market_close_time_obj:
+            return date_obj < comparison_date_obj
+        else:
+            return date_obj <= comparison_date_obj
+
+    # List to store all matching dates
+    matching_dates = []
+
+    for pattern in date_patterns:
+        # Find all substrings that match the pattern
+        dates = pattern.findall(input_string)
+
+        for date_str in dates:
+            try:
+                if pattern == date_patterns[0]:
+                    date_obj = dt.datetime.strptime(date_str, "%Y%m%d")
+                elif pattern == date_patterns[1]:
+                    date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
+                elif pattern == date_patterns[2]:
+                    date_obj = dt.datetime.strptime(date_str, "%m/%d/%Y")
+
+                if comparison_operator(date_obj):
+                    return True
+            except ValueError:
+                # Skip invalid dates
+                continue
+
+    return False
+
+
+def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_side: str) -> list[str]:
+    """get a list of internal order ids for a specified symbol, strategy and entry side combination
+
+    Args:
+        strategy (str): strategy
+        long_symbol (str): long symbol name
+        broker_entry_side (str): side of the  entry trade. 'B' or 'S'. So if entry was "SHORT", broker_entry_side will be 'S'
+
+    Returns:
+        list[str]: list of internal order ids that meet entry combination
+
+    """
+    int_order_ids = []
+    for int_order_id in broker.redis_o.scan_iter(strategy + "_" + "*"):
+        int_order_ids.append(int_order_id)
+    # get keys for the long_symbol
+    int_order_ids = [
+        int_order_id
+        for int_order_id in int_order_ids
+        if broker.redis_o.type(int_order_id) == "hash"  # noqa
+        and broker.redis_o.hexists(int_order_id, "long_symbol")
+        and long_symbol == broker.redis_o.hget(int_order_id, "long_symbol")
+    ]
+    if broker_entry_side is not None:
+        entry_keys = [broker.redis_o.hget(int_order_id, "entry_keys").split()[0] for int_order_id in int_order_ids]
+        jsons = [broker.redis_o.hgetall(entry_key) for entry_key in entry_keys]
+        indices = [i for i in range(len(jsons)) if jsons[i].get("order_type") == broker_entry_side]
+        int_order_ids = [int_order_ids[index] for index in indices]
+    return int_order_ids
+
+
+def get_open_position_by_order(
+    broker: BrokerBase,
+    int_order_id: str,
+    exclude_zero: bool = True,
+    side: List = ["entry", "exit"],
+    market_close_time: str = "15:30:00",
+) -> Dict[str, Position]:
+    logger.debug(f"Getting open position for {int_order_id}")
+
+    def _get_position_by_broker_order_ids(keys, positions: Dict[str, Position]) -> Dict[str, Position]:
+        for key in keys:
+            order = Order(**broker.redis_o.hgetall(key))
+            symbol = order.long_symbol
+            position = positions.get(symbol, Position())
+            position.symbol = symbol
+            quantity = order.quantity if order.order_type in ["BUY", "COVER"] else -1 * order.quantity
+            position.value = order.price * quantity + position.price * position.size
+            position.size = position.size + quantity
+            if position.size != 0:
+                position.price = position.value / position.size
+            else:
+                position.price = 0
+            positions[symbol] = position
+        return positions
+
+    def _expire_derivative(
+        broker: BrokerBase, internal_order_id: str, symbol: str, size: int, market_close_time: str
+    ) -> bool:
+        expire = False
+        expiry = symbol.split("_")[2]
+        if (
+            expiry is not None
+            and len(expiry) > 0
+            and (
+                expiry < dt.datetime.today().strftime("%Y%m%d")
+                or (
+                    expiry == dt.datetime.today().strftime("%Y%m%d")
+                    and dt.datetime.now().strftime("%H:%M:%S") > market_close_time
+                )
+            )
+        ):
+            expire = True
+            entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
+            entry_key = entry_keys[0]
+            exchange = hget_with_default(broker, entry_key, "exchange", "NSE")
+            exit_price = broker.get_quote(symbol, exchange).last
+            exit_quantity = abs(size)
+            exit_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sq_off_order = Order(
+                order_type="SELL" if size > 0 else "COVER",
+                quantity=exit_quantity,
+                exchange="SQUAREOFF",
+                exchange_segment="D",
+                is_intraday=False,
+                price=exit_price,
+                ahplaced="N",
+            )
+            sq_off_order.exch_order_id = str(random.randint(1000000000000000, 9000000000000000)) + "P"
+            sq_off_order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
+            sq_off_order.broker_order_id = str(random.randint(10000000, 99999999)) + "P"
+            sq_off_order.orderRef = internal_order_id
+            sq_off_order.internal_order_id = internal_order_id
+            sq_off_order.message = "Expiration Paper Order"
+            sq_off_order.status = OrderStatus.FILLED
+            sq_off_order.long_symbol = symbol
+            _process_broker_order_update(broker, sq_off_order, symbol)
+        return expire
+
+    positions: Dict[str, Position] = {}
+    entry = True if "entry" in side else False
+    exit = True if "exit" in side else False
+    if entry:
+        entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
+        positions = _get_position_by_broker_order_ids(entry_keys, positions)
+    if exit:
+        exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+        positions = _get_position_by_broker_order_ids(exit_keys, positions)
+    for position in positions.values():
+        position.price = position.value / position.size if position.size != 0 else 0
+    if exclude_zero:
+        positions = {key: value for key, value in positions.items() if value.size != 0}
+    if entry and exit:
+        expired_contracts = []
+        # check for expired contracts
+        for symbol, position in positions.items():
+            if position.size != 0:
+                expired = _expire_derivative(broker, int_order_id, symbol, position.size, market_close_time)
+                if expired:
+                    expired_contracts.append(symbol)
+        positions = {key: value for key, value in positions.items() if value.symbol not in expired_contracts}
+    return positions
+
+
+def parse_combo_symbol(combo_symbol):
+    result = OrderedDict()
+    if "?" not in combo_symbol:
+        result[combo_symbol] = 1
+        return result
+
+    symbols = combo_symbol.split(":")
+
+    for symbol in symbols:
+        name, quantity = symbol.split("?")
+        result[name] = int(quantity)
+
+    return result
+
+
+def get_exit_candidates(broker: BrokerBase, strategy: str, long_symbol: str, side: str) -> list:
+    """Retreive exit candidates for a specified strategy, side and entry order type
+
+    Args:
+        strategy (str): strategy name
+        long_symbol (str): long symbol
+        side (str): 'SELL' if original position is long. 'COVER' if original position is short. side should be the order type that will result in position closure.
+
+    Returns:
+        list: list of internal order ids that have matching positions for exit
+    """
+    if side == "SELL":
+        broker_entry_side = "BUY"
+    elif side == "COVER":
+        broker_entry_side = "SHORT"
+    else:
+        broker_entry_side = "UNDEFINED"
+    int_order_ids = get_orders_by_symbol(broker, strategy, long_symbol, broker_entry_side)
+    # get keys that have an open position. This is equal to keys that have an exit order that have a status of
+    # filled
+    if int_order_ids:
+        int_order_ids = [
+            int_order_id for int_order_id in int_order_ids if len(get_open_position_by_order(broker, int_order_id)) != 0
+        ]
+    else:
+        # Handle the case where int_order_ids is empty, if needed
+        pass
+    # order keys to support fifo, key with lower integer component should be first
+    int_order_ids.sort(key=lambda pair: pair.split("_")[1])
+    logger.info("Exit Candidates -->" + ",".join(int_order_ids))
+    return int_order_ids
+
+
+def get_limit_price(
+    broker: BrokerBase,
+    price_type=None,
+    order_type=None,
+    symbol=None,
+    price_broker: List[BrokerBase] = None,
+    exchange="NSE",
+    mds=False,
+):
+    exchange = broker.map_exchange_for_api(symbol, exchange)
+    if price_broker is None:
+        price_broker = [broker]
+    # quantity = order.quantity if order.order_type=='BUY' or order.order_type=='COVER' else order.quantity*-1
+    ref_price = float("nan")
+    pattern_plus = r"(LMT|BID|ASK)\s*\+\s*([+-]?\d+(\.\d+)?)"
+    pattern_minus = r"(LMT|BID|ASK)\s*\-\s*([+-]?\d+(\.\d+)?)"
+    pattern_mult = r"(LMT|BID|ASK)\s*\*\s*([+-]?\d+(\.\d+)?)"
+    match_plus = re.match(pattern_plus, str(price_type))
+    match_minus = re.match(pattern_minus, str(price_type))
+    match_mult = re.match(pattern_mult, str(price_type))
+    if price_type in ["LMT", "BID", "ASK"] or match_plus or match_minus or match_mult:
+        ticker = get_price(price_broker, symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
+        if "BID" in str(price_type):
+            ref_price = ticker.bid
+        elif "ASK" in str(price_type):
+            ref_price = ticker.ask
+        else:
+            ref_price = (ticker.bid + ticker.ask) / 2
+        if match_plus:
+            ref_price = ref_price + float(match_plus.group(2))
+        elif match_minus:
+            ref_price = ref_price - float(match_minus.group(2))
+        elif match_mult:
+            ref_price = ref_price * float(match_mult.group(2))
+        else:
+            pass
+        if not math.isnan(ref_price):
+            ref_price = int(
+                ref_price / broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05)
+            ) * broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05)
+            if ref_price <= 0:
+                ref_price = (
+                    max(
+                        broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05),
+                        ticker.bid + broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05),
+                    )
+                    if order_type in ["BUY", "COVER"]
+                    else ticker.ask - broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05)
+                )
+    elif price_type == "MKT":
+        ticker = get_price(price_broker, symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
+        if order_type in ["BUY", "COVER"]:
+            ref_price = ticker.ask
+            # lmt_price = int(ticker.ask / 2) - 1
+        else:
+            ref_price = ticker.bid
+            # lmt_price = int(ticker.bid * 2) + 1
+        if ref_price <= 0:
+            ref_price = (
+                max(
+                    broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05),
+                    ticker.bid + broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05),
+                )
+                if order_type in ["BUY", "COVER"]
+                else ticker.ask - broker.exchange_mappings[exchange]["contracttick_map"].get(symbol, 0.05)
+            )
+    elif isinstance(price_type, float) or isinstance(price_type, int):
+        ref_price = price_type
+    else:
+        ref_price = 0
+    return ref_price
+
+
+def get_combo_sub_order_type(order: Order, sub_order_qty: int) -> str:
+    """Get the order type  for combo suborder
+
+    Args:
+        order (Order): combo order
+        sub_order_qty (int): suborder quantity as per combo definition when buying 1 unit of combo
+
+    Returns:
+        str: order type of ['BUY','SELL','SHORT','COVER']
+    """
+    if "?" not in order.long_symbol:
+        return order.order_type
+
+    if order.order_type in ["BUY", "SHORT"]:
+        if sub_order_qty > 0:
+            return "BUY"
+        else:
+            return "SHORT"
+
+    if order.order_type in ["SELL", "COVER"]:
+        if sub_order_qty > 0:
+            return "COVER"
+        else:
+            return "SELL"
+
+
+def transmit_entry_order(
+    broker: BrokerBase, strategy: str, order: Order, paper: bool = True, price_broker: List[BrokerBase] = None
+) -> Union[str, None]:
+    """Entry order sent to broker
+
+    Args:
+        strategy (str): strategy
+        long_symbol (str): long symbol
+        order (Order): order object
+        paper (bool): If true (default), places simulated order
+
+    Returns:
+        int: status as returned by broker. 0 means success. anything else is an error
+    """
+
+    if order.price is None:
+        logger.error(f"Order not placed. Price was set as None for symbol: {order.long_symbol}")
+        return None
+    if price_broker is None:
+        price_broker = [broker]
+    if order.internal_order_id is None:
+        next_order_id = broker.starting_order_ids_int.get(strategy, 1)
+        broker.starting_order_ids_int[strategy] = next_order_id + 1
+        internal_order_id = strategy + "_" + str(next_order_id)
+        order.internal_order_id = internal_order_id
+        order.paper = paper
+    order.paper = paper
+
+    if "?" in order.long_symbol:
+        combo_order = True
+        combo_symbols = parse_combo_symbol(order.long_symbol)
+        symbols = list(combo_symbols.keys())
+        quantities = [
+            x * order.quantity if order.order_type == "BUY" else -x * order.quantity for x in combo_symbols.values()
+        ]
+        if isinstance(order.price_type, list):
+            price_types = order.price_type
+        else:
+            price_types = [order.price_type] * len(symbols)
+        # price_types = [0] * len(symbols) if paper is False else ["MKT"] * len(symbols)
+    else:
+        symbols = [order.long_symbol]
+        quantities = [order.quantity if order.order_type == "BUY" else -1 * order.quantity]
+        price_types = [order.price_type]
+        additional_infos = [order.additional_info]
+    symbols, quantities, price_types, additional_infos = _sort_list(symbols, quantities, price_types, additional_infos)
+    out = None
+    for symbol, quantity, price_type, additional_info in zip(symbols, quantities, price_types, additional_infos):
+        temp_order = deepcopy(order)
+        temp_order.order_type = get_combo_sub_order_type(order, quantity)
+        temp_order.quantity = abs(quantity)
+        temp_order.long_symbol = symbol
+        lmt_price = get_limit_price(
+            broker,
+            price_type=price_type,
+            order_type=temp_order.order_type,
+            symbol=symbol,
+            price_broker=price_broker,
+            exchange=temp_order.exchange,
+        )
+        temp_order.price = lmt_price
+        out = broker.place_order(temp_order)
+        out = _process_broker_order_update(broker, out, order.long_symbol)
+    return out
+
+
+def transmit_exit_order(
+    broker: BrokerBase,
+    strategy: str,
+    order: Order,
+    validate_db_position=True,
+    paper=True,
+    price_broker: List[BrokerBase] = None,
+    int_order_id: str = None,
+) -> None:
+    """Exit order sent to broker
+
+    Args:
+        strategy (str): name of strategy
+        long_symbol (str): symbol to exit
+        order (Order): order object
+        paper (bool): If true (default), places simulated order
+        int_order_id (str) : if specified, exits are effected from the specified order id
+    """
+
+    def cancel_internal_order_id(
+        broker: BrokerBase,
+        internal_order_id: str,
+    ):
+        order_mapping = broker.redis_o.hgetall(internal_order_id)
+        entry_keys = order_mapping.get("entry_keys")
+        if entry_keys is not None:
+            entry_keys_list = entry_keys.split(" ")
+            for ek in entry_keys_list:
+                broker.cancel_order(broker_order_id=ek)
+        exit_keys = order_mapping.get("exit_keys")
+        if exit_keys is not None:
+            exit_keys_list = exit_keys.split(" ")
+            for ek in exit_keys_list:
+                broker.cancel_order(broker_order_id=ek)
+
+    logger.info(
+        f"Exit order. Symbol: {order.long_symbol}{chr(10)} Side: {order.order_type}. Quantity: {order.quantity}"
+    )
+    exit_candidates = (
+        [int_order_id] if int_order_id else get_exit_candidates(broker, strategy, order.long_symbol, order.order_type)
+    )
+    order.paper = paper
+    if price_broker is None:
+        price_broker = [broker]
+
+    if "?" in order.long_symbol:
+        combo_symbols = parse_combo_symbol(order.long_symbol)
+        exit_symbols = list(combo_symbols.keys())
+        exit_quantities_required = [
+            x * order.quantity if order.order_type == "COVER" else -x * order.quantity for x in combo_symbols.values()
+        ]
+
+        if isinstance(order.price_type, list):
+            price_types = order.price_type
+        else:
+            price_types = [order.price_type] * len(exit_symbols)
+
+        # price_types = [0] * len(exit_symbols) if paper is False else ["MKT"] * len(exit_symbols)
+
+    else:
+        exit_symbols = [order.long_symbol]
+        exit_quantities_required = [order.quantity if order.order_type == "COVER" else -1 * order.quantity]
+        price_types = order.price_type if isinstance(order.price_type, list) else [order.price_type]
+    quantities_remaining = exit_quantities_required
+    additional_infos = order.additional_info if isinstance(order.additional_info, list) else [order.additional_info]
+
+    exit_symbols, quantities_remaining, price_types, additional_infos = _sort_list(
+        exit_symbols, quantities_remaining, price_types, additional_infos
+    )
+
+    if len(exit_candidates) > 0 and validate_db_position:
+        for internal_order_id in exit_candidates:
+            if any(quantities_remaining):
+                cancel_internal_order_id(broker, internal_order_id)
+                actual_positions = get_open_position_by_order(broker, internal_order_id)
+                loop_quantities_remaining = deepcopy(quantities_remaining)
+                for exit_symbol, quantity, price_type, additional_info in zip(
+                    exit_symbols, loop_quantities_remaining, price_types, additional_infos
+                ):
+                    actual_position = actual_positions.get(exit_symbol, Position())
+                    if quantity != 0 and quantity * actual_position.size < 0:
+                        order_new = deepcopy(order)
+                        order_new.additional_info = _merge_additional_info(order_new.additional_info, additional_info)
+                        order_new.long_symbol = exit_symbol
+                        order_new.quantity = min(abs(quantity), abs(actual_position.size))
+                        order_new.order_type = get_combo_sub_order_type(order, quantity)
+                        order_new.internal_order_id = internal_order_id
+                        order_new.orderRef = internal_order_id
+                        lmt_price = get_limit_price(
+                            broker,
+                            price_type=price_type,
+                            order_type=order_new.order_type,
+                            symbol=exit_symbol,
+                            price_broker=price_broker,
+                            exchange=order_new.exchange,
+                        )
+                        order_new.price = lmt_price
+                        out = broker.place_order(order=order_new)
+                        _process_broker_order_update(broker, out, order.long_symbol)
+                        calc_index = exit_symbols.index(exit_symbol)
+                        if order_new.order_type in ["COVER"]:
+                            quantities_remaining[calc_index] -= order_new.quantity
+                        else:
+                            quantities_remaining[calc_index] += order_new.quantity
+    else:
+        logger.info(
+            f"No exit candidates found for symbol: {order.long_symbol} and order: {order.order_type} and strategy: "
+            f"{strategy}"
+        )
+
+
+def calculate_extra_combo_positions(order_position: Dict[str, Position], base_position: Dict[str, int]) -> dict:
+    """Calculates extra positions outside completed combos.
+
+    Args:
+        order_position (dict): Positions of symbols within a combo.
+        base_position (dict): Baseline combo position making 1 combo unit.
+
+    Returns:
+        dict: Dictionary with incomplete details, total in-progress combos, and completed combos.
+    """
+    # Calculate complete multiples and determine first sign
+    complete_multiples = []
+    for symbol, base_pos in base_position.items():
+        actual_position = order_position.get(symbol, Position())
+        complete_multiples.append(actual_position.size / base_pos)
+
+    # Determine the sign of the first non-zero multiple
+    first_sign = 1  # Default to positive if all are zeros
+    for x in complete_multiples:
+        if x != 0:
+            first_sign = int(math.copysign(1, x))
+            break
+
+    # Check if all multiples are on the same side (considering 0 as positive or negative)
+    all_same_side = all(int(math.copysign(1, x)) == first_sign or x == 0 for x in complete_multiples)
+
+    if not all_same_side:
+        raise ValueError("Combo Order does not have consistent fill sides")
+
+    # Calculate completed and in-progress combos
+    abs_multiples = [abs(m) for m in complete_multiples]
+    completed = math.floor(min(abs_multiples))
+    in_progress = math.ceil(max(abs_multiples))
+
+    # Adjust completed and in-progress based on sign of first non-zero multiple
+    completed *= first_sign
+    in_progress *= first_sign
+
+    # Calculate extra positions
+    out = {}
+    for symbol, base_pos in base_position.items():
+        actual_position = order_position.get(symbol, Position())
+        extra_position = actual_position.size - base_pos * completed
+        if extra_position != 0:
+            out[symbol] = extra_position
+
+    return {"incomplete_details": out, "total_in_progress": in_progress, "total_completed": completed}
+
+
+def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: str) -> str:
+    """Processes broker  response to a fresh order (entry/exit)
+
+    Args:
+        broker (BrokerBase): broker instance
+        order (Order): Order
+        long_symbol (str): combo symbol if combo order, else actual symbol
+
+    Returns:
+        str: internal order id
+    """
+    if order is None:
+        logger.error(f"Order Not placed for {order.long_symbol}. Mother symbol: {long_symbol}. Are you logged in??")
+        return None
+    if order.status in [OrderStatus.REJECTED]:
+        logger.error(
+            f"Order not placed for {order.long_symbol}. Status was {order.status}. Message was {order.message}. Mother symbol was: {long_symbol}"
+        )
+        return None
+
+    if order.order_type in ["BUY", "SHORT"]:
+        current_orders = broker.redis_o.hget(order.internal_order_id, "entry_keys")
+        new_orders = (
+            str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
+        )
+        broker.redis_o.hset(order.orderRef, "entry_keys", new_orders)
+        broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol)
+
+    if order.order_type in ["SELL", "COVER"]:
+        current_orders = broker.redis_o.hget(order.internal_order_id, "exit_keys")
+        new_orders = (
+            str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
+        )
+        broker.redis_o.hset(order.orderRef, "exit_keys", new_orders)
+
+    broker.redis_o.hmset(str(order.broker_order_id), {key: str(val) for key, val in order.to_dict().items()})
+    update_order_status(broker, order.internal_order_id, str(order.broker_order_id), eod=False)
+    return order.internal_order_id
+
+
+def exit_is_expiration(broker: BrokerBase, internal_order_id: str) -> bool:
+    """Are exit key(s) all expired
+
+    Args:
+        broker (BrokerBase): broker
+        internal_order_id (str): internal order id
+
+    Returns:
+        bool: True if exit key(s) exits and are expiration(s). Else False
+    """
+    exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
+    if len(exit_keys) == 0:
+        return False
+    out = True
+    for ek in exit_keys:
+        if "expir" not in broker.redis_o.hget(ek, "message").lower():
+            out = out and False
+    return out
+
+
+def delete_broker_order_id(
+    broker,
+    internal_order_id: str,
+    broker_order_id: str = None,
+):
+    """Safely removes broker_order_id from redis and updates internal_order_id with keys
+
+    Args:
+        internal_order_id (str): internal  order id
+        broker_order_id (str): broker order id
+    """
+    if broker_order_id is None:
+        logger.info(f"Deleting internal order id: {internal_order_id} and linked broker order ids")
+        order_mapping = broker.redis_o.hgetall(internal_order_id)
+        entry_keys = order_mapping.get("entry_keys")
+        if entry_keys is not None:
+            entry_keys_list = entry_keys.split(" ")
+            for ek in entry_keys_list:
+                logger.info(f"Deleting order. Order {ek}")
+                broker.redis_o.delete(ek)
+        exit_keys = order_mapping.get("exit_keys")
+        if exit_keys is not None:
+            exit_keys_list = exit_keys.split(" ")
+            for ek in exit_keys_list:
+                logger.info(f"Deleting order. Order {ek}")
+                broker.redis_o.delete(ek)
+        logger.info(f"Deleting order. Order {internal_order_id}")
+        broker.redis_o.delete(internal_order_id)
+    else:
+        order_mapping = broker.redis_o.hgetall(internal_order_id)
+        if len(order_mapping) == 0:
+            logger.info("Internal Order ID: {internal_order_id} not found")
+            return
+        # check if removal is from entry
+        if str(broker_order_id) in order_mapping.get("entry_keys"):
+            entry_keys = order_mapping.get("entry_keys").split()
+            entry_keys.remove(str(broker_order_id))
+            logger.info(f"Deleting broker order id: {broker_order_id}")
+            exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
+            if len(entry_keys) == 0 and len(exit_keys) > 0:
+                if exit_is_expiration(broker, internal_order_id):
+                    pipe = broker.redis_o.pipeline()
+                    pipe.delete(internal_order_id)
+                    pipe.delete(broker_order_id)
+                    for ek in exit_keys:
+                        pipe.delete(ek)
+                    pipe.execute()
+                    pipe.reset()
+                    logger.info(
+                        f"Deleting order and internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
+                    )
+                else:
+                    logger.error(f"Unexpected exit key found for order id {internal_order_id}")
+            else:
+                order_mapping["entry_keys"] = " ".join(entry_keys)
+                pipe = broker.redis_o.pipeline()
+                pipe.delete(internal_order_id)
+                if not order_mapping["entry_keys"].strip() == "":
+                    pipe.hmset(internal_order_id, order_mapping)
+                pipe.delete(broker_order_id)
+                pipe.execute()
+                pipe.reset()
+                logger.info(
+                    f"Deleting unfilled order and updating internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
+                )
+        elif order_mapping.get("exit_keys") is not None and str(broker_order_id) in order_mapping.get("exit_keys"):
+            # check if removal is from exit
+            exit_keys = order_mapping.get("exit_keys").split()
+            exit_keys.remove(str(broker_order_id))
+            if len(exit_keys) == 0:
+                order_mapping.pop("exit_keys")
+            else:
+                order_mapping["exit_keys"] = " ".join(exit_keys)
+            pipe = broker.redis_o.pipeline()
+            pipe.delete(internal_order_id)
+            pipe.hmset(internal_order_id, order_mapping)
+            pipe.delete(broker_order_id)
+            pipe.execute()
+            pipe.reset()
+            logger.info(
+                f"Deleting  order and updating internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
+            )
+
+
+def update_order_status(
+    broker: BrokerBase, internal_order_id: str, broker_order_id: str, eod: bool = False
+) -> OrderInfo:
+    """
+    if eod is false, [price,quantity,status] is updated to [fill_price/order_price,order_size,orderstatus]
+    if eod is true, [price,quantity,status] is updated to [fill_price,fill_size,orderstatus]. in addition to eod functionality, order is deleted if fill_size is zero
+    """
+    fills = broker.get_order_info(broker_order_id=broker_order_id)
+    required_attributes = [
+        "broker",
+        "status",
+        "fill_size",
+        "fill_price",
+        "order_price",
+        "order_size",
+        "exchange_order_id",
+    ]
+    for attr in required_attributes:
+        if not hasattr(fills, attr) or getattr(fills, attr) is None:
+            logger.error(
+                f"Missing or invalid attribute {attr} in order information for broker_order_id: {broker_order_id}"
+            )
+            return fills
+
+    if broker.broker != fills.broker:
+        return fills
+    logger.debug(f"Order information for {internal_order_id}, broker_order_id: {broker_order_id} {fills}")
+    if fills.status == OrderStatus.CANCELLED and fills.fill_size > 0:
+        broker.redis_o.hset(broker_order_id, "price", str(fills.fill_price))
+        broker.redis_o.hset(broker_order_id, "quantity", str(fills.fill_size))
+        broker.redis_o.hset(broker_order_id, "status", fills.status.name)
+        broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
+    elif (fills.status == OrderStatus.CANCELLED and fills.fill_size == 0) or (fills.status == OrderStatus.REJECTED):
+        delete_broker_order_id(broker, internal_order_id, broker_order_id)
+    elif eod:
+        if fills.fill_size > 0:
+            broker.redis_o.hset(broker_order_id, "price", str(fills.fill_price))
+            broker.redis_o.hset(broker_order_id, "quantity", str(fills.fill_size))
+            broker.redis_o.hset(broker_order_id, "status", fills.status.name)
+            broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
+        else:
+            delete_broker_order_id(broker, internal_order_id, broker_order_id)
+    else:
+        if fills.status == OrderStatus.HISTORICAL:
+            return fills
+        elif fills.fill_price == 0:
+            broker.redis_o.hset(broker_order_id, "price", str(fills.order_price))
+            broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
+        else:
+            broker.redis_o.hset(broker_order_id, "price", str(fills.fill_price))
+            broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
+        broker.redis_o.hset(broker_order_id, "quantity", str(fills.order_size))
+        broker.redis_o.hset(broker_order_id, "status", fills.status.name)
+    return fills
+
+
+def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = None, exchange: str = "NSE") -> list[str]:
+    """Get option chain
+
+    Args:
+        symbol_name (str): symbol name either long_name or short_name
+        expiry (str, optional): Expiry formatted as yyyymmdd. Defaults to None.
+        file_path (str, optional): Full path to symbols file. Defaults to None.
+
+    Returns:
+        list[str]: List containing longnames of available option symbols
+    """
+    symbol_name_opt = symbol_name.replace("_STK_", "_OPT_").replace("_IND_", "_OPT_")
+    exchange = broker.map_exchange_for_api(symbol_name_opt, exchange)
+    symbols = list(broker.exchange_mappings[exchange]["symbol_map"].keys())
+    short_symbol = symbol_name.split("_")[0]
+    linked_options = []
+    if expiry is not None:
+        expiry, _ = valid_datetime(expiry, "%Y%m%d")
+        symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_{expiry}")]
+    else:
+        symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_")]
+    linked_options = list(symbols)
+    return linked_options
+
+
+def get_linked_futures(symbol_name: str, expiry: str = None, file_path: str = None) -> list[str]:
+    """Get futures chain
+
+    Args:
+        symbol_name (str): symbol name either long_name or short_name
+        expiry (str, optional): Expiry formatted as yyyymmdd. Defaults to None.
+        file_path (str, optional): Full path to symbols file. Defaults to None.
+
+    Returns:
+        list[str]: List containing longnames of available option symbols
+    """
+    if file_path is not None:
+        symbols = pd.read_csv(file_path)
+    else:
+        return []
+    short_symbol = symbol_name.split("_")[0]
+    linked_futures = []
+    if expiry is not None:
+        symbols = symbols.loc[symbols["long_symbol"].str.contains(f"\\b{short_symbol}_FUT_{expiry}"), "long_symbol"]
+    else:
+        symbols = symbols.loc[symbols["long_symbol"].str.contains(f"\\b{short_symbol}_FUT_"), "long_symbol"]
+    linked_futures = list(symbols)
+    return linked_futures
+
+
+def get_latest_symbol_file(directory_path="/home/psharma/onedrive/rfiles/data/static/symbols"):
+    pattern = "*_symbols.csv"
+    files = glob.glob(os.path.join(directory_path, pattern))
+    dates = [int(os.path.basename(file).split("_")[0]) for file in files]
+    latest_index = dates.index(max(dates))
+    latest_file = files[latest_index] if files else None
+    return latest_file
+
+
+def get_universe(file_path: str = None, product_types=["OPT", "FUT"], exchanges=["N", "B"], expiry=None):
+    """Get list of all symbols for a given product type and exchange
+
+    Args:
+        file_path (str, optional): _description_. Defaults to None.
+        product_types (list, optional): _description_. Defaults to ["OPT", "FUT"].
+        exchanges (list, optional): _description_. Defaults to ["N", "B"].
+        expiry (str, optional): expiry formatted as yyyymmdd
+
+    Returns:
+        list: list of long names
+    """
+    if file_path is None:
+        file_path = get_latest_symbol_file()
+    symbols = pd.read_csv(file_path)
+    out = []
+
+    for exchange in exchanges:
+        for prod_type in product_types:
+            # Filter condition for prod_type and exchange
+            condition = (symbols["long_symbol"].str.contains(f"_{prod_type}_")) & (symbols["Exch"] == exchange)
+
+            # Add condition for expiry if it's not None
+            if expiry is not None:
+                condition &= symbols["long_symbol"].str.contains(expiry)
+
+            temp = list(symbols.loc[condition, "long_symbol"])
+            out = out + temp
+    return out
+
+
+def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str = None) -> list[str]:
+    """Get a list of all short symbol names for a specified exchange and security type
+
+    Args:
+        exchange (str): Exchange name. Either 'N' for NSE or 'M' for MCX
+        sec_type (str): security type like 'IND",'STK','FUT','OPT'
+        file_path (str, optional): path to symbols file if historical information needed. Defaults to None.
+
+    Returns:
+        list[str]: list of short symbol names
+    """
+    if os.path.isdir(file_path):
+        # Get list of files in directory sorted by modification time in descending order
+        files = sorted(os.listdir(file_path), reverse=True)
+        if files:
+            # Read CSV from the first file in the sorted list
+            first_file = files[0]
+            symbols = pd.read_csv(os.path.join(file_path, first_file))
+        else:
+            return []
+    elif os.path.isfile(file_path):
+        # Read CSV from the given file
+        symbols = pd.read_csv(file_path)
+    else:
+        return []
+
+    unique_short_names = []
+    symbols = symbols[(symbols.Exch == exchange) & (symbols.long_symbol.str.contains(f"_{sec_type}"))]
+    short_name = symbols["long_symbol"].str.split("_").str[0]
+    unique_short_names = list(short_name.unique())
+    return unique_short_names
+
+
+def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = None, exchange="NSE") -> int:
+    """Get margin from Zerodha for option contracts
+
+    Args:
+        long_symbol (str): long symbol
+        proxy (str, optional): Proxy specified as ipaddress:port . Defaults to None.
+
+    Returns:
+        int: margin for contract
+    """
+    # https://stackoverflow.com/questions/56591881/web-scrape-with-multiple-inputs-and-collect-total-margin-required
+    symbol = long_symbol.split("_")[0]
+    strike_price = float(long_symbol.split("_")[4])
+    option_type = long_symbol.split("_")[3]
+    expiry = long_symbol.split("_")[2]
+
+    BASE_URL = "https://zerodha.com/margin-calculator/SPAN"
+    scrip = symbol + dt.datetime.strptime(expiry, "%Y%m%d").strftime("%y%b").upper()
+    z_option_type = "CE" if option_type == "CALL" else "PE"
+    strike_price = ("%f" % strike_price).rstrip("0").rstrip(".")
+    #     long_symbol = f'{symbol}_OPT_{expiry}_{option_type}_{strike_price}'
+    quantity = broker.get_min_lot_size(long_symbol, exchange)
+    payload = {
+        "action": "calculate",
+        "exchange[]": "NFO",
+        "product[]": "OPT",
+        "scrip[]": scrip,
+        "option_type[]": z_option_type,
+        "strike_price[]": strike_price,
+        "qty[]": quantity,
+        "trade[]": "sell",
+    }
+    try:
+        session = Session()
+        if proxy is not None:
+            proxies = {"http": "https://" + proxy}
+            res = session.post(BASE_URL, data=payload, proxies=proxies)
+        else:
+            res = session.post(BASE_URL, data=payload)
+        data = res.json()
+        try:
+            output = data["total"]["total"]
+            output = int(output)
+        except Exception:
+            output = 1000000
+        logger.info(f"margin for {long_symbol}:{output}")
+        session.close()
+        return output
+    except Exception as e:
+        logger.exception("Error")
+
+
+def get_margin_samco(long_symbol: str, driver_path: str = None, proxy: str = None) -> int:
+    """Get margin from SAMCO for option contracts
+
+    Args:
+        long_symbol (str): long symbol
+        driver_path (str, optional): path to firefox driver. Defaults to None.
+        proxy (str, optional): proxy address, specified as ipaddress:port . Defaults to None.
+
+    Returns:
+        int: margin
+    """
+    output = 1000000
+    strike = long_symbol.split("_")[4]
+    type = long_symbol.split("_")[3].lower()
+    expiry = long_symbol.split("_")[2]
+    symbol = long_symbol.split("_")[0]
+
+    try:
+        margin_url = "https://www.samco.in/span"
+        op = webdriver.FirefoxOptions()
+        if driver_path is None:
+            driver_path = "/home/psharma/Downloads/geckodriver"
+        if proxy is not None:
+            op.add_argument("--proxy-server=%s" % proxy)
+        op.add_argument("--headless")
+        driver = webdriver.Firefox(executable_path=driver_path, options=op)
+        driver.get(margin_url)
+        driver.implicitly_wait(10)
+        reset = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//a[@class='close-icon sprite-icon'])[1]"))
+        )
+        driver.execute_script("arguments[0].click();", reset)
+        # reset.click()
+        exchange = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='exchange'])[1]"))
+        )
+        exchange.send_keys("NFO")
+        product = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='product'])[1]"))
+        )
+        product.send_keys("Options")
+        underlying = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='underlying'])[1]"))
+        )
+        underlying.send_keys(symbol)
+        expiry_element = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='expiry'])[1]"))
+        )
+        expiry_formatted = dt.datetime.strptime(expiry, "%Y%m%d").strftime("%d%b%y").upper()
+        expiry_element.send_keys(expiry_formatted)
+
+        strike_1 = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='strike_price'])[1]"))
+        )
+        time.sleep(2)
+        strike_1.send_keys(strike)
+
+        sell = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//label[normalize-space()='Sell'])[1]"))
+        )
+        driver.execute_script("arguments[0].click();", sell)
+        # sell.click()
+
+        if type == "put":
+            opt_type = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, "(//select[@name='option'])[1]"))
+            )
+            opt_type.send_keys("PUTS")
+        add = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//button[normalize-space()='Add'])[1]"))
+        )
+        driver.execute_script("arguments[0].click();", add)
+        wait = 0
+        while (
+            int(
+                "".join(
+                    list(filter(str.isdigit, (driver.find_element("xpath", "(//span[@id='total_margin'])[1]").text)))
+                )
+            )
+            == 0
+            and wait < 20
+        ):
+            wait = wait + 1
+            time.sleep(1)
+        try:
+            output = int(
+                "".join(
+                    list(filter(str.isdigit, (driver.find_element("xpath", "(//span[@id='total_margin'])[1]").text)))
+                )
+            )
+        except Exception:
+            output = 100000000
+        logger.info(f"margin for {long_symbol}:{output}")
+        driver.close()
+    except Exception:
+        logger.exception("Error")
+        driver.close()
+        if proxy is not None:
+            proxy = get_free_proxy(driver_path)
+    return output
+
+
+def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = None, proxy: str = None) -> int:
+    output = 1000000
+    strike = long_symbol.split("_")[4]
+    type = long_symbol.split("_")[3].lower()
+    expiry = long_symbol.split("_")[2]
+    symbol = long_symbol.split("_")[0]
+
+    try:
+        margin_url = "https://zerodha.com/margin-calculator/SPAN"
+        op = webdriver.FirefoxOptions()
+        if driver_path is None:
+            driver_path = "/home/psharma/Downloads/geckodriver"
+        if proxy is not None:
+            op.add_argument("--proxy-server=%s" % proxy)
+        op.add_argument("--headless")
+        driver = webdriver.Firefox(executable_path=driver_path, options=op)
+        driver.get(margin_url)
+        driver.implicitly_wait(10)
+        # driver.find_element_by_xpath("(//a[@id='btnReset'])[1]").click()
+        reset = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "(//input[@id='reset'])[1]")))
+        reset.click()
+        segment = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='exchange'])[1]"))
+        )
+        segment.send_keys("NFO")
+        product = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//select[@id='product'])[1]"))
+        )
+        product.send_keys("Options")
+        symbol_box = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//span[@id='select2-scrip-container'])[1]"))
+        )
+        expiry_formatted = dt.datetime.strptime(expiry, "%Y%m%d").strftime("%d-%b-%y").upper()
+        symbol_formatted = f"{symbol} {expiry_formatted}"
+        symbol_box.click()
+        symbol_txtbox = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//input[@role='textbox'])[1]"))
+        )
+        symbol_txtbox.send_keys(symbol_formatted)
+        symbol_txtbox.send_keys(Keys.DOWN)
+        symbol_txtbox.send_keys(Keys.ENTER)
+        if type == "put":
+            opt_type = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.XPATH, "(//select[@id='option_type'])[1]"))
+            )
+            opt_type.send_keys("Puts")
+            # opt_type.send_keys(Keys.ENTER)
+        else:
+            pass
+        strike = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.XPATH, "(//input[@id='strike_price'])[1]"))
+        )
+        strike_price = ("%f" % strike_price).rstrip("0").rstrip(".")
+        strike.send_keys(strike_price)
+        side = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "(//input[@value='sell'])[1]")))
+        side.click()
+        add = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "(//input[@value='Add'])[1]")))
+        add.click()
+        wait = 0
+        while (
+            int(
+                "".join(
+                    list(filter(str.isdigit, (driver.find_element("xpath", "(//span[@class='val total'])[1]").text)))
+                )
+            )
+            == 0
+            and wait < 20
+        ):
+            wait = wait + 1
+            time.sleep(1)
+        try:
+            output = int(
+                "".join(
+                    list(filter(str.isdigit, (driver.find_element("xpath", "(//span[@class='val total'])[1]").text)))
+                )
+            )
+        except Exception:
+            output = 100000000
+        logger.info(f"margin for {long_symbol}:{output}")
+        driver.close()
+    except Exception:
+        driver.close()
+        if proxy is not None:
+            proxy = get_free_proxy(driver_path)
+    return output
+
+
+def get_free_proxy(driver_path: str = None) -> str:
+    """Get working proxy. This requires firefox driver (geckodriver) to be available in specified driver path
+
+    Args:
+        driver_path (str, optional): _description_. Defaults to None.
+
+    Returns:
+        str: proxy as ipaddress:port
+    """
+    op = webdriver.FirefoxOptions()
+    op.add_argument("--headless")
+    if driver_path is None:
+        driver_path = "/home/psharma/Downloads/geckodriver"
+    driver = webdriver.Firefox(executable_path=driver_path, options=op)
+    driver.get("https://sslproxies.org")
+    table = driver.find_element(By.TAG_NAME, "table")
+    thead = table.find_element(By.TAG_NAME, "thead").find_elements(By.TAG_NAME, "th")
+    tbody = table.find_element(By.TAG_NAME, "tbody").find_elements(By.TAG_NAME, "tr")
+
+    headers = []
+    for th in thead:
+        headers.append(th.text.strip())
+
+    proxies = []
+    for tr in tbody:
+        proxy_data = {}
+        tds = tr.find_elements(By.TAG_NAME, "td")
+        for i in range(len(headers)):
+            proxy_data[headers[i]] = tds[i].text.strip()
+        proxies.append(proxy_data)
+    driver.close()
+
+    for i in range(0, len(proxies)):
+        try:
+            if proxies[i]["Country"] in ["India", "Singapore"]:
+                login_url = "https://login.5paisa.com/lwp"
+                op = webdriver.FirefoxOptions()
+                PROXY = proxies[i]["IP Address"] + ":" + proxies[i]["Port"]
+                op.add_argument("--proxy-server=%s" % PROXY)
+                op.add_argument("--headless")
+                dr = webdriver.Firefox(executable_path=driver_path, options=op)
+                dr.get(login_url)
+                if WebDriverWait(dr, 5).until(EC.visibility_of_element_located((By.ID, "loginUser"))):
+                    dr.close()
+                    break
+        except Exception as e:
+            logger.exception("Error")
+            continue
+    logger.info(f"Proxy selected: {proxies[i]}")
+    return proxies[i].get("IP Address") + ":" + proxies[i].get("Port")
+
+
+def get_yield(broker: BrokerBase, long_symbol: str, proxy=None, exchange="NSE") -> list[float]:
+    """Get yield to expiry of an option contract
+
+    Args:
+        long_symbol (str): long symbol
+        proxy (str, optional): of form ipaddress:port. Defaults to None.
+
+    Returns:
+        list[float]: [midprice, bid, ask,yield,margin]
+    """
+    mid = 0
+    margin = get_margin_zerodha(broker, long_symbol, proxy)
+    size = broker.get_min_lot_size(long_symbol, exchange)
+    quote = broker.get_quote(long_symbol, exchange)
+    if quote["BidRate"] > 0 and quote["OffRate"] > 0:
+        mid = (quote["BidRate"] + quote["OffRate"]) / 2
+    mid = mid if mid > 0 else -1
+    if size is not None and quote["BidRate"] > 0 and quote["OffRate"] > 0:
+        max_return = (mid * size) / margin
+        return [mid, quote["BidRate"], quote["OffRate"], max_return, margin]
+    else:
+        return [mid, quote["BidRate"], quote["BidRate"], 100, margin]
+
+
+def review_price_history(symbol: str, exchange: str = "NSE", count: int = 1):
+    """Retrieve the last `count` prices for a symbol from Redis."""
+    global mds_history
+    price_history_key = f"price_history:{symbol}~{exchange}"
+    price_history = mds_history.zrevrange(price_history_key, 0, 0)
+    return [json.loads(price) for price in price_history]
+
+
+def listen_with_timeout(pubsub, symbol, timeout=60):
+    start_time = time.time()
+    while time.time() - start_time <= timeout:
+        message = pubsub.get_message()  # Non-blocking
+        if message:
+            if message["type"] == "message" and json.loads(message["data"])["symbol"] == symbol:
+                return message
+        time.sleep(0.1)  # Prevent busy-waiting
+    return None  # Return None if no valid message is received
+
+
+def is_within_60_seconds(json_price):
+    # Parse the timestamp string into a datetime object
+    price = Price.from_dict(json_price)
+    try:
+        timestamp, _ = valid_datetime(price.timestamp)
+    except ValueError:
+        return False  # Return False if the timestamp format is invalid
+    now = dt.datetime.now()
+    return now <= timestamp + dt.timedelta(seconds=60)
+
+
+def _get_price_mds(brok: BrokerBase, symbol: str, exchange: str = "NSE", channel: str = "mds"):
+    mapped_exchange = brok.map_exchange_for_db(symbol, exchange)
+    history = review_price_history(symbol, mapped_exchange)
+    if len(history) == 1:
+        if is_within_60_seconds(history[0]):
+            return Price.from_dict(history[0])
+    logger.info(
+        f"symbol:{symbol} subscription received by {brok.broker.name}. exchange received in request:{exchange}, exchange sent in broker request:{mapped_exchange}"
+    )
+    # 'subscribe' or 'unsubscribe'
+    out = get_price(brok, symbol, exchange=exchange)
+    request = {
+        "action": "subscribe",
+        "symbol": symbol,
+        "exchange": mapped_exchange,
+        "channel": channel,
+    }
+    mds_history.publish("subscription_requests", json.dumps(request))
+    return out
+
+
+def get_price(
+    brokers: Union[List[BrokerBase], BrokerBase],
+    long_symbol: str,
+    checks: List[str] = ["bid", "ask", "last", "prior_close"],
+    attempts: int = 3,
+    exchange="NSE",
+    mds=False,
+) -> Price:
+    def sum_prices(prices: List[Price]) -> Price:
+        if not prices:
+            return Price()  # Return an empty Price if the list is empty
+
+        return Price(
+            bid=sum(price.bid for price in prices),
+            ask=sum(price.ask for price in prices),
+            bid_volume=sum(price.bid_volume for price in prices),
+            ask_volume=sum(price.ask_volume for price in prices),
+            prior_close=sum(price.prior_close for price in prices),
+            last=sum(price.last for price in prices),
+            symbol=prices[0].symbol,  # Assuming symbol remains the same for all prices
+        )
+
+    if isinstance(brokers, BrokerBase):
+        brokers = [brokers]
+
+    if "?" not in long_symbol:
+        out = Price()
+        out.symbol = long_symbol
+        for attempt in range(attempts):
+            for broker in brokers:
+                mapped_exchange = broker.map_exchange_for_db(long_symbol, exchange)
+                if mds:
+                    price = _get_price_mds(broker, long_symbol, mapped_exchange)
+                else:
+                    price = broker.get_quote(long_symbol, mapped_exchange)
+                out.update(price)
+                if all(not math.isnan(getattr(out, check)) for check in checks):
+                    logger.debug(out)
+                    return out
+    else:
+        out_list = []
+        symbols = parse_combo_symbol(long_symbol)
+        for symbol, size in symbols.items():
+            out = Price()
+            valid_price_found = False
+            for attempt in range(attempts):
+                for broker in brokers:
+                    price = broker.get_quote(symbol, exchange)
+                    out.update(price, size)
+                    if all(not math.isnan(getattr(out, check)) for check in checks):
+                        valid_price_found = True
+                        break  # Stop attempts for this symbol if a valid price is found
+                if valid_price_found:
+                    break  # Stop attempts for other brokers for this symbol
+            out_list.append(out)
+        out = sum_prices(out_list)
+        out.symbol = long_symbol
+    logger.debug(out)
+    return out
+
+
+def get_option_underlying_price(
+    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = None, exchange="NSE", mds=False
+) -> float:
+    """Retrieve underlying price for a symbol and interpolates, if if needed
+
+    Args:
+        symbol (str): sybol name. Should be atleast of form symbol_type___
+        opt_expiry (str): expiry date of option. The expiry is NOT picked from symbol
+        fut_expiry (str, optional): expiry date of underlying future. Defaults to None.
+
+    Returns:
+        float: price of underlying
+    """
+    if fut_expiry is None:
+        price_f = get_price(brokers, symbol, exchange=exchange, mds=mds).last
+    else:
+        underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
+        last_price = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).last
+        if last_price is not None:
+            price_f = last_price
+        else:
+            price_f = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).prior_close
+        if price_f is None:
+            return None
+
+    if "NIFTY" in symbol and fut_expiry is not None:
+        t_o = calc_fractional_business_days(
+            dt.datetime.now(), dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+        )
+        t_f = calc_fractional_business_days(
+            dt.datetime.now(), dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+        )
+        underlying_ind = f'{symbol.split("_")[0]}_IND___'
+        last_price = get_price(brokers, underlying_ind, checks=["last"], exchange=exchange, mds=mds).last
+        if last_price is not None:
+            price_u = last_price
+        else:
+            price_u = get_price(brokers, underlying_ind, checks="prior_close", exchange=exchange, mds=mds).prior_close
+        price_f = price_u + (price_f - price_u) * t_o / t_f
+    return price_f
+
+
+def calculate_delta(
+    brokers: list[BrokerBase], long_symbol, price_f, market_close_time="15:30:00", exchange="NSE", mds=False
+):
+    delta = float("nan")
+    ticker = get_price(brokers, long_symbol, checks=["bid", "ask", "prior_close"], exchange=exchange, mds=mds)
+    price = (ticker.bid + ticker.ask) / 2 if ticker.bid > 0 and ticker.ask > 0 else ticker.prior_close
+    t = (
+        calc_fractional_business_days(
+            dt.datetime.now(),
+            dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
+        )
+        / 252
+    )  # convert days number of years
+    vol = BlackScholesIV(
+        S=price_f,
+        X=float(long_symbol.split("_")[4]),
+        r=0,
+        T=t,
+        OptionType=long_symbol.split("_")[3],
+        OptionPrice=price,
+    )
+    delta = BlackScholesDelta(
+        S=price_f,
+        X=float(long_symbol.split("_")[4]),
+        r=0,
+        sigma=vol,
+        T=t,
+        OptionType=long_symbol.split("_")[3],
+    )
+    return delta
+
+
+def find_option_with_delta(
+    brokers: list[BrokerBase],
+    price_f,
+    option_chain,
+    target_delta,
+    return_lower_delta,
+    market_close_time="15:30:00",
+    exchange="NSE",
+    mds="mds",
+):
+    # Determine the correct option exchange
+    opt_exchange = "NFO" if exchange == "NSE" else "BFO" if exchange == "BSE" else exchange
+
+    left, right = 0, len(option_chain) - 1
+    best_index = -1  # Default to -1 if no valid option is found
+    best_delta = float("-inf") if return_lower_delta else float("inf")  # Best delta found so far
+
+    # Determine if delta is increasing or decreasing
+    mid = (left + right) // 2
+    delta_1, delta_2 = float("nan"), float("nan")
+
+    # Find the first valid left-side delta
+    i = mid
+    while i >= left and math.isnan(delta_1):
+        delta_1 = calculate_delta(brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds)
+        i -= 1
+
+    # Find the first valid right-side delta
+    i = mid + 1
+    while i <= right and math.isnan(delta_2):
+        delta_2 = calculate_delta(brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds)
+        i += 1
+
+    # If we cannot determine a valid direction, return -1
+    if math.isnan(delta_1) or math.isnan(delta_2):
+        return best_index
+
+    increasing = abs(delta_2) > abs(delta_1)  # True if deltas increase with strike price
+    # if delta is nan, we need to decide if the search range is to the left or right of the present strike
+    # we use delta_2 which is on the right range.
+    # and use delta_2's position vis_a_vis target_delta to determine the direction of move to identity next best delta.
+    move_right_on_nan_delta = True
+    if delta_2 > target_delta and increasing:
+        move_right_on_nan_delta = False
+    elif delta_2 > target_delta and not increasing:
+        move_right_on_nan_delta = True
+    elif delta_2 < target_delta and increasing:
+        move_right_on_nan_delta = True
+    elif delta_2 < target_delta and not increasing:
+        move_right_on_nan_delta = False
+
+    while left <= right:
+        mid = (left + right) // 2
+        delta = calculate_delta(brokers, option_chain[mid], price_f, market_close_time, exchange=opt_exchange, mds=mds)
+        delta = abs(delta)  # always select an option using the absolute value of delta.
+
+        if math.isnan(delta):
+            # Skip NaN values by moving in the correct direction
+            if move_right_on_nan_delta:
+                left = mid + 1  # Move right
+            else:
+                right = mid - 1  # Move right
+            continue
+
+        # Update best index if this delta is a better fit
+        if return_lower_delta:
+            if delta <= target_delta and delta > best_delta:
+                best_delta = delta
+                best_index = mid
+        else:
+            if delta >= target_delta and delta < best_delta:
+                best_delta = delta
+                best_index = mid
+
+        # Adjust binary search range based on delta trend
+        if increasing:
+            if delta > target_delta:
+                right = mid - 1  # Search lower strikes for smaller deltas
+            else:
+                left = mid + 1  # Search higher strikes for bigger deltas
+        else:
+            if delta > target_delta:
+                left = mid + 1  # Search higher strikes for smaller deltas
+            else:
+                right = mid - 1  # Search lower strikes for bigger deltas
+
+    return best_index
+
+
+def get_delta_strike(
+    brokers: list[BrokerBase],
+    underlying_symbol: str,
+    delta: float,
+    opt_expiry: str,
+    option_type: str,
+    fut_expiry=None,
+    rounding=None,
+    return_lower_delta=True,
+    use_future=True,
+    search_range=[0.8, 1.2],
+    market_close_time="15:30:00",
+    exchange="NSE",
+    mds=False,
+) -> Union[str, None]:
+    """Returns long symbol for specified value  of absolute delta
+
+
+    Args:
+        underlying_symbol (str): underlying symbol as _STK___ or _IND___
+        delta (float): absolute value of delta
+        expiry (str): formatted as YYYYMMDD
+        option_type (str): CALL or PUT
+        rounding (float, optional): Rounding of strike. Defaults to None.
+        return_lower_strike (bool, optional): should lower strike value be returend. Defaults to True.
+        use_future(bool, optional): Should future prices be used as underlying
+        search_range (list, optional): the range of strikes to search with reference to underlying price. Defaults to [0.8,1.2].
+
+    Returns:
+        Union[str,None]: long_symbol or None
+    """
+    if isinstance(brokers, BrokerBase):
+        brokers = [brokers]
+    exchange = brokers[0].map_exchange_for_api(underlying_symbol, exchange)
+    if use_future:
+        price_f = get_option_underlying_price(
+            brokers, underlying_symbol, opt_expiry, fut_expiry, exchange=exchange, mds=mds
+        )
+    else:
+        price_f = get_price(brokers, underlying_symbol, checks=["last"], exchange=exchange, mds=mds).last
+    option_chain = get_linked_options(brokers[0], underlying_symbol, opt_expiry, exchange)
+    # option_chain = get_opt_chain(broker, underlying_symbol.split("_")[0], opt_expiry_yyyy_mm_dd)
+    option_chain = [opt for opt in option_chain if f"_{option_type}_" in opt]
+    option_chain = [
+        opt for opt in option_chain if search_range[0] * price_f < float(opt.split("_")[4]) < search_range[1] * price_f
+    ]
+    option_chain = sorted(option_chain, key=lambda x: float(x.split("_")[-1]))  # sort ascending
+    if rounding is not None:
+        option_chain = [t for t in option_chain if float(t.split("_")[4]) % rounding == 0]
+    if len(option_chain) == 0:
+        logger.info(f"Option Chain not found for symbol: {underlying_symbol}")
+        return None
+    index = find_option_with_delta(
+        brokers, price_f, option_chain, delta, return_lower_delta, market_close_time, exchange=exchange, mds=mds
+    )
+    if index >= 0:
+        return option_chain[index]
+    else:
+        return None
+
+
+def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds=False) -> dict:
+    ticker = get_price(brokers, symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
+    impact_cost = (ticker.ask - ticker.bi) / ((ticker.ask + ticker.bid) / 2)
+    return {"ticker": ticker, "impact_cost": impact_cost}
+
+
+def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None):
+    # Handle cases where price_types is None or partially filled
+    if not price_types or price_types == [None]:
+        price_types = ["LMT"] * len(symbols)
+    elif len(price_types) < len(symbols):
+        # Propagate the first price type to all symbols
+        price_types = [price_types[0]] * len(symbols)
+
+    # Zip the relevant pairs based on whether exchanges are provided
+    if exchanges is not None:
+        zipped_pairs = zip(quantities, symbols, exchanges, price_types, additional_info)
+    else:
+        zipped_pairs = zip(quantities, symbols, price_types, additional_info)
+
+    # Sort zipped pairs by quantities in descending order
+    sorted_pairs = sorted(zipped_pairs, reverse=True)
+
+    # Unpack the sorted pairs into lists
+    if exchanges is not None:
+        if not sorted_pairs:
+            sorted_quantities, sorted_symbols, sorted_exchanges, sorted_order_types, sorted_additional_info = (
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
+        else:
+            sorted_quantities, sorted_symbols, sorted_exchanges, sorted_order_types, sorted_additional_info = zip(
+                *sorted_pairs
+            )
+        return (
+            list(sorted_symbols),
+            list(sorted_quantities),
+            list(sorted_order_types),
+            list(sorted_exchanges),
+            list(sorted_additional_info),
+        )
+    else:
+        sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
+        return list(sorted_symbols), list(sorted_quantities), list(sorted_order_types), list(sorted_additional_info)
+
+
+def place_combo_order(
+    execution_broker: BrokerBase,
+    strategy: str,
+    symbols: list[str],
+    quantities: list[int],
+    entry: bool,
+    additional_infos: list[str] = [""],
+    exchanges: list[str] = "NSE",
+    price_broker: list[BrokerBase] = None,
+    price_types: list = None,
+    validate_db_position: bool = True,
+    paper: bool = True,
+) -> dict:
+    """Place a combo order with broker
+
+    Args:
+        broker: broker instance
+        strategy (str): strategy name
+        symbols (list[str]): list of symbols
+        quantities (list[int]): list of quantities
+        entry (bool): True if entry else False
+        additional_infos (list): list of json formatted string,
+        price_types (list, optional): list of order types. Should be same length as symbols. Defaults to None which reflects in limit orders at midprice
+        validate_db_position(bool): if set to false, exit orders are generated without updating redis
+        paper: if set to True (default), simulated orders are generated
+
+    Returns:
+        dict: for entry orders a dict containing symbol:int order id is returned. dict is empty for exit orders
+    """
+
+    if price_broker is None:
+        price_broker = [execution_broker]
+    if not isinstance(symbols, list):
+        symbols = [symbols]
+    if not isinstance(price_types, list):
+        price_types = [price_types]
+    if not isinstance(quantities, list):
+        quantities = [quantities]
+    if not isinstance(exchanges, list):
+        exchanges = [exchanges]
+    if len(exchanges) < len(symbols):
+        exchanges = [exchanges[0]] * len(symbols)
+    if not isinstance(additional_infos, list):
+        additional_infos = [additional_infos]
+    if len(additional_infos) < len(symbols):
+        additional_infos = additional_infos + [""] * (len(symbols) - len(additional_infos))
+    exchanges = [
+        execution_broker.map_exchange_for_api(symbol, exchange) for symbol, exchange in zip(symbols, exchanges)
+    ]
+    symbols, quantities, price_types, exchanges, additional_infos = _sort_list(
+        symbols, quantities, price_types, additional_infos, exchanges
+    )
+    out = {}
+    for symbol, exchange, quantity, price_type, additional_info in zip(
+        symbols, exchanges, quantities, price_types, additional_infos
+    ):
+        size = quantity
+        if entry:
+            side = "BUY" if size > 0 else "SHORT"
+        else:
+            side = "COVER" if size > 0 else "SELL"
+        size = abs(size)
+        exch = exchange
+        exch_type = execution_broker.exchange_mappings[exch]["exchangetype_map"].get(symbol.split("?")[0])
+        temp_order = Order(
+            order_type=side,
+            quantity=size,
+            exchange=exch,
+            exchange_segment=exch_type,
+            is_intraday=False,
+            price=float("nan"),
+            ahplaced="N",
+            long_symbol=symbol,
+            price_type=price_type,
+            additional_info=additional_info,
+        )
+        logger.info(f"{symbol} {exch} {size} {side}")
+        if entry:
+            temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper)
+            out[symbol] = temp
+        else:
+            transmit_exit_order(execution_broker, strategy, temp_order, validate_db_position, paper=paper)
+    return out
+
+
+def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds=False) -> pd.DataFrame:
+    """Calculates MTM for a profit DataFrame which has open trades.
+
+    Args:
+        pnl (pd.DataFrame): Profit DataFrame.
+        mtm_date (str): Date of MTM, if None, the latest MTM is calculated. Currently only yyyy-mm-dd formatted
+        string is supported. Intraday MTM is not available for historical dates.
+
+    Returns:
+        pd.DataFrame: Profit DataFrame with mark-to-market prices.
+    """
+    pnl = pnl.copy()
+    pnl.reset_index(drop=True, inplace=True)
+    for index, row in pnl.iterrows():
+        if row["exit_quantity"] + row["entry_quantity"] != 0 and row["entry_price"] != 0:
+            logger.debug(f'Getting mtm for {row["symbol"]}')
+            exchange = "BSE" if "SENSEX" in row["symbol"] else "NSE"
+            quote = get_price(
+                brokers,
+                row["symbol"],
+                checks=["bid", "ask", "last", "prior_close"],
+                attempts=1,
+                exchange=exchange,
+                mds=mds,
+            )
+            if all(not math.isnan(attr) for attr in [quote.bid, quote.ask]):
+                mtm_price = (quote.bid + quote.ask) / 2
+            else:
+                mtm_price = quote.last if quote.last is not None else quote.prior_close
+            pnl.loc[index, "mtm"] = mtm_price
+    pnl["gross_pnl"] = -1 * (
+        pnl["exit_price"] * pnl["exit_quantity"]
+        + pnl["mtm"] * -1 * (pnl["entry_quantity"] + pnl["exit_quantity"])
+        + pnl["entry_quantity"] * pnl["entry_price"]
+    )
+    return pnl
+
+
+def get_expiry_from_FormattedExpiryTime(timestamp_str) -> str:
+    """Convert str formatted as "/Date(1703754000000+0530)/" to yyyy-mm-dd
+
+    Args:
+        timestamp_str (_type_): str formatted as "/Date(1703754000000+0530)/"
+
+    Returns:
+        str: date formatted as yyyy-mm-dd
+    """
+    timestamp_str = timestamp_str.replace("/Date(", "").replace(")/", "")
+    # Extract milliseconds and timezone offset
+    milliseconds = int(timestamp_str[:-5])
+    timezone_offset = int(timestamp_str[-5:])
+
+    # Create a timedelta object for the timezone offset
+    offset_timedelta = dt.timedelta(minutes=timezone_offset // 100 * 60 + timezone_offset % 100)
+
+    # Convert milliseconds to seconds and add the offset
+    timestamp_seconds = milliseconds / 1000
+    timestamp_with_offset = timestamp_seconds + offset_timedelta.total_seconds()
+
+    # Convert the timestamp to a datetime object
+    date_object = dt.datetime.utcfromtimestamp(timestamp_with_offset)
+
+    # Format the datetime object as a string
+    formatted_date = date_object.strftime("%Y-%m-%d")
+    return formatted_date
+
+
+def get_opt_chain(broker: BrokerBase, short_symbol: str, expiry: str) -> list:
+    """Returns a list of option chains for given expiry
+
+    Args:
+        broker : broker object
+        short_symbol (str): short symbol
+        expiry (str): formatted as yyyy-mm-dd
+
+    Returns:
+        list: list of option long names
+    """
+
+    if broker.broker == "IB":
+        pass
+    elif broker.broker == "FivePaisa":
+        expiries = pd.DataFrame(broker.fp.get_expiry("N", short_symbol)["Expiry"])
+        expiries["expiry"] = expiries["ExpiryDate"].apply(get_expiry_from_FormattedExpiryTime)
+        expiry_timestamp = expiries.loc[expiries.expiry == expiry, "ExpiryDate"].item()
+        opt_chain = broker.api.get_option_chain(
+            "N", short_symbol, int(expiry_timestamp.replace("/Date(", "").replace("+0530)/", ""))
+        )
+        opt_chain = pd.DataFrame(opt_chain["Options"])
+        opt_chain["long_symbol"] = broker.get_long_name_from_broker_identifier(opt_chain.Name)
+        return list(opt_chain.long_symbol)
+
+
+def historical_to_dataframes(historical_data: Dict[str, List[HistoricalData]]) -> List[pd.DataFrame]:
+    """
+    Converts a dictionary of lists of HistoricalData to a list of pandas DataFrames.
+
+    Args:
+        historical_data (Dict[str, List[HistoricalData]]): Dictionary with symbol as keys and lists of HistoricalData as values.
+
+    Returns:
+        List[pd.DataFrame]: List of DataFrames, each containing historical data for a symbol.
+    """
+    dataframes = []
+    for symbol, data_list in historical_data.items():
+        try:
+            # Convert list of HistoricalData to a DataFrame
+            df = pd.DataFrame(
+                [{**data.to_dict(), "symbol": symbol} for data in data_list if data.date is not None]
+            )  # Filter out entries with None dates
+
+            if not df.empty:
+                df = df.sort_values(by="date")
+                df.reset_index(inplace=True, drop=True)
+                dataframes.append(df)
+        except Exception as e:
+            print(f"Error processing data for symbol {symbol}: {e}")
+
+    return dataframes
+
+
+def _get_active_commission_config(entry_date: str, config) -> str:
+    """
+    Get the active commission configuration effective date based on the entry date.
+
+    :param entry_date: A string in the form "yyyy-mm-dd".
+    :param config: A dictionary containing the YAML data loaded using yaml.safe_load.
+    :return: The most recent effective_date that is less than the entry_date.
+    """
+
+    # Extract and sort the effective dates as strings
+    effective_dates = sorted(list(config.get("commissions").keys()))
+
+    # Find the most recent effective date less than entry_date
+    for effective_date in effective_dates:
+        if effective_date < entry_date:
+            return effective_date
+
+    # Return None if no effective date is found
+    return None
+
+
+def _update_commissions(dataframe: pd.DataFrame, brok: BrokerBase = None):
+    """get commission values in trades dataframe
+
+    Args:
+        dataframe (pd.DataFrame): trades dataframe
+        brok (BrokerBase, optional): BrokerBase containing database with trades. Defaults to None.
+    """
+
+    def get_redis_price(broker_order_id: str, long_symbol: str, brok: BrokerBase):
+        """Fetch the price from Redis using the broker_order_id and ensure it matches the long_symbol."""
+        if brok is None:
+            return 0
+        order_data = brok.redis_o.hgetall(broker_order_id)
+        if order_data.get("long_symbol") == long_symbol:
+            return float(order_data.get("price", 0))
+        return 0
+
+    broker_name = brok.broker.name if brok is not None else "UNDEFINED"
+
+    if "commission" not in dataframe.columns:
+        dataframe["commission"] = 0.0
+
+    for index, row in dataframe.iterrows():
+        symbol_parts = row["symbol"].split("_", 2)
+        if len(symbol_parts) < 2:
+            continue  # Skip if the symbol is not in the expected format
+        entry_date = row["entry_time"][0:10]
+        exit_date = row["exit_time"][0:10]
+        entry_gst = config.get_commission_by_date(entry_date, f"{broker_name}.GST", 0)
+        exit_gst = config.get_commission_by_date(exit_date, f"{broker_name}.GST", 0)
+
+        # Check if the symbol is a combo symbol and split it into legs
+        legs = row["symbol"].split(":") if ":" in row["symbol"] else [row["symbol"]]
+        entry_keys = row["entry_keys"].split(" ") if "entry_keys" in row and row["entry_keys"] else []
+        exit_keys = row["exit_keys"].split(" ") if "exit_keys" in row and row["exit_keys"] else []
+        total_commission = 0
+        if len(legs) > 1 and brok is None:
+            raise ValueError("brok needs to be specfied for combo trades")
+            return
+        for leg in legs:
+            leg_parts = leg.split("?")
+            leg_symbol = leg_parts[0]
+            leg_size = float(leg_parts[1]) if len(leg_parts) > 1 else 1
+
+            leg_symbol_parts = leg_symbol.split("_")
+            symbol_type = leg_symbol_parts[1]
+
+            # Determine the trade_side for each leg based on leg_size
+            if leg_size > 0:
+                trade_side = row["side"]
+            else:
+                trade_side = "SHORT" if row["side"] == "BUY" else "BUY"
+
+            exit_side = "SHORT" if trade_side == "BUY" else "BUY"  # Determine exit side
+
+            # Find the correct entry and exit keys for this leg
+            entry_price = None
+            exit_price = None
+
+            for entry_key in entry_keys:
+                price = get_redis_price(entry_key, leg_symbol, brok)
+                if price > 0:
+                    entry_price = price
+                    break
+
+            for exit_key in exit_keys:
+                price = get_redis_price(exit_key, leg_symbol, brok)
+                if price > 0:
+                    exit_price = price
+                    break
+
+            # Fallback to row's entry_price and exit_price if not found in Redis
+            entry_price = entry_price if entry_price is not None else row["entry_price"]
+            # exit_price is set to 0 for combo orders irresepctive of mtm.
+            exit_price = exit_price if exit_price is not None else row["exit_price"] if len(legs) == 1 else 0
+
+            # Fetch commission rates for the entry trade
+            flat_rate = config.get_commission_by_date(entry_date, f"{broker_name}.{symbol_type}.{trade_side}.flat", 0)
+            per_commission = config.get_commission_by_date(
+                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.commission", 0
+            )
+            per_stt = config.get_commission_by_date(
+                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.stt", 0
+            )
+            per_exchange = config.get_commission_by_date(
+                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.exchange", 0
+            )
+            per_sebi = config.get_commission_by_date(
+                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.sebi", 0
+            )
+            per_stampduty = config.get_commission_by_date(
+                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.stampduty", 0
+            )
+
+            # Calculate the total commission for the entry trade
+            entry_trade_value = abs(row["entry_quantity"] * abs(leg_size) * entry_price)
+            entry_commission = (
+                flat_rate * (100 + entry_gst) / 100
+                + (per_commission / 100 * entry_trade_value) * (100 + entry_gst) / 100
+                + (per_stt / 100 * entry_trade_value)
+                + (per_exchange / 100 * entry_trade_value) * (100 + entry_gst) / 100
+                + (per_sebi / 100 * entry_trade_value) * (100 + entry_gst) / 100
+                + (per_stampduty / 100 * entry_trade_value)
+            )
+
+            # Fetch commission rates for the exit trade
+            flat_rate = config.get_commission_by_date(exit_date, f"{broker_name}.{symbol_type}.{exit_side}.flat", 0)
+            per_commission = config.get_commission_by_date(
+                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.commission", 0
+            )
+            per_stt = config.get_commission_by_date(
+                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.stt", 0
+            )
+            per_exchange = config.get_commission_by_date(
+                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.exchange", 0
+            )
+            per_sebi = config.get_commission_by_date(
+                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.sebi", 0
+            )
+            per_stampduty = config.get_commission_by_date(
+                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.stampduty", 0
+            )
+
+            # Calculate the total commission for the exit trade
+            exit_trade_value = abs(row["exit_quantity"] * abs(leg_size) * exit_price)
+            exit_commission = (
+                flat_rate * (100 + exit_gst) / 100
+                + (per_commission / 100 * exit_trade_value) * (100 + exit_gst) / 100
+                + (per_stt / 100 * exit_trade_value)
+                + (per_exchange / 100 * exit_trade_value) * (100 + exit_gst) / 100
+                + (per_sebi / 100 * exit_trade_value) * (100 + exit_gst) / 100
+                + (per_stampduty / 100 * exit_trade_value)
+            )
+
+            # Sum up the commission for this leg
+            total_commission += entry_commission + exit_commission
+
+        # Update the dataframe with the total commission for the combo symbol
+        dataframe.at[index, "commission"] = round(total_commission, 0)
+
+    return dataframe
+
+
+def calc_pnl(trades: pd.DataFrame, brok: BrokerBase = None):
+    """Calculates absolute profit /loss arising from a trade object
+    This function  adds/amends pnl column to input dataframe.
+
+    Args:
+        trades (pd.DataFrame): Dataframe of trades
+        brok (BrokerBase) : broker and linked database holding trades
+
+    Returns:
+        float: Absolute P&L
+    """
+    broker_name = brok.broker.name if brok is not None else "UNDEFINED"
+    if len(trades) == 0:
+        logger.info("No trades")
+        return trades
+    trades = trades.copy()
+    if broker_name is not None:
+        trades = _update_commissions(trades, brok=brok)
+    trades["gross_pnl"] = -1 * (
+        trades["exit_price"] * trades["exit_quantity"]
+        + trades["mtm"] * -1 * (trades["entry_quantity"] + trades["exit_quantity"])
+        + trades["entry_quantity"] * trades["entry_price"]
+    )
+    trades["pnl"] = trades["gross_pnl"] - trades["commission"]
+    return trades

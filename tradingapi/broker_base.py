@@ -1,0 +1,430 @@
+import datetime as dt
+import json
+import math
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Union
+
+import pandas as pd
+import redis
+
+NEXT_DAY_TIMESTAMP = int((dt.datetime.today() + dt.timedelta(days=1)).timestamp())
+
+
+class Brokers(Enum):
+    UNDEFINED = 1
+    FIVEPAISA = 2
+    SHOONYA = 3
+    INTERACTIVEBROKERS = 4
+    DHAN = 5
+    ICICIDIRECT = 6
+
+
+@dataclass
+class HistoricalData:
+    date: dt.datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    intoi: int
+    oi: int
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in asdict(self).items() if v is not None and not (isinstance(v, float) and math.isnan(v))}
+        # return asdict(self)
+
+    def __repr__(self):
+        return f"HistoricalData({self.__dict__})"
+
+
+class OrderStatus(Enum):
+    UNDEFINED = 1  # No information on status
+    HISTORICAL = 2  # Order is from earlier days, no broker status
+    PENDING = 3  # Pending with  Broker
+    REJECTED = 4  # Rejected by Broker
+    OPEN = 5  # active with exchange
+    FILLED = 6  # Filled with exchange
+    CANCELLED = 7  # Cancelled by Exchange
+
+
+class Order:
+    def __init__(
+        self,
+        long_symbol: str = None,
+        order_type: str = None,
+        price_type: str = None,
+        quantity: int = None,
+        exchange: str = None,
+        exchange_segment: Optional[str] = None,
+        price: float = float("nan"),
+        is_intraday: Optional[bool] = None,
+        internal_order_id: str = None,
+        remote_order_id: str = "",
+        scrip_code: Optional[int] = None,
+        exch_order_id: Optional[str] = "0",
+        broker_order_id: Optional[str] = "0",
+        stoploss_price: float = 0.0,
+        is_stoploss_order: bool = False,
+        ioc_order: bool = False,
+        scripdata: str = "",
+        orderRef: str = "",
+        order_id: int = 0,
+        local_order_id: int = 0,
+        disqty: Optional[int] = None,
+        message: str = "",
+        status: str = "UNDEFINED",
+        vtd: str = f"/Date({NEXT_DAY_TIMESTAMP})/",
+        ahplaced: str = "N",
+        IsGTCOrder: bool = False,
+        IsEOSOrder: bool = False,
+        paper: Optional[bool] = None,
+        broker: str = "UNDEFINED",
+        additional_info: str = "",
+        **kwargs: Any,
+    ):
+        """
+        Initialize an Order object with various attributes related to trading orders.
+        """
+        self.long_symbol = long_symbol
+        self.price_type = price_type
+        self.order_type = order_type
+        self.quantity = self._convert_to_int(quantity)
+        self.price = self._convert_to_float(price)
+        self.exchange = exchange
+        self.exchange_segment = exchange_segment
+        self.internal_order_id = internal_order_id
+        self.remote_order_id = remote_order_id
+        self.scrip_code = self._convert_to_int(scrip_code)
+        self.exch_order_id = exch_order_id
+        self.broker_order_id = broker_order_id
+        self.stoploss_price = self._convert_to_float(stoploss_price)
+        self.is_stoploss_order = self._convert_to_bool(is_stoploss_order)
+        self.ioc_order = self._convert_to_bool(ioc_order)
+        self.scripdata = scripdata
+        self.orderRef = orderRef
+        self.order_id = self._convert_to_int(order_id)
+        self.local_order_id = self._convert_to_int(local_order_id)
+        self.disqty = self._convert_to_int(disqty)
+        self.message = message
+        self.vtd = vtd
+        self.ahplaced = ahplaced
+        self.IsGTCOrder = self._convert_to_bool(IsGTCOrder)
+        self.IsEOSOrder = self._convert_to_bool(IsEOSOrder)
+        self.paper = self._convert_to_bool(paper)
+        self.is_intraday = self._convert_to_bool(is_intraday)
+        self.additional_info = additional_info
+
+        # Setting status using enum
+        self.status = self._set_status(status)
+
+        # Setting broker using enum
+        self.broker = self._set_broker(broker)
+
+        # Handling any additional keyword arguments
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def _set_status(self, status: str) -> OrderStatus:
+        """
+        Convert a string status to an OrderStatus enum. Default to UNDEFINED if invalid.
+        """
+        try:
+            return OrderStatus[status.upper()]
+        except KeyError:
+            return OrderStatus.UNDEFINED
+
+    def _set_broker(self, broker: str) -> Brokers:
+        """
+        Convert a string broker to a Brokers enum. Default to UNDEFINED if invalid.
+        """
+        try:
+            return Brokers[broker.upper()]
+        except KeyError:
+            return Brokers.UNDEFINED
+
+    def _convert_to_int(self, value: Any) -> Optional[int]:
+        """
+        Convert a value to an integer if possible, otherwise return None.
+        """
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _convert_to_float(self, value: Any) -> float:
+        """
+        Convert a value to a float if possible, otherwise return NaN.
+        """
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def _convert_to_bool(self, value: Any) -> bool:
+        """
+        Convert a value to a boolean if possible.
+        """
+        if isinstance(value, str):
+            return value.lower() in ["true", "1", "yes"]
+        return bool(value)
+
+    def to_dict(self):
+        result = self.__dict__.copy()
+        # Convert enum to its name (string)
+        result["status"] = self.status.name
+        result["broker"] = self.broker.name
+        return result
+
+    def __repr__(self):
+        return json.dumps(self.to_dict(), indent=4, default=str)
+
+
+class Price:
+    def __init__(
+        self,
+        bid: float = float("nan"),
+        ask: float = float("nan"),
+        bid_volume: int = float("nan"),
+        ask_volume: int = float("nan"),
+        prior_close: float = float("nan"),
+        last: float = float("nan"),
+        high: float = float("nan"),
+        low: float = float("nan"),
+        volume: int = float("nan"),
+        symbol: str = "",
+        exchange: str = "",
+        src: str = "",
+        timestamp: str = "",
+    ):
+        self.bid = bid
+        self.ask = ask
+        self.bid_volume = bid_volume
+        self.ask_volume = ask_volume
+        self.prior_close = prior_close
+        self.last = last
+        self.high = high
+        self.low = low
+        self.volume = volume
+        self.symbol = symbol
+        self.exchange = exchange
+        self.src = src
+        self.timestamp = timestamp
+
+    def __add__(self, other):
+        def safe_add(a, b):
+            if math.isnan(a) or math.isnan(b):
+                return float("nan")
+            return a + b
+
+        return Price(
+            bid=safe_add(self.bid, other.bid),
+            ask=safe_add(self.ask, other.ask),
+            bid_volume=safe_add(self.bid_volume, other.bid_volume),
+            ask_volume=safe_add(self.ask_volume, other.ask_volume),
+            prior_close=safe_add(self.prior_close, other.prior_close),
+            last=safe_add(self.last, other.last),
+            high=safe_add(self.high, other.high),
+            low=safe_add(self.low, other.low),
+            volume=safe_add(self.volume, other.volume),
+        )
+        # dont change symbol
+
+    def update(self, other, size=1):
+        self.bid = other.bid * size if other.bid * size is not float("nan") else self.bid
+        self.ask = other.ask * size if other.ask * size is not float("nan") else self.ask
+        self.bid_volume = other.bid_volume if other.bid_volume is not float("nan") else self.bid_volume
+        self.ask_volume = other.ask_volume if other.ask_volume is not float("nan") else self.ask_volume
+        self.prior_close = other.prior_close * size if other.prior_close is not float("nan") else self.prior_close
+        self.last = other.last * size if other.last * size is not float("nan") else self.last
+        self.high = other.high * size if other.high * size is not float("nan") else self.high
+        self.low = other.low * size if other.low * size is not float("nan") else self.low
+        self.volume = other.volume if other.volume is not float("nan") else self.volume
+        self.symbol = other.symbol
+        self.exchange = other.exchange
+        self.src = other.src
+        self.timestamp = other.timestamp
+
+    def to_dict(self):
+        return {
+            "bid": self.bid,
+            "ask": self.ask,
+            "bid_volume": self.bid_volume,
+            "ask_volume": self.ask_volume,
+            "prior_close": self.prior_close,
+            "last": self.last,
+            "high": self.high,
+            "low": self.low,
+            "volume": self.volume,
+            "symbol": self.symbol,
+            "exchange": self.exchange,
+            "src": self.src,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(
+            bid=data.get("bid", float("nan")),
+            ask=data.get("ask", float("nan")),
+            bid_volume=data.get("bid_volume", float("nan")),
+            ask_volume=data.get("ask_volume", float("nan")),
+            prior_close=data.get("prior_close", float("nan")),
+            last=data.get("last", float("nan")),
+            high=data.get("high", float("nan")),
+            low=data.get("low", float("nan")),
+            volume=data.get("volume", float("nan")),
+            symbol=data.get("symbol", ""),
+            exchange=data.get("exchange", ""),
+            src=data.get("src", ""),
+            timestamp=data.get("timestamp", ""),
+        )
+
+    def __repr__(self):
+        return json.dumps(self.to_dict(), indent=4, default=str)
+
+
+@dataclass
+class Position:
+    symbol: str = ""
+    size: int = 0
+    price: float = 0
+    value: float = 0
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in asdict(self).items() if v is not None and not (isinstance(v, float) and math.isnan(v))}
+        # return asdict(self)
+
+    def __repr__(self):
+        return f"Position({self.__dict__})"
+
+
+class OrderInfo:
+    def __init__(
+        self,
+        order_size: int = None,
+        order_price: float = None,
+        fill_size: int = 0,
+        fill_price: float = 0,
+        status: OrderStatus = OrderStatus.UNDEFINED,
+        broker_order_id: str = "",
+        exchange_order_id: str = "",
+        broker=Brokers.UNDEFINED,
+    ):
+        self.order_size = order_size
+        self.order_price = order_price
+        self.fill_size = fill_size
+        self.fill_price = fill_price
+        self.status = status
+        self.broker_order_id = broker_order_id
+        self.exchange_order_id = exchange_order_id
+        self.broker = broker
+
+    def to_dict(self):
+        return {
+            "order_size": str(self.order_size),
+            "order_price": str(self.order_price),
+            "fill_size": str(self.fill_size),
+            "fill_price": str(self.fill_price),
+            "status": self.status.name if isinstance(self.status, Enum) else self.status,
+            "broker_order_id": self.broker_order_id,
+            "exchange_order_id": self.exchange_order_id,
+            "broker": self.broker.name if isinstance(self.broker, Enum) else self.broker,
+        }
+
+    def __repr__(self):
+        return json.dumps(self.to_dict(), indent=4, default=str)
+
+
+class BrokerBase(ABC):
+    @abstractmethod
+    def __init__(self, **kwargs):
+        self.broker = Brokers.UNDEFINED
+        # self.symbol_map = {}
+        # self.contractsize_map = {}
+        # self.exchange_map = {}
+        # self.exchangetype_map = {}
+        # self.contracttick_map = {}
+        # self.symbol_map_reversed = {}
+        self.starting_order_ids_int = {}
+        self.redis_o = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+        self.exchange_mappings = {
+            "symbol_map": {},
+            "contractsize_map": {},
+            "exchange_map": {},
+            "exchangetype_map": {},
+            "contracttick_map": {},
+            "symbol_map_reversed": {},
+        }
+
+    @abstractmethod
+    def update_symbology(self, **kwargs):
+        pass
+
+    @abstractmethod
+    def connect(self, redis_db: int):
+        pass
+
+    @abstractmethod
+    def is_connected(self):
+        pass
+
+    @abstractmethod
+    def disconnect(self):
+        pass
+
+    @abstractmethod
+    def place_order(self, order: Order, **kwargs) -> Order:
+        pass
+
+    @abstractmethod
+    def modify_order(self, **kwargs) -> Order:
+        pass
+
+    @abstractmethod
+    def cancel_order(self, **kwargs) -> Order:
+        pass
+
+    @abstractmethod
+    def get_order_info(self, **kwargs) -> OrderInfo:
+        pass
+
+    @abstractmethod
+    def get_historical(self, **kwargs) -> Dict[str, List[HistoricalData]]:
+        pass
+
+    @abstractmethod
+    def map_exchange_for_api(self, **kwargs) -> str:
+        """maps exchange to exchange code needed by broker API."""
+        pass
+
+    @abstractmethod
+    def map_exchange_for_db(self, **kwargs) -> str:
+        """maps exchange to NSE or BSE or MCX. The long form exchange name."""
+        pass
+
+    @abstractmethod
+    def get_quote(self, **kwargs) -> Price:
+        pass
+
+    @abstractmethod
+    def get_position(self, long_symbol: str) -> Union[pd.DataFrame, int]:
+        pass
+
+    @abstractmethod
+    def get_orders_today(self, **kwargs) -> pd.DataFrame:
+        pass
+
+    @abstractmethod
+    def get_trades_today(self, **kwargs) -> pd.DataFrame:
+        pass
+
+    @abstractmethod
+    def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
+        pass
+
+    @abstractmethod
+    def get_min_lot_size(self, long_symbol: str) -> int:
+        pass

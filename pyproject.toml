@@ -1,0 +1,47 @@
+[tool.black]
+line-length = 88
+
+[tool.flake8]
+max-line-length = 88
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["yaml", "pytz","requests"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["numpy", "pyreadr", "rpy2", "pandas", "scipy","redis"]
+ignore_missing_imports = true
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"tradingapi2" = ["config/config_sample.yaml", "config/commissions_20241216.yaml"]
+
+[project]
+name = "tradingapi"
+version = "0.1.1"
+description = "Trade integration with brokers"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Pankaj Sharma", email = "sharma.pankaj.kumar@gmail.com" }
+]
+dependencies = [
+    "chameli",
+    "NorenRestApi==0.0.32",
+    "py5paisa==0.7.19",
+    "redis==5.0.4",
+    "pyotp==2.9.0"
+]
+
+[project.urls]
+homepage = "https://bitbucket.org/incurrency/tradingpapi2"
+repository = "https://bitbucket.org/incurrency/tradingapi2"

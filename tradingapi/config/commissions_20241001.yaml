@@ -1,0 +1,108 @@
+# stt on options hiked to 0.1% from 0.0625%. STT on futures hiked to 0.02% from 0.01%
+SHOONYA:
+  GST: 18
+  STK:
+    BUY:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0.10
+        exchange: 0.00345
+        sebi: 0.0001
+        stampduty: 0.015
+    SHORT:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0.10
+        exchange: 0.00345
+        sebi: 0.0001
+        stampduty: 0
+  FUT:
+    BUY:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0
+        exchange: 0.002
+        sebi: 0.0001
+        stampduty: 0.002
+    SHORT:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0.02
+        exchange: 0.002
+        sebi: 0.0001
+        stampduty: 0
+  OPT:
+    BUY:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0
+        exchange: 0.053
+        sebi: 0.0001
+        stampduty: 0.003
+    SHORT:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0.1
+        exchange: 0.053
+        sebi: 0.0001
+        stampduty: 0
+
+FIVEPAISA:
+  GST: 18
+  STK:
+    BUY:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0.10
+        exchange: 0.00345
+        sebi: 0.0001
+        stampduty: 0.015
+    SHORT:
+      flat: 0
+      percentage:
+        commission: 0
+        stt: 0.10
+        exchange: 0.00345
+        sebi: 0.0001
+        stampduty: 0
+  FUT:
+    BUY:
+      flat: 10
+      percentage:
+        commission: 0
+        stt: 0
+        exchange: 0.002
+        sebi: 0.0001
+        stampduty: 0.002
+    SHORT:
+      flat: 10
+      percentage:
+        commission: 0
+        stt: 0.02
+        exchange: 0.002
+        sebi: 0.0001
+        stampduty: 0
+  OPT:
+    BUY:
+      flat: 10
+      percentage:
+        commission: 0
+        stt: 0
+        exchange: 0.053
+        sebi: 0.0001
+        stampduty: 0.003
+    SHORT:
+      flat: 10
+      percentage:
+        commission: 0
+        stt: 0.1
+        exchange: 0.053
+        sebi: 0.0001
+        stampduty: 0

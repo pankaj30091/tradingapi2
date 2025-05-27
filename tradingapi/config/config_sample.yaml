@@ -1,0 +1,32 @@
+# bhavcopy path  - this is the path where symbol files from brokers are saved
+bhavcopy_folder : /home/psharma/onedrive/rfiles/data/bhavcopy
+
+commissions:
+  - effective_date: "2020-01-01"
+    file: "commissions_20200101.yaml"
+  - effective_date: "2024-10-01"
+    file: "commissions_20241001.yaml"
+  - effective_date: "2024-12-02"
+    file: "commissions_20241216.yaml"
+
+FIVEPAISA:
+  APP_NAME:
+  APP_SOURCE:
+  USER_ID:
+  PASSWORD:
+  USER_KEY:
+  ENCRYPTION_KEY:
+  TOTP_TOKEN:
+  PIN:
+  CLIENT_ID:
+  SYMBOLCODES:
+  USERTOKEN:
+
+SHOONYA:
+  USER:
+  PWD:
+  VC:
+  APPKEY:
+  TOKEN:
+  SYMBOLCODES: "/home/psharma/onedrive/rfiles/data/static/shoonya_symbols"
+  USERTOKEN:

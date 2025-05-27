@@ -1,0 +1,58 @@
+# Specify the Pre-Commit framework version
+default_language_version:
+  python: python3.9  # Adjust to match your Python version
+
+repos:
+  # 2️⃣ isort: Sorts imports in a consistent order
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+
+  # 4️⃣ Mypy: Static type checking for Python
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        args: ["--config-file", "pyproject.toml"]
+
+  # 5️⃣ Bandit: Security analysis for Python
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.2
+    hooks:
+      - id: bandit
+        # args: ["-r", "."]
+
+  # 6️⃣ Ruff: Fast Python linter (alternative to Flake8)
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.9.3
+    hooks:
+      - id: ruff
+
+  # 7️⃣ Detect Secrets: Prevents committing API keys & secrets
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0  # Latest stable version
+    hooks:
+      - id: detect-secrets
+
+  # 8️⃣ Check YAML syntax
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+
+  # 9️⃣ Ensures no merge conflicts are committed
+      - id: check-merge-conflict
+
+  # 🔟 Ensures files have a newline at the end
+      - id: end-of-file-fixer
+
+  # 11️⃣ Trims trailing whitespace
+      - id: trailing-whitespace
+
+  # 12️⃣ Ensures JSON files are valid
+      - id: check-json
+
+  # 13️⃣ Prevents committing large files (over 500KB)
+      - id: check-added-large-files
+        args: ["--maxkb=500"]

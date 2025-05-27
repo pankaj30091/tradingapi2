@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.o
+*.dll
+
+# Virtual environments
+.venv/
+.env
+env/
+
+# Logs
+logs/
+temp/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+# dist
+dist/
+build/
+docs/
+examples/
+tradingapi.egg-info/
+tests/
+
+# environment
+setup.cfg
+tradingapi/testing.py
+tradingapi/config/config_prod.yaml
