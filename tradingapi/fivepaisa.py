@@ -845,7 +845,7 @@ class FivePaisa(BrokerBase):
         long_symbol: str,
         exchange="N",
         bar_duration="1m",
-        timestamp: dt.datetime = dt.datetime(1970, 0, 0),
+        timestamp: dt.datetime = dt.datetime(1970, 1, 1),
         adj=False,
     ) -> float:
         """Get last traded price from five paisa
