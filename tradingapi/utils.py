@@ -621,7 +621,7 @@ def get_combo_sub_order_type(order: Order, sub_order_qty: int) -> str:
 
 def transmit_entry_order(
     broker: BrokerBase, strategy: str, order: Order, paper: bool = True, price_broker: Optional[List[BrokerBase]] = None
-) -> Union[str, None]:
+) -> str:
     """Entry order sent to broker
 
     Args:
@@ -631,7 +631,7 @@ def transmit_entry_order(
         paper (bool): If true (default), places simulated order
 
     Returns:
-        int: status as returned by broker. 0 means success. anything else is an error
+        str: internal order id
     """
 
     if order.price is None:
@@ -639,7 +639,7 @@ def transmit_entry_order(
         return None
     if price_broker is None:
         price_broker = [broker]
-    if order.internal_order_id is None:
+    if not order.internal_order_id:
         next_order_id = broker.starting_order_ids_int.get(strategy, 1)
         broker.starting_order_ids_int[strategy] = next_order_id + 1
         internal_order_id = strategy + "_" + str(next_order_id)
@@ -1006,7 +1006,7 @@ def update_order_status(
         "exchange_order_id",
     ]
     for attr in required_attributes:
-        if not hasattr(fills, attr) or getattr(fills, attr) is None:
+        if not hasattr(fills, attr) or getattr(fills, attr) in [None, "0"]:
             logger.error(
                 f"Missing or invalid attribute {attr} in order information for broker_order_id: {broker_order_id}"
             )
@@ -1625,11 +1625,11 @@ def get_option_underlying_price(
     else:
         underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
         last_price = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).last
-        if last_price is not None:
+        if not math.isnan(last_price):
             price_f = last_price
         else:
             price_f = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).prior_close
-        if price_f is None:
+        if math.isnan(price_f):
             return float("nan")
 
     if "NIFTY" in symbol and fut_expiry is not None:
@@ -1641,7 +1641,7 @@ def get_option_underlying_price(
         )
         underlying_ind = f'{symbol.split("_")[0]}_IND___'
         last_price = get_price(brokers, underlying_ind, checks=["last"], exchange=exchange, mds=mds).last
-        if last_price is not None:
+        if not math.isnan(last_price):
             price_u = last_price
         else:
             price_u = get_price(brokers, underlying_ind, checks=["prior_close"], exchange=exchange, mds=mds).prior_close
@@ -1993,7 +1993,7 @@ def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds=False) -> pd
             if all(not math.isnan(attr) for attr in [quote.bid, quote.ask]):
                 mtm_price = (quote.bid + quote.ask) / 2
             else:
-                mtm_price = quote.last if quote.last is not None else quote.prior_close
+                mtm_price = quote.last if not math.isnan(quote.last) else quote.prior_close
             pnl.loc[index, "mtm"] = mtm_price
     pnl["gross_pnl"] = -1 * (
         pnl["exit_price"] * pnl["exit_quantity"]
@@ -2047,8 +2047,8 @@ def historical_to_dataframes(historical_data: Dict[str, List[HistoricalData]]) -
         try:
             # Convert list of HistoricalData to a DataFrame
             df = pd.DataFrame(
-                [{**data.to_dict(), "symbol": symbol} for data in data_list if data.date is not None]
-            )  # Filter out entries with None dates
+                [{**data.to_dict(), "symbol": symbol} for data in data_list if data.date != dt.datetime(1970, 1, 1)]
+            )  # Filter out entries with missing dates
 
             if not df.empty:
                 df = df.sort_values(by="date")
@@ -2077,7 +2077,7 @@ def _get_active_commission_config(entry_date: str, config) -> str:
         if effective_date < entry_date:
             return effective_date
 
-    # Return None if no effective date is found
+    # Return 1970 if no effective date is found
     return "1970-01-01"
 
 

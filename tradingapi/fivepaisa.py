@@ -42,7 +42,7 @@ def save_symbol_data(saveToFolder: bool = False):
     bhavcopyfolder = config.get("bhavcopy_folder")
     url = "https://openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/All"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_codes.csv"
-    response = requests.get(url, allow_redirects=True, timeout=10)  # Add timeout to `requests.get` to fix Bandit issue
+    response = requests.get(url, allow_redirects=True, timeout=100)  # Add timeout to `requests.get` to fix Bandit issue
     if response.status_code == 200:
         df = pd.read_csv(io.BytesIO(response.content))
         # Rename the column
@@ -927,58 +927,65 @@ class FivePaisa(BrokerBase):
 
         Args:
             long_symbol (str): long symbol
+            exchange (str): Exchange name. Defaults to "NSE".
 
         Returns:
-            json: Quote
+            Price: Quote details.
         """
         mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
-        market_feed = Price()
+        market_feed = Price()  # Initialize with default values
         market_feed.src = "fp"
         market_feed.symbol = long_symbol
         exch_type = self.exchange_mappings[mapped_exchange]["exchangetype_map"].get(long_symbol)
         scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
+
         if scrip_code is None:
-            return market_feed
+            logger.error(f"No scrip code found for symbol: {long_symbol}")
+            return market_feed  # Return default Price object if no scrip code is found
+
         req_list = [
             {"Exch": mapped_exchange, "ExchType": exch_type, "ScripCode": scrip_code},
         ]
-        out = self.api.fetch_market_feed_scrip(req_list)
-        snapshot = out["Data"][0]
-        out = self.api.fetch_market_depth_by_scrip(
-            Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
-        )
-        market_depth_data = out["MarketDepthData"]
-        bids = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 66]
-        asks = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 83]
+        try:
+            out = self.api.fetch_market_feed_scrip(req_list)
+            snapshot = out["Data"][0]
+            out = self.api.fetch_market_depth_by_scrip(
+                Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
+            )
+            market_depth_data = out["MarketDepthData"]
+            bids = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 66]
+            asks = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 83]
 
-        # Get the best bid and best ask
-        best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
-        best_ask = min(asks, key=lambda x: x["Price"]) if asks else None
+            # Get the best bid and best ask
+            best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
+            best_ask = min(asks, key=lambda x: x["Price"]) if asks else None
 
-        # Extract prices and quantities
-        best_bid_price = best_bid["Price"] if best_bid else None
-        best_bid_quantity = best_bid["Quantity"] if best_bid else None
+            # Extract prices and quantities
+            best_bid_price = best_bid["Price"] if best_bid else None
+            best_bid_quantity = best_bid["Quantity"] if best_bid else None
 
-        best_ask_price = best_ask["Price"] if best_ask else None
-        best_ask_quantity = best_ask["Quantity"] if best_ask else None
+            best_ask_price = best_ask["Price"] if best_ask else None
+            best_ask_quantity = best_ask["Quantity"] if best_ask else None
 
-        market_feed.ask = best_ask_price if best_ask_price is not None and best_ask_price != 0 else market_feed.ask
-        market_feed.bid = best_bid_price if best_bid_price is not None and best_bid_price != 0 else market_feed.bid
-        market_feed.bid_volume = (
-            best_bid_quantity if best_bid_quantity is not None and best_bid_quantity > 0 else market_feed.bid_volume
-        )
-        market_feed.ask_volume = (
-            best_ask_quantity if best_ask_quantity is not None and best_ask_quantity > 0 else market_feed.ask_volume
-        )
-        market_feed.exchange = snapshot["Exch"]
-        market_feed.high = snapshot["High"] if snapshot["High"] > 0 else market_feed.high
-        market_feed.low = snapshot["Low"] if snapshot["Low"] > 0 else market_feed.low
-        market_feed.last = snapshot["LastRate"] if snapshot["LastRate"] > 0 else market_feed.last
-        market_feed.prior_close = snapshot["PClose"] if snapshot["PClose"] > 0 else market_feed.prior_close
-        market_feed.src = "fp"
-        market_feed.symbol = long_symbol
-        market_feed.volume = snapshot["TotalQty"] if snapshot["TotalQty"] > 0 else market_feed.volume
-        market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Update market_feed with fetched data
+            market_feed.ask = best_ask_price if best_ask_price is not None and best_ask_price != 0 else market_feed.ask
+            market_feed.bid = best_bid_price if best_bid_price is not None and best_bid_price != 0 else market_feed.bid
+            market_feed.bid_volume = (
+                best_bid_quantity if best_bid_quantity is not None and best_bid_quantity > 0 else market_feed.bid_volume
+            )
+            market_feed.ask_volume = (
+                best_ask_quantity if best_ask_quantity is not None and best_ask_quantity > 0 else market_feed.ask_volume
+            )
+            market_feed.exchange = snapshot["Exch"]
+            market_feed.high = snapshot["High"] if snapshot["High"] > 0 else market_feed.high
+            market_feed.low = snapshot["Low"] if snapshot["Low"] > 0 else market_feed.low
+            market_feed.last = snapshot["LastRate"] if snapshot["LastRate"] > 0 else market_feed.last
+            market_feed.prior_close = snapshot["PClose"] if snapshot["PClose"] > 0 else market_feed.prior_close
+            market_feed.volume = snapshot["TotalQty"] if snapshot["TotalQty"] > 0 else market_feed.volume
+            market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as e:
+            logger.error(f"Error fetching quote for symbol {long_symbol}: {str(e)}", exc_info=True)
+
         return market_feed
 
     def start_quotes_streaming(self, operation: str, symbols=List[str], ext_callback=None, exchange="NSE"):

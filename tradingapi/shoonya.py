@@ -964,12 +964,26 @@ class Shoonya(BrokerBase):
         return formatted_time
 
     def get_quote(self, long_symbol: str, exchange="NSE") -> Price:
+        """Get Quote details of a symbol.
+
+        Args:
+            long_symbol (str): Long symbol.
+            exchange (str): Exchange name. Defaults to "NSE".
+
+        Returns:
+            Price: Quote details.
+        """
         mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
-        market_feed = Price()
+        market_feed = Price()  # Initialize with default values
         market_feed.src = "sh"
         market_feed.symbol = long_symbol
+
         token = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
-        if token is not None:
+        if token is None:
+            logger.error(f"No token found for symbol: {long_symbol}")
+            return market_feed  # Return default Price object if no token is found
+
+        try:
             tick_data = self.api.get_quotes(exchange=mapped_exchange, token=str(token))
             market_feed.bid = (
                 float("nan")
@@ -1009,11 +1023,11 @@ class Shoonya(BrokerBase):
             )
             market_feed.volume = 0 if tick_data.get("v") in [None, float("nan")] else int(float(tick_data.get("v")))
             market_feed.exchange = self.map_exchange_for_db(long_symbol, tick_data.get("exch"))
-            # market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-4]
             market_feed.timestamp = self.convert_ft_to_ist(int(tick_data.get("lut", 0)))
-            return market_feed
-        else:
-            return market_feed
+        except Exception as e:
+            logger.error(f"Error fetching quote for symbol {long_symbol}: {str(e)}", exc_info=True)
+
+        return market_feed
 
     def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE"):
         prices = {}
