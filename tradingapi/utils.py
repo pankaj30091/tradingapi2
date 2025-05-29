@@ -1115,7 +1115,7 @@ def get_universe(file_path: str = "", product_types=["OPT", "FUT"], exchanges=["
     Returns:
         list: list of long names
     """
-    if file_path:
+    if not file_path:
         file_path = get_latest_symbol_file()
     symbols = pd.read_csv(file_path)
     out: List[str] = []
