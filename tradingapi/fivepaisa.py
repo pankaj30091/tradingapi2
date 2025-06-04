@@ -809,6 +809,11 @@ class FivePaisa(BrokerBase):
                 data["date"] = pd.to_datetime(data["date"])
                 data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
                 data = data[data["date"].dt.time < pd.to_datetime(market_close_time).time()]
+
+                # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
+                if any(period in periodicity for period in ['d', 'w', 'm']):
+                    data["date"] = data["date"].dt.floor("D")
+
                 for _, row in data.iterrows():
                     historical_data = HistoricalData(
                         date=row.get("date"),
