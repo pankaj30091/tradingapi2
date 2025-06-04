@@ -1030,9 +1030,19 @@ class Shoonya(BrokerBase):
         return market_feed
 
     def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE"):
+        """
+        Start streaming quotes for the given symbols.
+
+        Args:
+            operation (str): 's' for subscribe, 'u' for unsubscribe.
+            symbols (List[str]): List of symbols to subscribe/unsubscribe.
+            ext_callback (function): External callback function for processing price updates.
+            exchange (str): Exchange name (default: 'NSE').
+        """
         prices = {}
         mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
 
+        # Function to map JSON data to a Price object
         def map_to_price(json_data):
             price = Price()
             price.src = "sh"
@@ -1075,11 +1085,11 @@ class Shoonya(BrokerBase):
             price.volume = float("nan") if json_data.get("v") in [None, float("nan")] else float(json_data.get("v"))
             symbol = self.exchange_mappings[json_data.get("e")]["symbol_map_reversed"].get(int(json_data.get("tk")))
             price.exchange = self.map_exchange_for_db(symbol, json_data.get("e"))
-            # price.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-4]
             price.timestamp = self.convert_ft_to_ist(int(json_data.get("ft", 0)))
             price.symbol = symbol
             return price
 
+        # Function to handle incoming WebSocket messages
         def on_message(message):
             if message.get("t") == "tk":
                 price = map_to_price(message)
@@ -1102,44 +1112,62 @@ class Shoonya(BrokerBase):
                     if message.get("lp"):
                         price.last = float(message.get("lp"))
                     if message.get("h"):
-                        price.last = float(message.get("h"))
+                        price.high = float(message.get("h"))
                     if message.get("l"):
-                        price.last = float(message.get("l"))
+                        price.low = float(message.get("l"))
                     if message.get("v"):
                         price.volume = float(message.get("v"))
-                    # price.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-4]
                     price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
                     prices[message.get("tk")] = price
                     ext_callback(price)
-            else:
-                pass
 
+        # Function to handle WebSocket errors
         def handle_socket_error(error=None):
             if error:
                 logger.error(f"WebSocket error: {str(error)}")
             else:
                 logger.error("WebSocket error. Connection to remote host was lost.")
-
             initiate_reconnect()
 
-        def initiate_reconnect():
-            logger.info("Attempting to reconnect...")
-            time.sleep(5)
-            try:
-                self.socket_opened = False
-                connect_and_subscribe()
-                while not self.socket_opened:
-                    time.sleep(1)
-                self.api.subscribe(req_list)
-            except Exception as e:
-                logger.error(f"Reconnection failed: {e}")
-                self.socket_opened = False
-                initiate_reconnect()
+        def initiate_reconnect(max_retries=5, retry_delay=5):
+            """
+            Attempt to reconnect the WebSocket connection.
+            """
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Reconnect attempt {attempt + 1}/{max_retries}...")
 
+                    # Close the existing WebSocket connection if open
+                    if self.api and self.socket_opened:
+                        self.api.close_websocket()
+                        self.socket_opened = False
+
+                    # Reinitialize the WebSocket connection
+                    connect_and_subscribe()
+
+                    # Wait for the WebSocket to open
+                    for _ in range(10):  # Wait up to 10 seconds
+                        if self.socket_opened:
+                            logger.info("WebSocket reconnected successfully.")
+                            self.api.subscribe(req_list)
+                            return
+                        time.sleep(1)
+
+                    logger.warning("WebSocket did not open within the expected time.")
+                except Exception as e:
+                    logger.error(f"Reconnect attempt {attempt + 1} failed: {e}")
+
+                # Wait before the next retry
+                time.sleep(retry_delay)
+
+            logger.error("Max reconnect attempts reached. Unable to reconnect the WebSocket.")
+
+        # Function to handle WebSocket connection opening
         def on_socket_open():
             logger.info("WebSocket connection opened")
             self.socket_opened = True
 
+        # Function to establish WebSocket connection and subscribe
         def connect_and_subscribe():
             self.api.start_websocket(
                 subscribe_callback=on_message,
@@ -1150,6 +1178,7 @@ class Shoonya(BrokerBase):
             while not self.socket_opened:
                 time.sleep(1)
 
+        # Function to expand symbols into request format
         def expand_symbols_to_request(symbol_list):
             req_list = []
             for symbol in symbol_list:
@@ -1160,6 +1189,7 @@ class Shoonya(BrokerBase):
                     logger.error(f"Did not find scrip_code for {symbol}")
             return req_list
 
+        # Function to update the subscription list
         def update_subscription_list(operation, symbols):
             if operation == "s":
                 self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
