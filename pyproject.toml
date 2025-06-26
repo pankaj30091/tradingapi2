@@ -27,7 +27,7 @@ include-package-data = true
 
 [project]
 name = "tradingapi"
-version = "0.1.1"
+version = "0.1.2"
 description = "Trade integration with brokers"
 readme = "README.md"
 license = "MIT"
