@@ -658,6 +658,7 @@ def transmit_entry_order(
         else:
             price_types = [order.price_type] * len(symbols)
         # price_types = [0] * len(symbols) if paper is False else ["MKT"] * len(symbols)
+        additional_infos = [""] * len(combo_symbols)
     else:
         symbols = [order.long_symbol]
         quantities = [order.quantity if order.order_type == "BUY" else -1 * order.quantity]
