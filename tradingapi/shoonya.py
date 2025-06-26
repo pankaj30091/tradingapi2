@@ -1127,7 +1127,11 @@ class Shoonya(BrokerBase):
                 logger.error(f"WebSocket error: {str(error)}")
             else:
                 logger.error("WebSocket error. Connection to remote host was lost.")
-            initiate_reconnect()
+
+        def handle_socket_close(close_code=None, close_msg=None):
+            if close_msg:
+                logger.error(f"WebSocket closed: {str(close_msg)}")
+                initiate_reconnect()
 
         def initiate_reconnect(max_retries=5, retry_delay=5):
             """
@@ -1171,7 +1175,7 @@ class Shoonya(BrokerBase):
         def connect_and_subscribe():
             self.api.start_websocket(
                 subscribe_callback=on_message,
-                socket_close_callback=handle_socket_error,
+                socket_close_callback=handle_socket_close,
                 socket_error_callback=handle_socket_error,
                 socket_open_callback=on_socket_open,
             )
