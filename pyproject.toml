@@ -37,7 +37,7 @@ authors = [
 dependencies = [
     "chameli",
     "NorenRestApi==0.0.32",
-    "py5paisa==0.7.19",
+    "py5paisa==0.7.20",
     "redis==5.0.4",
     "pyotp==2.9.0"
 ]
