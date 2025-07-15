@@ -1608,8 +1608,29 @@ def get_price(
     return out
 
 
+def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds=False, last=False):
+    if isinstance(brokers, BrokerBase):
+        brokers = [brokers]
+    try:
+        quote = get_price(brokers, long_symbol, exchange=exchange, mds=mds)
+    except Exception as e:
+        logger.error(f"Error getting price for {long_symbol} on {exchange}: {e}")
+        return float("nan")
+    if last:
+        return quote.last
+    else:
+        if quote.bid > 0 and quote.ask > 0:
+            mid = (quote.bid + quote.ask) / 2
+            mapped_exchange = brokers[0].map_exchange_for_api(long_symbol, exchange)
+            ticksize = brokers[0].exchange_mappings[mapped_exchange]["contracttick_map"].get(long_symbol, 0.05)
+            mid = round(mid / ticksize) * ticksize
+            mid = round(mid, 2)  # <-- Add this line to ensure two decimal places
+        mid = mid if mid > 0 else float("nan")
+        return mid
+
+
 def get_option_underlying_price(
-    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = "", exchange="NSE", mds=False
+    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = "", exchange="NSE", mds=False, last=False
 ) -> float:
     """Retrieve underlying price for a symbol and interpolates, if if needed
 
@@ -1622,14 +1643,10 @@ def get_option_underlying_price(
         float: price of underlying
     """
     if not fut_expiry:
-        price_f = get_price(brokers, symbol, exchange=exchange, mds=mds).last
+        price_f = get_mid_price(brokers, symbol, exchange=exchange, mds=mds, last=last)
     else:
         underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
-        last_price = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).last
-        if not math.isnan(last_price):
-            price_f = last_price
-        else:
-            price_f = get_price(brokers, underlying, checks=["last"], exchange=exchange, mds=mds).prior_close
+        price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
         if math.isnan(price_f):
             return float("nan")
 
@@ -1641,7 +1658,7 @@ def get_option_underlying_price(
             dt.datetime.now(), dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
         )
         underlying_ind = f'{symbol.split("_")[0]}_IND___'
-        last_price = get_price(brokers, underlying_ind, checks=["last"], exchange=exchange, mds=mds).last
+        last_price = get_mid_price(brokers, underlying_ind, exchange=exchange, mds=mds, last=True)
         if not math.isnan(last_price):
             price_u = last_price
         else:
@@ -1846,11 +1863,22 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
         # Propagate the first price type to all symbols
         price_types = [price_types[0]] * len(symbols)
 
+    # Ensure all lists are the same length
+    n = len(symbols)
+    if not price_types or len(price_types) < n:
+        price_types = [price_types[0]] * n if price_types else ["LMT"] * n
+    if not quantities or len(quantities) < n:
+        quantities = [quantities[0]] * n if quantities else [1] * n
+    if not additional_info or len(additional_info) < n:
+        additional_info = (additional_info + [""] * n)[:n]
+    if exchanges is not None and (not exchanges or len(exchanges) < n):
+        exchanges = (exchanges + [exchanges[0]] * n)[:n]
+
     # Zip the relevant pairs based on whether exchanges are provided
     if exchanges is not None:
-        zipped_pairs = zip(quantities, symbols, exchanges, price_types, additional_info)
+        zipped_pairs = list(zip(quantities, symbols, exchanges, price_types, additional_info))
     else:
-        zipped_pairs = zip(quantities, symbols, price_types, additional_info)
+        zipped_pairs = list(zip(quantities, symbols, price_types, additional_info))
 
     # Sort zipped pairs by quantities in descending order
     sorted_pairs = sorted(zipped_pairs, reverse=True)
@@ -1877,6 +1905,8 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
             list(sorted_additional_info),
         )
     else:
+        if not sorted_pairs:
+            return [], [], [], []
         sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
         return list(sorted_symbols), list(sorted_quantities), list(sorted_order_types), list(sorted_additional_info)
 
@@ -2152,7 +2182,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
                     exit_price = price
                     break
 
-            # Fallback to row's entry_price and exit_price if not found in Redis
+            # Fallback to row's entry_price and exitPrice if not found in Redis
             entry_price = entry_price if entry_price is not None else row["entry_price"]
             # exit_price is set to 0 for combo orders irresepctive of mtm.
             exit_price = exit_price if exit_price is not None else row["exit_price"] if len(legs) == 1 else 0
