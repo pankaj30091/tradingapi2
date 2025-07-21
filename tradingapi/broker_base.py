@@ -19,6 +19,7 @@ class Brokers(Enum):
     INTERACTIVEBROKERS = 4
     DHAN = 5
     ICICIDIRECT = 6
+    FLATTRADE = 7
 
 
 @dataclass
