@@ -1650,7 +1650,8 @@ def get_option_underlying_price(
         if math.isnan(price_f):
             return float("nan")
 
-    if "NIFTY" in symbol and fut_expiry is not None:
+    # Interpolate for index options if needed
+    if ("NIFTY" in symbol or "SENSEX" in symbol) and fut_expiry:
         t_o = calc_fractional_business_days(
             dt.datetime.now(), dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
         )
@@ -1738,8 +1739,7 @@ def find_option_with_delta(
 
     increasing = abs(delta_2) > abs(delta_1)  # True if deltas increase with strike price
     # if delta is nan, we need to decide if the search range is to the left or right of the present strike
-    # we use delta_2 which is on the right range.
-    # and use delta_2's position vis_a_vis target_delta to determine the direction of move to identity next best delta.
+    # and use delta_2's position vis_a-vis target_delta to determine the direction of move to identity next best delta.
     move_right_on_nan_delta = True
     if delta_2 > target_delta and increasing:
         move_right_on_nan_delta = False
