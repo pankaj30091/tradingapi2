@@ -1619,6 +1619,7 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
     if last:
         return quote.last
     else:
+        mid = float("nan")
         if quote.bid > 0 and quote.ask > 0:
             mid = (quote.bid + quote.ask) / 2
             mapped_exchange = brokers[0].map_exchange_for_api(long_symbol, exchange)
