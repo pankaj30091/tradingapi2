@@ -1095,7 +1095,7 @@ def get_linked_futures(symbol_name: str, expiry: str = "", file_path: str = "") 
     return linked_futures
 
 
-def get_latest_symbol_file(directory_path="/home/psharma/onedrive/rfiles/data/static/symbols"):
+def get_latest_symbol_file(directory_path="/home/psharma/onedrive/data/static/symbols"):
     pattern = "*_symbols.csv"
     files = glob.glob(os.path.join(directory_path, pattern))
     dates = [int(os.path.basename(file).split("_")[0]) for file in files]
