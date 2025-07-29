@@ -1122,6 +1122,7 @@ def get_universe(file_path: str = "", product_types=["OPT", "FUT"], exchanges=["
     out: List[str] = []
 
     for exchange in exchanges:
+        exchange = exchange[0]
         for prod_type in product_types:
             # Filter condition for prod_type and exchange
             condition = (symbols["long_symbol"].str.contains(f"_{prod_type}_")) & (symbols["Exch"] == exchange)
