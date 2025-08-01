@@ -125,8 +125,8 @@ def _merge_additional_info(old_info, new_info):
     """
     try:
         # Parse the JSON strings into dictionaries
-        old_dict = json.loads(old_info) if old_info.strip() else {}
-        new_dict = json.loads(new_info) if new_info.strip() else {}
+        old_dict = json.loads(old_info) if old_info and old_info.strip() else {}
+        new_dict = json.loads(new_info) if new_info and new_info.strip() else {}
 
         if not isinstance(old_dict, dict) or not isinstance(new_dict, dict):
             logger.error("Both inputs must be JSON objects (dictionaries).")
@@ -158,6 +158,21 @@ def _merge_additional_info(old_info, new_info):
 
 def is_not_int_order_id(s):
     return not bool(re.match(r"^.*_\d+$", s))
+
+
+def needs_refresh_status_from_redis(broker: BrokerBase, pnl_df: pd.DataFrame) -> bool:
+    """
+    Returns True if any trade's entry/exit order price in Redis is 0.
+    """
+    for _, row in pnl_df.iterrows():
+        for order_id_col in ["entry_internal_orderid", "exit_internal_orderid"]:
+            order_id = row.get(order_id_col)
+            if order_id:
+                redis_key = f"order:{order_id}"
+                price = broker.redis_o.hget(redis_key, "price")
+                if price is not None and float(price) == 0.0:
+                    return True
+    return False
 
 
 def get_pnl_table(
@@ -1617,18 +1632,18 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
     except Exception as e:
         logger.error(f"Error getting price for {long_symbol} on {exchange}: {e}")
         return float("nan")
-    if last:
+    mid = float("nan")
+    if quote.bid > 0 and quote.ask > 0:
+        mid = (quote.bid + quote.ask) / 2
+        mapped_exchange = brokers[0].map_exchange_for_api(long_symbol, exchange)
+        ticksize = brokers[0].exchange_mappings[mapped_exchange]["contracttick_map"].get(long_symbol, 0.05)
+        mid = round(mid / ticksize) * ticksize
+        mid = round(mid, 2)  # <-- Add this line to ensure two decimal places
+    mid = mid if mid > 0 else float("nan")
+    if last and math.isnan(mid):
         return quote.last
-    else:
-        mid = float("nan")
-        if quote.bid > 0 and quote.ask > 0:
-            mid = (quote.bid + quote.ask) / 2
-            mapped_exchange = brokers[0].map_exchange_for_api(long_symbol, exchange)
-            ticksize = brokers[0].exchange_mappings[mapped_exchange]["contracttick_map"].get(long_symbol, 0.05)
-            mid = round(mid / ticksize) * ticksize
-            mid = round(mid, 2)  # <-- Add this line to ensure two decimal places
-        mid = mid if mid > 0 else float("nan")
-        return mid
+    return mid
+     
 
 
 def get_option_underlying_price(
@@ -1645,7 +1660,8 @@ def get_option_underlying_price(
         float: price of underlying
     """
     if not fut_expiry:
-        price_f = get_mid_price(brokers, symbol, exchange=exchange, mds=mds, last=last)
+        underlying = symbol.split("_")[0] + "_IND___" if "NIFTY" in symbol or "SENSEX" in symbol else symbol.split("_")[0] + "_STK___"
+        price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
     else:
         underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)

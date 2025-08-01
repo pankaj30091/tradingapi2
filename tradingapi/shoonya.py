@@ -1256,12 +1256,59 @@ class Shoonya(BrokerBase):
         """
 
         def split_fno(fno_symbol):
-            part1 = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol).group()
-            date_match = re.search(r"\d{2}[A-Z]{3}\d{2}", fno_symbol)
-            part2 = dt.datetime.strptime(date_match.group(), "%d%b%y").date().strftime("%Y%m%d")
-            part3 = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol).group(1)
-            part4 = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol).group(1)
-            return f"{part1}_{'FUT' if part3 == 'F' else 'OPT'}_{part2}_{'CALL' if part3=='C' else 'PUT' if part3 =='P' else ''}_{part4}"
+            # Check if it's SENSEX format (ends with CE/PE)
+            if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
+                # SENSEX format: SENSEX2580581800CE
+                # Extract symbol
+                symbol = "SENSEX"
+                
+                # Extract option type (last 2 characters)
+                option_type = fno_symbol[-2:]  # CE or PE
+                part3 = "C" if option_type == "CE" else "P"
+                
+                # Extract the numeric part after SENSEX and before CE/PE
+                numeric_part = fno_symbol[6:-2]  # 2580581800
+                
+                # Parse the date part: YYMMDD format
+                # For SENSEX2580581800CE: 25805 = 25(year) + 8(month) + 05(day)
+                if len(numeric_part) >= 5:
+                    # Extract date components
+                    year = "20" + numeric_part[:2]  # 25 -> 2025
+                    month = numeric_part[2:3]        # 8 -> 08 (add leading zero if needed)
+                    day = numeric_part[3:5]          # 05 -> 05
+                    
+                    # Ensure month has leading zero if needed
+                    if len(month) == 1:
+                        month = "0" + month
+                    
+                    # Ensure day has leading zero if needed  
+                    if len(day) == 1:
+                        day = "0" + day
+                    
+                    # Construct date string
+                    date_str = f"{year}{month}{day}"
+                    part2 = date_str
+                    
+                    # Extract strike (remaining digits after date)
+                    strike_part = numeric_part[5:]  # 81800
+                    part4 = strike_part
+                    
+                else:
+                    # Fallback if the format is unexpected
+                    logger.warning(f"Unexpected SENSEX format: {fno_symbol}")
+                    part2 = "20250101"
+                    part4 = numeric_part
+                
+                return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
+            
+            else:
+                # Original NIFTY format: NIFTY07AUG25C25050
+                part1 = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol).group()
+                date_match = re.search(r"\d{2}[A-Z]{3}\d{2}", fno_symbol)
+                part2 = dt.datetime.strptime(date_match.group(), "%d%b%y").date().strftime("%Y%m%d")
+                part3 = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol).group(1)
+                part4 = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol).group(1)
+                return f"{part1}_{'FUT' if part3 == 'F' else 'OPT'}_{part2}_{'CALL' if part3=='C' else 'PUT' if part3 =='P' else ''}_{part4}"
 
         def split_cash(cash_symbol):
             lst = cash_symbol.split("_")
