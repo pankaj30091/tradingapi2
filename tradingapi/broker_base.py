@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import logging
 import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
@@ -8,6 +9,18 @@ from typing import Any, Dict, List, Union
 
 import pandas as pd
 import redis
+
+logger = logging.getLogger(__name__)
+
+from .exceptions import (
+    TradingAPIError, BrokerConnectionError, OrderError, MarketDataError,
+    ValidationError, NetworkError, AuthenticationError, create_error_context
+)
+from .error_handling import (
+    retry_on_error, safe_execute, log_execution_time, 
+    handle_broker_errors, validate_inputs
+)
+# Removed trading_logger import to avoid circular import issues
 
 NEXT_DAY_TIMESTAMP = int((dt.datetime.today() + dt.timedelta(days=1)).timestamp())
 
@@ -51,6 +64,58 @@ class OrderStatus(Enum):
     CANCELLED = 7  # Cancelled by Exchange
 
 
+def _validate_quantity(quantity):
+    """
+    Validate quantity parameter that can be int, float, or string representation.
+
+    Args:
+        quantity: Quantity value to validate
+
+    Returns:
+        bool: True if valid quantity, False otherwise
+    """
+    try:
+        if isinstance(quantity, (int, float)):
+            return quantity >= 0
+        elif isinstance(quantity, str) and quantity.strip():
+            # Try to convert string to float
+            float_val = float(quantity.strip())
+            return float_val >= 0
+        else:
+            return False
+    except (ValueError, TypeError):
+        return False
+
+
+def _validate_price(price):
+    """
+    Validate price parameter that can be int, float, string representation, or NaN.
+
+    Args:
+        price: Price value to validate
+
+    Returns:
+        bool: True if valid price, False otherwise
+    """
+    try:
+        if isinstance(price, (int, float)):
+            return True  # Allow any numeric value including NaN
+        elif isinstance(price, str) and price.strip():
+            # Try to convert string to float
+            float(price.strip())
+            return True
+        else:
+            return False
+    except (ValueError, TypeError):
+        return False
+
+@validate_inputs(
+    long_symbol=lambda x: isinstance(x, str),
+    order_type=lambda x: isinstance(x, str),
+    quantity=lambda x: _validate_quantity(x),
+    exchange=lambda x: isinstance(x, str),
+    price=lambda x: _validate_price(x)
+)
 class Order:
     def __init__(
         self,
@@ -88,6 +153,41 @@ class Order:
     ):
         """
         Initialize an Order object with various attributes related to trading orders.
+        
+        Args:
+            long_symbol: Trading symbol
+            order_type: Type of order (BUY, SELL, SHORT, COVER)
+            price_type: Price type for the order
+            quantity: Order quantity
+            exchange: Exchange name
+            exchange_segment: Exchange segment
+            price: Order price
+            is_intraday: Whether order is intraday
+            internal_order_id: Internal order ID
+            remote_order_id: Remote order ID
+            scrip_code: Scrip code
+            exch_order_id: Exchange order ID
+            broker_order_id: Broker order ID
+            stoploss_price: Stop loss price
+            is_stoploss_order: Whether it's a stop loss order
+            ioc_order: Whether it's an IOC order
+            scripdata: Scrip data
+            orderRef: Order reference
+            order_id: Order ID
+            local_order_id: Local order ID
+            disqty: Disclosed quantity
+            message: Order message
+            status: Order status
+            vtd: VTD string
+            ahplaced: After hours placement
+            IsGTCOrder: Whether it's a GTC order
+            IsEOSOrder: Whether it's an EOS order
+            paper: Whether it's a paper trade
+            broker: Broker name
+            additional_info: Additional information
+            
+        Raises:
+            ValidationError: If input parameters are invalid
         """
         self.long_symbol = long_symbol
         self.price_type = price_type
@@ -108,7 +208,7 @@ class Order:
         self.orderRef = orderRef
         self.order_id = self._convert_to_int(order_id)
         self.local_order_id = self._convert_to_int(local_order_id)
-        self.disqty = self._convert_to_int(disqty)
+        self.disqty = 0 if disqty == 'None' else self._convert_to_int(disqty)
         self.message = message
         self.vtd = vtd
         self.ahplaced = ahplaced
@@ -148,29 +248,175 @@ class Order:
 
     def _convert_to_int(self, value: Any) -> int:
         """
-        Convert a value to an integer if possible, otherwise return None.
+        Convert a value to an integer if possible, otherwise return 0.
+        Handles various types including strings, floats, and objects that can be converted to numbers.
         """
         try:
-            return int(float(value))
-        except (TypeError, ValueError):
+            # Handle None values
+            if value is None:
+                logger.warning("Received None value, returning 0", extra={
+                    "value": value,
+                    "default": 0,
+                    "method": "_convert_to_int"
+                })
+                return 0
+            
+            # Handle integers directly
+            if isinstance(value, int):
+                return value
+            
+            # Handle floats
+            elif isinstance(value, float):
+                return int(value)
+            
+            # Handle strings (including object representations like '260.0')
+            elif isinstance(value, str):
+                # Strip whitespace and handle empty strings
+                value = value.strip()
+                if not value:
+                    logger.warning("Empty string value, returning 0", extra={
+                        "value": repr(value),
+                        "default": 0,
+                        "method": "_convert_to_int"
+                    })
+                    return 0
+                
+                try:
+                    # Try to convert string to float first, then to int
+                    return int(float(value))
+                except ValueError:
+                    logger.warning("Failed to convert string to int", extra={
+                        "value": repr(value),
+                        "default": 0,
+                        "method": "_convert_to_int"
+                    })
+                    return 0
+            
+            # Handle other objects by converting to string first
+            else:
+                try:
+                    # Convert object to string and then to number
+                    str_value = str(value).strip()
+                    if not str_value:
+                        logger.warning("Object converted to empty string, returning 0", extra={
+                            "value": repr(value),
+                            "value_type": type(value).__name__,
+                            "default": 0,
+                            "method": "_convert_to_int"
+                        })
+                        return 0
+                    
+                    return int(float(str_value))
+                except (ValueError, TypeError):
+                    logger.warning("Failed to convert object to int", extra={
+                        "value": repr(value),
+                        "value_type": type(value).__name__,
+                        "default": 0,
+                        "method": "_convert_to_int"
+                    })
+                    return 0
+                    
+        except Exception as e:
+            logger.error("Error converting value to int", exc_info=True, extra={
+                "value": repr(value),
+                "value_type": type(value).__name__,
+                "method": "_convert_to_int"
+            })
             return 0
 
     def _convert_to_float(self, value: Any) -> float:
         """
         Convert a value to a float if possible, otherwise return NaN.
+        Handles various types including strings, integers, and objects that can be converted to numbers.
         """
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            # Handle None values
+            if value is None:
+                logger.warning("Received None value, returning NaN", extra={
+                    "value": value,
+                    "default": float("nan"),
+                    "method": "_convert_to_float"
+                })
+                return float("nan")
+            
+            # Handle numbers directly
+            if isinstance(value, (int, float)):
+                return float(value)
+            
+            # Handle strings
+            elif isinstance(value, str):
+                # Strip whitespace and handle empty strings
+                value = value.strip()
+                if not value:
+                    logger.warning("Empty string value, returning NaN", extra={
+                        "value": repr(value),
+                        "default": float("nan"),
+                        "method": "_convert_to_float"
+                    })
+                    return float("nan")
+                
+                try:
+                    return float(value)
+                except ValueError:
+                    logger.warning("Failed to convert string to float", extra={
+                        "value": repr(value),
+                        "default": float("nan"),
+                        "method": "_convert_to_float"
+                    })
+                    return float("nan")
+            
+            # Handle other objects by converting to string first
+            else:
+                try:
+                    # Convert object to string and then to number
+                    str_value = str(value).strip()
+                    if not str_value:
+                        logger.warning("Object converted to empty string, returning NaN", extra={
+                            "value": repr(value),
+                            "value_type": type(value).__name__,
+                            "default": float("nan"),
+                            "method": "_convert_to_float"
+                        })
+                        return float("nan")
+                    
+                    return float(str_value)
+                except (ValueError, TypeError):
+                    logger.warning("Failed to convert object to float", extra={
+                        "value": repr(value),
+                        "value_type": type(value).__name__,
+                        "default": float("nan"),
+                        "method": "_convert_to_float"
+                    })
+                    return float("nan")
+                    
+        except Exception as e:
+            logger.error("Error converting value to float", exc_info=True, extra={
+                "value": repr(value),
+                "value_type": type(value).__name__,
+                "method": "_convert_to_float"
+            })
             return float("nan")
 
     def _convert_to_bool(self, value: Any) -> bool:
         """
         Convert a value to a boolean if possible.
         """
-        if isinstance(value, str):
-            return value.lower() in ["true", "1", "yes"]
-        return bool(value)
+        try:
+            if isinstance(value, bool):
+                return value
+            elif isinstance(value, str):
+                return value.lower() in ("true", "1", "yes", "y")
+            elif isinstance(value, (int, float)):
+                return bool(value)
+            else:
+                return False
+        except Exception as e:
+            logger.error("Error converting value to bool", exc_info=True, extra={
+                "value": value,
+                "value_type": type(value).__name__,
+                "method": "_convert_to_bool"
+            })
+            return False
 
     def to_dict(self):
         result = self.__dict__.copy()
@@ -183,6 +429,21 @@ class Order:
         return json.dumps(self.to_dict(), indent=4, default=str)
 
 
+@validate_inputs(
+    bid=lambda x: _validate_price(x),
+    ask=lambda x: _validate_price(x),
+    bid_volume=lambda x: _validate_quantity(x),
+    ask_volume=lambda x: _validate_quantity(x),
+    prior_close=lambda x: _validate_price(x),
+    last=lambda x: _validate_price(x),
+    high=lambda x: _validate_price(x),
+    low=lambda x: _validate_price(x),
+    volume=lambda x: _validate_quantity(x),
+    symbol=lambda x: isinstance(x, str),
+    exchange=lambda x: isinstance(x, str),
+    src=lambda x: isinstance(x, str),
+    timestamp=lambda x: isinstance(x, str)
+)
 class Price:
     def __init__(
         self,
@@ -200,6 +461,27 @@ class Price:
         src: str = "",
         timestamp: str = "",
     ):
+        """
+        Initialize a Price object with market data.
+        
+        Args:
+            bid: Bid price
+            ask: Ask price
+            bid_volume: Bid volume
+            ask_volume: Ask volume
+            prior_close: Prior close price
+            last: Last traded price
+            high: High price
+            low: Low price
+            volume: Total volume
+            symbol: Trading symbol
+            exchange: Exchange name
+            src: Source of the price data
+            timestamp: Timestamp of the price data
+            
+        Raises:
+            ValidationError: If input parameters are invalid
+        """
         self.bid = bid
         self.ask = ask
         self.bid_volume = bid_volume
@@ -340,8 +622,52 @@ class OrderInfo:
 
 
 class BrokerBase(ABC):
-    @abstractmethod
+    """
+    Abstract base class for broker implementations with enhanced error handling.
+    
+    This class defines the interface that all broker implementations must follow.
+    It includes common error handling patterns and logging capabilities.
+    """
+    
     def __init__(self, **kwargs):
+        """
+        Initialize the broker with configuration parameters.
+        
+        Args:
+            **kwargs: Configuration parameters for the broker
+            
+        Raises:
+            ValidationError: If configuration parameters are invalid
+            BrokerConnectionError: If broker initialization fails
+        """
+        try:
+            self._validate_config(kwargs)
+            self._initialize_broker(kwargs)
+            logger.info("Broker initialized successfully", extra={
+                "broker_type": self.__class__.__name__,
+                "config_keys": list(kwargs.keys())
+            })
+        except Exception as e:
+            context = create_error_context(
+                broker_type=self.__class__.__name__,
+                config_keys=list(kwargs.keys()),
+                error=str(e)
+            )
+            raise BrokerConnectionError(f"Failed to initialize broker: {str(e)}", context)
+    
+    def _validate_config(self, config: dict):
+        """Validate broker configuration parameters."""
+        if not isinstance(config, dict):
+            raise ValidationError("Configuration must be a dictionary")
+        
+        # Add specific validation logic for each broker type
+        logger.debug("Validating broker configuration", extra={
+            "broker_type": self.__class__.__name__,
+            "config_keys": list(config.keys())
+        })
+    
+    def _initialize_broker(self, config: dict):
+        """Initialize broker-specific components."""
         self.broker = Brokers.UNDEFINED
         self.starting_order_ids_int = {}
         self.redis_o = redis.Redis(db=0, charset="utf-8", decode_responses=True)
@@ -356,78 +682,295 @@ class BrokerBase(ABC):
 
     @abstractmethod
     def update_symbology(self, **kwargs):
+        """
+        Update the symbology mapping for the broker.
+        
+        Raises:
+            ValidationError: If symbology parameters are invalid
+            BrokerConnectionError: If symbology update fails
+        """
         pass
 
     @abstractmethod
     def connect(self, redis_db: int):
+        """
+        Connect to the broker's trading platform.
+        
+        Args:
+            redis_db: Redis database number
+            
+        Raises:
+            ValidationError: If redis_db is invalid
+            BrokerConnectionError: If connection fails
+            AuthenticationError: If authentication fails
+        """
         pass
 
     @abstractmethod
     def is_connected(self):
+        """
+        Check if the broker is connected.
+        
+        Returns:
+            bool: True if connected, False otherwise
+            
+        Raises:
+            BrokerConnectionError: If connection check fails
+        """
         pass
 
     @abstractmethod
     def disconnect(self):
+        """
+        Disconnect from the broker's trading platform.
+        
+        Raises:
+            BrokerConnectionError: If disconnection fails
+        """
         pass
 
     @abstractmethod
     def place_order(self, order: Order, **kwargs) -> Order:
+        """
+        Place an order with the broker.
+        
+        Args:
+            order: Order object to place
+            **kwargs: Additional order parameters
+            
+        Returns:
+            Order: Updated order object
+            
+        Raises:
+            ValidationError: If order parameters are invalid
+            OrderError: If order placement fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def modify_order(self, **kwargs) -> Order:
+        """
+        Modify an existing order.
+        
+        Args:
+            **kwargs: Order modification parameters
+            
+        Returns:
+            Order: Updated order object
+            
+        Raises:
+            ValidationError: If modification parameters are invalid
+            OrderError: If order modification fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def cancel_order(self, **kwargs) -> Order:
+        """
+        Cancel an existing order.
+        
+        Args:
+            **kwargs: Order cancellation parameters
+            
+        Returns:
+            Order: Updated order object
+            
+        Raises:
+            ValidationError: If cancellation parameters are invalid
+            OrderError: If order cancellation fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def get_order_info(self, **kwargs) -> OrderInfo:
+        """
+        Get information about an order.
+        
+        Args:
+            **kwargs: Order information parameters
+            
+        Returns:
+            OrderInfo: Order information object
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            OrderError: If order information retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def get_historical(
         self,
         symbols: Union[str, pd.DataFrame, dict],
-        date_start: str,
-        date_end: str = dt.datetime.today().strftime("%Y-%m-%d"),
+        date_start: Union[str, dt.datetime, dt.date],
+        date_end: Union[str, dt.datetime, dt.date] = dt.datetime.today().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
         market_close_time: str = "15:30:00",
     ) -> Dict[str, List[HistoricalData]]:
+        """
+        Get historical data for symbols.
+        
+        Args:
+            symbols: Symbol(s) to get historical data for
+            date_start: Start date for historical data (can be string, datetime, or date object)
+            date_end: End date for historical data (can be string, datetime, or date object)
+            exchange: Exchange name
+            periodicity: Data periodicity
+            market_close_time: Market close time
+            
+        Returns:
+            Dict[str, List[HistoricalData]]: Historical data for each symbol
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If historical data retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def map_exchange_for_api(self, long_symbol, exchange) -> str:
-        """maps exchange to exchange code needed by broker API."""
+        """
+        Map exchange for API calls.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name
+            
+        Returns:
+            str: Mapped exchange name
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            SymbolError: If symbol mapping fails
+        """
         pass
 
     @abstractmethod
     def map_exchange_for_db(self, long_symbol, exchange) -> str:
-        """maps exchange to NSE or BSE or MCX. The long form exchange name."""
+        """
+        Map exchange for database operations.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name
+            
+        Returns:
+            str: Mapped exchange name
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            SymbolError: If symbol mapping fails
+        """
         pass
 
     @abstractmethod
     def get_quote(self, long_symbol: str, exchange="NSE") -> Price:
+        """
+        Get quote for a symbol.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name
+            
+        Returns:
+            Price: Price object with market data
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If quote retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def get_position(self, long_symbol: str) -> Union[pd.DataFrame, int]:
+        """
+        Get position for a symbol.
+        
+        Args:
+            long_symbol: Trading symbol
+            
+        Returns:
+            Union[pd.DataFrame, int]: Position data
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If position retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def get_orders_today(self, **kwargs) -> pd.DataFrame:
+        """
+        Get orders for today.
+        
+        Args:
+            **kwargs: Additional parameters
+            
+        Returns:
+            pd.DataFrame: Orders data
+            
+        Raises:
+            OrderError: If order retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def get_trades_today(self, **kwargs) -> pd.DataFrame:
+        """
+        Get trades for today.
+        
+        Args:
+            **kwargs: Additional parameters
+            
+        Returns:
+            pd.DataFrame: Trades data
+            
+        Raises:
+            MarketDataError: If trade retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
         pass
 
     @abstractmethod
     def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
+        """
+        Get long name from broker identifier.
+        
+        Args:
+            **kwargs: Additional parameters
+            
+        Returns:
+            pd.Series: Long names
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            SymbolError: If symbol mapping fails
+        """
         pass
 
     @abstractmethod
     def get_min_lot_size(self, long_symbol: str, exchange: str) -> int:
+        """
+        Get minimum lot size for a symbol.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name
+            
+        Returns:
+            int: Minimum lot size
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            SymbolError: If symbol lookup fails
+        """
         pass

@@ -25,25 +25,49 @@ from .broker_base import (BrokerBase, Brokers, HistoricalData, Order,
 from .config import get_config
 from .utils import (delete_broker_order_id, set_starting_internal_ids_int,
                     update_order_status)
+from .exceptions import (
+    ConfigurationError, DataError, RedisError, SymbolError, TradingAPIError, BrokerConnectionError, OrderError, MarketDataError,
+    ValidationError, NetworkError, AuthenticationError, create_error_context
+)
+from .error_handling import (
+    retry_on_error, safe_execute, log_execution_time, 
+    handle_broker_errors, validate_inputs
+)
+from . import trading_logger
 
 logger = logging.getLogger(__name__)
 config = get_config()
 
 
-# Exception handler
+# Enhanced exception handler with structured logging
 def my_handler(typ, value, trace):
-    logger.error("%s %s %s", typ.__name__, value, "".join(traceback.format_tb(trace)))
+    context = create_error_context(
+        exception_type=typ.__name__,
+        exception_value=str(value),
+        traceback="".join(traceback.format_tb(trace))
+    )
+    trading_logger.log_error(
+        f"Uncaught exception: {typ.__name__}",
+        value,
+        context
+    )
 
 
 sys.excepthook = my_handler
 
 
+@log_execution_time
+@retry_on_error(max_retries=3, delay=2.0, backoff_factor=2.0)
 def save_symbol_data(saveToFolder: bool = False):
-    bhavcopyfolder = config.get("bhavcopy_folder")
-    url = "https://openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/All"
-    dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_codes.csv"
-    response = requests.get(url, allow_redirects=True, timeout=100)  # Add timeout to `requests.get` to fix Bandit issue
-    if response.status_code == 200:
+    try:
+        bhavcopyfolder = config.get("bhavcopy_folder")
+        url = "https://openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/All"
+        dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_codes.csv"
+        response = requests.get(url, allow_redirects=True, timeout=100)  # Add timeout to `requests.get` to fix Bandit issue
+        
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch symbol data. Status code: {response.status_code}")
+        
         df = pd.read_csv(io.BytesIO(response.content))
         # Rename the column
         df.rename(columns={"ScripCode": "Scripcode"}, inplace=True)
@@ -84,7 +108,9 @@ def save_symbol_data(saveToFolder: bool = False):
             symbol_vec = row["symbol_vec"]
             ticksize = row["TickSize"]
 
-            if row["QtyLimit"] == 0 and row["LotSize"] == 2000 and row["TickSize"] == 0 and row["Exch"] in ["N"]:
+            if row["QtyLimit"] == 0 and row["LotSize"] == 2000 and row["TickSize"] == 0 and row["Exch"] in [
+                "N"
+            ]:
                 return f"{''.join(symbol_vec).replace('/', '')}_IND___".upper()
             elif (
                 row["QtyLimit"] == 0
@@ -100,8 +126,14 @@ def save_symbol_data(saveToFolder: bool = False):
                 try:
                     expiry = dt.datetime.strptime(expiry_str, "%Y%b%d").strftime("%Y%m%d")
                     return f"{symbol_vec[0]}_FUT_{expiry}__".upper()
-                except ValueError:
-                    return pd.NA
+                except Exception as e:
+                    trading_logger.log_error("Error processing symbol row", e, {
+                        "symbol_vec": symbol_vec,
+                        "row": str(row)
+                    })
+                    # Also log to the standard logger as backup
+                    logger.error(f"Error processing symbol row: {e}", exc_info=True)
+                    return None
             elif len(symbol_vec) == 6:
                 expiry_str = f"{symbol_vec[3]}{symbol_vec[2]}{symbol_vec[1]}"
                 try:
@@ -109,436 +141,1748 @@ def save_symbol_data(saveToFolder: bool = False):
                     right = "CALL" if symbol_vec[4] == "CE" else "PUT"
                     strike = ("%f" % float(symbol_vec[5])).rstrip("0").rstrip(".")
                     return f"{symbol_vec[0]}_OPT_{expiry}_{right}_{strike}".upper()
-                except ValueError:
-                    return pd.NA
+                except Exception as e:
+                    trading_logger.log_error("Error processing symbol row", e, {
+                        "symbol_vec": symbol_vec,
+                        "row": str(row)
+                    })
+                    # Also log to the standard logger as backup
+                    logger.error(f"Error processing symbol row: {e}", exc_info=True)
+                    return None
             else:
-                return pd.NA
+                return None
 
-        # Apply the function to each row
         codes["long_symbol"] = codes.apply(process_row, axis=1)
-
-        # Save to CSV
-        filtered_codes = codes.dropna(subset=["long_symbol"])
+        codes = codes.dropna(subset=["long_symbol"])
+        codes = codes.drop(columns=["symbol_vec"])
         if saveToFolder:
             dest_symbol_file = (
                 f"{config.get('FIVEPAISA.SYMBOLCODES')}/{dt.datetime.today().strftime('%Y%m%d')}_symbols.csv"
             )
-            filtered_codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize"]].to_csv(
-                dest_symbol_file, index=False
-            )
-        return filtered_codes
+            filtered_codes = codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize"]]
+
+            filtered_codes.to_csv(dest_symbol_file, index=False)
+        return codes
+    except Exception as e:
+        # Log error to both trading_logger and standard logger
+        try:
+            trading_logger.log_error("Error in save_symbol_data", e, {
+                "saveToFolder": saveToFolder,
+                "dest_file": dest_file if 'dest_file' in locals() else None
+            })
+        except:
+            pass  # If trading_logger fails, continue with standard logging
+        
+        # Also log to standard logger as backup
+        logger.error(f"Error in save_symbol_data: {e}", exc_info=True)
+        raise
 
 
 class FivePaisa(BrokerBase):
+    """
+    FivePaisa broker implementation with enhanced error handling and logging.
+    """
+    
+    @log_execution_time
     def __init__(self, **kwargs):
         """
-        mandatory_keys = None
-
+        Initialize FivePaisa broker with enhanced error handling.
+        
+        Args:
+            **kwargs: Configuration parameters for FivePaisa broker
+            
         Raises:
-            ValueError: _description_
+            ValidationError: If configuration parameters are invalid
+            BrokerConnectionError: If broker initialization fails
         """
-        super().__init__()
-        self.codes = pd.DataFrame()
-        self.broker = Brokers.FIVEPAISA
-        self.api = None
-        self.subscribe_thread = None
-        self.subscribed_symbols = []
-
-    def log_and_return(self, any_object):
-        caller_function = inspect.stack()[1].function
-
-        if hasattr(any_object, "to_dict"):
-            # Try to get the object's __dict__
-            try:
-                log_object = any_object.to_dict()  # Use the object's attributes as a dictionary
-            except Exception as e:
-                log_object = {"error": f"Error accessing __dict__: {str(e)}"}
-        else:
-            # If no __dict__, treat the object as a simple serializable object (e.g., a dict, list, etc.)
-            log_object = any_object
-
-        # Add the calling function name to the log
-        log_entry = {"caller": caller_function, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "object": log_object}
-
-        # Log the entry to Redis
-        self.redis_o.zadd("FIVEPAISA:LOG", {json.dumps(log_entry): time.time()})
-
-    def update_symbology(self, **kwargs):
-        dt_today = dt.datetime.today().strftime("%Y%m%d")
-        symbols_path = os.path.join(config.get(f"{self.broker.name}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
-
-        # Load symbols data
-        if not os.path.exists(symbols_path):
-            codes = save_symbol_data(saveToFolder=False)
-            codes = codes.dropna(subset=["long_symbol"])
-        else:
-            codes = pd.read_csv(symbols_path)
-
-        # Initialize dictionaries to hold mappings for each exchange
-        self.exchange_mappings = {}
-
-        for exchange, group in codes.groupby("Exch"):
-            self.exchange_mappings[exchange] = {
-                "symbol_map": dict(zip(group["long_symbol"], group["Scripcode"])),
-                "contractsize_map": dict(zip(group["long_symbol"], group["LotSize"])),
-                "exchange_map": dict(zip(group["long_symbol"], group["Exch"])),
-                "exchangetype_map": dict(zip(group["long_symbol"], group["ExchType"])),
-                "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"])),
-                "symbol_map_reversed": dict(zip(group["Scripcode"], group["long_symbol"])),
-            }
-        return codes
-
-    def connect(self, redis_db: int):
-        def extract_credentials():
-            return {
-                "APP_SOURCE": config.get(f"{self.broker.name}.APP_SOURCE"),
-                "APP_NAME": config.get(f"{self.broker.name}.APP_NAME"),
-                "USER_ID": config.get(f"{self.broker.name}.USER_ID"),
-                "PASSWORD": config.get(f"{self.broker.name}.PASSWORD"),
-                "USER_KEY": config.get(f"{self.broker.name}.USER_KEY"),
-                "ENCRYPTION_KEY": config.get(f"{self.broker.name}.ENCRYPTION_KEY"),
-            }
-
-        susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
-        logged_in_user = False
-        if config.get(self.broker.name) != {}:
-            self.codes = self.update_symbology()
-            if os.path.exists(susertoken_path):
-                mod_time = os.path.getmtime(susertoken_path)
-                mod_datetime = dt.datetime.fromtimestamp(mod_time)
-                today = dt.datetime.now().date()
-                if mod_datetime.date() == today:
-                    with open(susertoken_path, "r") as file:
-                        susertoken = file.read().strip()
-                    client_id = config.get(f"{self.broker.name}.CLIENT_ID")
-                    self.api = FivePaisaClient(cred=extract_credentials())
-                    self.api.set_access_token(susertoken, client_id)
-                    if self.api.Login_check() == ".ASPXAUTH=None":
-                        logged_in_user = False
-                    else:
-                        logged_in_user = True
-            if not logged_in_user:
-                self.api = FivePaisaClient(cred=extract_credentials())
-                max_attempts = 5
-                for attempt in range(1, max_attempts + 1):
-                    otp = pyotp.TOTP(config.get(f"{self.broker.name}.TOTP_TOKEN")).now()
-                    self.api.get_totp_session(
-                        config.get(f"{self.broker.name}.CLIENT_ID"),
-                        otp,
-                        config.get(f"{self.broker.name}.PIN"),
-                    )
-                    if self.api.access_token:
-                        logger.info(f"Connected successfully on attempt {attempt}.")
-                        susertoken = self.api.access_token
-                        with open(susertoken_path, "w") as file:
-                            file.write(susertoken)
-                            logged_in_user = True
-                            break
-                    else:
-                        logger.warning(f"Attempt {attempt} failed. Retrying in 40 seconds...")
-                        time.sleep(40)
-                # attributes_string = ""
-                # for key, value in vars(self.api).items():
-                #     attributes_string += "{}: {}\n".format(key, value)
-                # logger.debug(f"{attributes_string}")
-            self.redis_o = redis.Redis(db=redis_db, charset="utf-8", decode_responses=True)
-            self.starting_order_ids_int = set_starting_internal_ids_int(redis_db=self.redis_o)
-            if not logged_in_user:
-                logger.error("Error: Not connected. Access token is missing after 5 attempts.")
-                raise ValueError("Error: Not connected. Access token is missing.")
-        else:
-            logger.error("Configuration file not found.")
-            sys.exit(1)
-
-    def is_connected(self):
         try:
-            if (
-                float(self.api.margin()[0]["Ledgerbalance"]) + float(self.api.margin()[0]["FundsPayln"]) > 0
-                and self.get_quote("NIFTY_IND___").last > 0
-            ):
-                return True
+            super().__init__(**kwargs)
+            self.codes = pd.DataFrame()
+            self.broker = Brokers.FIVEPAISA
+            self.api = None
+            self.subscribe_thread = None
+            self.subscribed_symbols = []
+            
+            trading_logger.log_info("FivePaisa broker initialized", {
+                "broker_type": "FivePaisa",
+                "config_keys": list(kwargs.keys())
+            })
+        except Exception as e:
+            context = create_error_context(
+                broker_type="FivePaisa",
+                config_keys=list(kwargs.keys()),
+                error=str(e)
+            )
+            raise BrokerConnectionError(f"Failed to initialize FivePaisa broker: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        any_object=lambda x: x is not None
+    )
+    def log_and_return(self, any_object):
+        """
+        Log and return an object with enhanced error handling.
+        
+        Args:
+            any_object: Object to log and return
+            
+        Returns:
+            The original object
+            
+        Raises:
+            ValidationError: If any_object is None
+            RedisError: If Redis logging fails
+        """
+        try:
+            trading_logger.log_debug("Logging and returning object", {
+                "object_type": type(any_object).__name__
+            })
+            
+            if any_object is None:
+                context = create_error_context(
+                    object_type=type(any_object)
+                )
+                raise ValidationError("Object cannot be None", context)
+            
+            caller_function = inspect.stack()[1].function
+
+            try:
+                if hasattr(any_object, "to_dict"):
+                    # Try to get the object's __dict__
+                    try:
+                        log_object = any_object.to_dict()  # Use the object's attributes as a dictionary
+                    except Exception as e:
+                        trading_logger.log_warning("Error accessing object to_dict method", {
+                            "object_type": type(any_object).__name__,
+                            "error": str(e)
+                        })
+                        log_object = {"error": f"Error accessing __dict__: {str(e)}"}
+                else:
+                    # If no __dict__, treat the object as a simple serializable object (e.g., a dict, list, etc.)
+                    log_object = any_object
+
+                # Add the calling function name to the log
+                log_entry = {"caller": caller_function, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "object": log_object}
+
+                # Log the entry to Redis
+                try:
+                    self.redis_o.zadd("FIVEPAISA:LOG", {json.dumps(log_entry): time.time()})
+                    trading_logger.log_debug("Object logged to Redis successfully", {
+                        "caller_function": caller_function,
+                        "object_type": type(any_object).__name__
+                    })
+                except Exception as e:
+                    context = create_error_context(
+                        caller_function=caller_function,
+                        object_type=type(any_object).__name__,
+                        error=str(e)
+                    )
+                    raise RedisError(f"Failed to log object to Redis: {str(e)}", context)
+                    
+            except Exception as e:
+                trading_logger.log_error("Error processing object for logging", e, {
+                    "caller_function": caller_function,
+                    "object_type": type(any_object).__name__
+                })
+                # Continue execution even if logging fails
+                
+            return any_object
+            
+        except (ValidationError, RedisError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                object_type=type(any_object).__name__,
+                error=str(e)
+            )
+            raise ValidationError(f"Unexpected error in log_and_return: {str(e)}", context)
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def _validate_quantity(self, quantity):
+        """
+        Validate quantity parameter that can be int, float, or string representation.
+        
+        Args:
+            quantity: Quantity value to validate
+            
+        Returns:
+            bool: True if valid quantity, False otherwise
+        """
+        try:
+            if isinstance(quantity, (int, float)):
+                return quantity >= 0
+            elif isinstance(quantity, str) and quantity.strip():
+                # Try to convert string to float
+                float_val = float(quantity.strip())
+                return float_val >= 0
             else:
                 return False
-        except Exception as e:
-            logger.error(f"Login error: {str(e)}")
+        except (ValueError, TypeError):
             return False
 
-    def disconnect(self):
-        return super().disconnect()
-
-    def place_order(self, order: Order, **kwargs) -> Order:
-        mandatory_keys = [
-            "long_symbol",
-            "order_type",
-            "quantity",
-            "price",
-            "exchange",
-            "exchange_segment",
-            "internal_order_id",
-            "paper",
-        ]
-        # Check for missing keys
-        missing_keys = [key for key in mandatory_keys if key not in order.to_dict() or order.to_dict()[key] is None]
-        # If there are missing keys, raise an exception or print an error
-        if missing_keys:
-            raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        order.broker = self.broker
-        order.scrip_code = self.exchange_mappings[order.exchange]["symbol_map"].get(order.long_symbol, None)
-        orig_order_type = order.order_type
-        if order.scrip_code is not None or order.paper:  # if paper, we dont check for valid scrip_code
-            if order.order_type == "BUY" or order.order_type == "COVER":
-                order.order_type = "B"
-            elif order.order_type == "SHORT" or order.order_type == "SELL":
-                order.order_type = "S"
-            order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
-            if not order.paper:
-                if order.exchange == "M":
-                    min_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(order.long_symbol)
-                    quantity: Optional[int] = None  # Initialize as None
-                    if min_size is not None and order.quantity is not None:
-                        quantity = int(round(order.quantity / min_size, 0))
-                else:
-                    quantity = order.quantity
-                out = self.api.place_order(
-                    OrderType=order.order_type,
-                    Exchange=order.exchange,
-                    ExchangeType=order.exchange_segment,
-                    ScripCode=order.scrip_code,
-                    Qty=quantity,
-                    Price=order.price,
-                    RemoteOrderID=order.remote_order_id,
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def update_symbology(self, **kwargs):
+        """
+        Update symbology mappings with enhanced error handling.
+        
+        Args:
+            **kwargs: Additional keyword arguments
+            
+        Returns:
+            pd.DataFrame: Updated symbology codes
+            
+        Raises:
+            ConfigurationError: If configuration is invalid
+            DataError: If symbology data processing fails
+            FileNotFoundError: If symbol file is not found
+        """
+        try:
+            trading_logger.log_info("Updating symbology", {
+                "broker_name": self.broker.name
+            })
+            
+            try:
+                dt_today = dt.datetime.today().strftime("%Y%m%d")
+                symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
+                
+                if not symbol_codes_path:
+                    context = create_error_context(
+                        broker_name=self.broker.name,
+                        config_keys=list(config.keys())
+                    )
+                    raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.broker.name}", context)
+                
+                symbols_path = os.path.join(symbol_codes_path, f"{dt_today}_symbols.csv")
+                
+                trading_logger.log_debug("Symbols file path", {
+                    "symbols_path": symbols_path,
+                    "date": dt_today
+                })
+                
+            except Exception as e:
+                context = create_error_context(
+                    broker_name=self.broker.name,
+                    error=str(e)
                 )
-                if out is not None:
-                    order.exch_order_id = out.get("ExchOrderID")
-                    order.broker_order_id = out.get("BrokerOrderID")
-                    order.local_order_id = out.get("LocalOrderID")
-                    order.order_type = orig_order_type
-                    order.orderRef = order.internal_order_id
-                    order.message = out.get("Message")
-                    order.status = out.get("Status")
-                    order.exch_order_id = self._get_exchange_order_id(order.broker_order_id, order, delete=False)
-                    fills = self.get_order_info(broker_order_id=order.broker_order_id, order=order)
-                    order.status = fills.status
-                    order.exch_order_id = fills.exchange_order_id
-                    if fills.status == OrderStatus.REJECTED:
-                        logger.info(f"Order Rejected by broker. Order: {order}")
-                        return order
-                    if fills.fill_price > 0:
-                        order.price = fills.fill_price
-                    logger.info(f"Placed Order: {order}")
-                    self.log_and_return(order)
-                    return order
-            else:
-                order.order_type = orig_order_type
-                order.exch_order_id = str(secrets.randbelow(10**15)) + "P"  # Replace `random` with `secrets`
-                order.broker_order_id = str(secrets.randbelow(10**8)) + "P"  # Replace `random` with `secrets`
-                order.orderRef = order.internal_order_id
-                order.message = "Paper Order"
-                order.status = OrderStatus.FILLED
-                order.scrip_code = 0 if order.scrip_code is None else order.scrip_code
-                logger.info(f"Placed Paper Order: {order}")
-            self.log_and_return(order)
-            return order
-        if order.scrip_code is None:
-            logger.info(f"No broker identifier found for symbol: {order.long_symbol}")
-        self.log_and_return(order)
-        return order
+                raise ConfigurationError(f"Error getting symbols path: {str(e)}", context)
 
+            # Load symbols data
+            try:
+                if not os.path.exists(symbols_path):
+                    trading_logger.log_info("Symbols file not found, generating new data", {
+                        "symbols_path": symbols_path
+                    })
+                    codes = save_symbol_data(saveToFolder=False)
+                    codes = codes.dropna(subset=["long_symbol"])
+                else:
+                    trading_logger.log_info("Loading existing symbols file", {
+                        "symbols_path": symbols_path
+                    })
+                    codes = pd.read_csv(symbols_path)
+                    
+                trading_logger.log_debug("Symbols data loaded", {
+                    "data_shape": codes.shape,
+                    "columns": list(codes.columns)
+                })
+                
+            except FileNotFoundError as e:
+                context = create_error_context(
+                    symbols_path=symbols_path,
+                    error=str(e)
+                )
+                raise FileNotFoundError(f"Symbols file not found: {str(e)}", context)
+            except Exception as e:
+                context = create_error_context(
+                    symbols_path=symbols_path,
+                    error=str(e)
+                )
+                raise DataError(f"Error loading symbols data: {str(e)}", context)
+
+            # Initialize dictionaries to hold mappings for each exchange
+            try:
+                self.exchange_mappings = {}
+
+                for exchange, group in codes.groupby("Exch"):
+                    try:
+                        self.exchange_mappings[exchange] = {
+                            "symbol_map": dict(zip(group["long_symbol"], group["Scripcode"])),
+                            "contractsize_map": dict(zip(group["long_symbol"], group["LotSize"])),
+                            "exchange_map": dict(zip(group["long_symbol"], group["Exch"])),
+                            "exchangetype_map": dict(zip(group["long_symbol"], group["ExchType"])),
+                            "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"])),
+                            "symbol_map_reversed": dict(zip(group["Scripcode"], group["long_symbol"])),
+                        }
+                        
+                        trading_logger.log_debug("Exchange mappings created", {
+                            "exchange": exchange,
+                            "symbol_count": len(group)
+                        })
+                        
+                    except Exception as e:
+                        trading_logger.log_error("Error creating mappings for exchange", e, {
+                            "exchange": exchange,
+                            "group_shape": group.shape
+                        })
+                        continue
+                
+                trading_logger.log_info("Symbology update completed", {
+                    "total_exchanges": len(self.exchange_mappings),
+                    "total_symbols": len(codes)
+                })
+                
+            except Exception as e:
+                context = create_error_context(
+                    codes_shape=codes.shape if codes is not None else None,
+                    error=str(e)
+                )
+                raise DataError(f"Error creating exchange mappings: {str(e)}", context)
+                
+            return codes
+            
+        except (ConfigurationError, DataError, FileNotFoundError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                broker_name=self.broker.name,
+                error=str(e)
+            )
+            raise DataError(f"Unexpected error updating symbology: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        redis_db=lambda x: isinstance(x, int) and x >= 0
+    )
+    def connect(self, redis_db: int):
+        """
+        Connect to FivePaisa trading platform with enhanced error handling.
+        
+        Args:
+            redis_db: Redis database number
+            
+        Raises:
+            ValidationError: If redis_db is invalid
+            BrokerConnectionError: If connection fails
+            AuthenticationError: If authentication fails
+        """
+        def extract_credentials():
+            """Extract credentials from config with validation."""
+            try:
+                credentials = {
+                    "APP_SOURCE": config.get(f"{self.broker.name}.APP_SOURCE"),
+                    "APP_NAME": config.get(f"{self.broker.name}.APP_NAME"),
+                    "USER_ID": config.get(f"{self.broker.name}.USER_ID"),
+                    "PASSWORD": config.get(f"{self.broker.name}.PASSWORD"),
+                    "USER_KEY": config.get(f"{self.broker.name}.USER_KEY"),
+                    "ENCRYPTION_KEY": config.get(f"{self.broker.name}.ENCRYPTION_KEY"),
+                }
+                
+                missing_keys = [key for key, value in credentials.items() if not value]
+                if missing_keys:
+                    context = create_error_context(
+                        missing_keys=missing_keys,
+                        available_keys=list(config.keys())
+                    )
+                    raise AuthenticationError(f"Missing required FivePaisa credentials: {missing_keys}", context)
+                
+                return credentials
+            except Exception as e:
+                context = create_error_context(
+                    error=str(e),
+                    config_keys=list(config.keys())
+                )
+                raise AuthenticationError(f"Error extracting credentials: {str(e)}", context)
+
+        try:
+            trading_logger.log_info("Connecting to FivePaisa", {
+                "redis_db": redis_db,
+                "broker_name": self.broker.name
+            })
+            
+            if config.get(self.broker.name) == {}:
+                context = create_error_context(
+                    broker_name=self.broker.name,
+                    config_keys=list(config.keys())
+                )
+                raise BrokerConnectionError("Configuration file not found or empty", context)
+            
+            # Update symbology
+            try:
+                self.codes = self.update_symbology()
+            except Exception as e:
+                trading_logger.log_warning("Failed to update symbology", {
+                    "error": str(e)
+                })
+            
+            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            logged_in_user = False
+            
+            # Try to use existing token
+            if os.path.exists(susertoken_path):
+                try:
+                    mod_time = os.path.getmtime(susertoken_path)
+                    mod_datetime = dt.datetime.fromtimestamp(mod_time)
+                    today = dt.datetime.now().date()
+                    
+                    if mod_datetime.date() == today:
+                        with open(susertoken_path, "r") as file:
+                            susertoken = file.read().strip()
+                        
+                        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+                        if not client_id:
+                            raise AuthenticationError("CLIENT_ID not configured")
+                        
+                        self.api = FivePaisaClient(cred=extract_credentials())
+                        self.api.set_access_token(susertoken, client_id)
+                        
+                        if self.api.Login_check() == ".ASPXAUTH=None":
+                            logged_in_user = False
+                            trading_logger.log_warning("Existing token is invalid", {
+                                "susertoken_path": susertoken_path
+                            })
+                        else:
+                            logged_in_user = True
+                            trading_logger.log_info("Successfully used existing token", {
+                                "susertoken_path": susertoken_path
+                            })
+                except Exception as e:
+                    trading_logger.log_warning("Failed to use existing token", {
+                        "susertoken_path": susertoken_path,
+                        "error": str(e)
+                    })
+                    logged_in_user = False
+            
+            # Login with new token if needed
+            if not logged_in_user:
+                try:
+                    self.api = FivePaisaClient(cred=extract_credentials())
+                    max_attempts = 5
+                    
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            totp_token = config.get(f"{self.broker.name}.TOTP_TOKEN")
+                            if not totp_token:
+                                raise AuthenticationError("TOTP_TOKEN not configured")
+                            
+                            otp = pyotp.TOTP(totp_token).now()
+                            client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+                            pin = config.get(f"{self.broker.name}.PIN")
+                            
+                            if not client_id or not pin:
+                                raise AuthenticationError("CLIENT_ID or PIN not configured")
+                            
+                            self.api.get_totp_session(client_id, otp, pin)
+                            
+                            if self.api.access_token:
+                                trading_logger.log_info("Connected successfully", {
+                                    "attempt": attempt,
+                                    "max_attempts": max_attempts
+                                })
+                                susertoken = self.api.access_token
+                                
+                                # Save token
+                                try:
+                                    with open(susertoken_path, "w") as file:
+                                        file.write(susertoken)
+                                    logged_in_user = True
+                                    break
+                                except Exception as e:
+                                    trading_logger.log_warning("Failed to save token", {
+                                        "susertoken_path": susertoken_path,
+                                        "error": str(e)
+                                    })
+                            else:
+                                trading_logger.log_warning("Login attempt failed", {
+                                    "attempt": attempt,
+                                    "max_attempts": max_attempts
+                                })
+                                if attempt < max_attempts:
+                                    time.sleep(40)
+                        except Exception as e:
+                            trading_logger.log_error("Error during login attempt", e, {
+                                "attempt": attempt,
+                                "max_attempts": max_attempts
+                            })
+                            if attempt < max_attempts:
+                                time.sleep(40)
+                    
+                    if not logged_in_user:
+                        context = create_error_context(
+                            max_attempts=max_attempts,
+                            broker_name=self.broker.name
+                        )
+                        raise AuthenticationError("Failed to obtain access token after all attempts", context)
+                        
+                except Exception as e:
+                    context = create_error_context(
+                        broker_name=self.broker.name,
+                        error=str(e)
+                    )
+                    raise AuthenticationError(f"Login failed: {str(e)}", context)
+            
+            # Set up Redis connection
+            try:
+                self.redis_o = redis.Redis(db=redis_db, charset="utf-8", decode_responses=True)
+                # Test Redis connection
+                self.redis_o.ping()
+            except Exception as e:
+                context = create_error_context(
+                    redis_db=redis_db,
+                    error=str(e)
+                )
+                raise BrokerConnectionError(f"Failed to connect to Redis: {str(e)}", context)
+            
+            # Set starting order IDs
+            try:
+                self.starting_order_ids_int = set_starting_internal_ids_int(redis_db=self.redis_o)
+            except Exception as e:
+                trading_logger.log_warning("Failed to set starting order IDs", {
+                    "error": str(e),
+                    "redis_db": redis_db
+                })
+
+            trading_logger.log_info("Successfully connected to FivePaisa", {
+                "logged_in_user": logged_in_user,
+                "redis_db": redis_db
+            })
+            return True
+
+        except (ValidationError, BrokerConnectionError, AuthenticationError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                redis_db=redis_db,
+                broker_name=self.broker.name,
+                error=str(e)
+            )
+            raise BrokerConnectionError(f"Unexpected error connecting to FivePaisa: {str(e)}", context)
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def is_connected(self):
+        """
+        Check if the FivePaisa broker is connected.
+        
+        Returns:
+            bool: True if connected, False otherwise
+            
+        Raises:
+            BrokerConnectionError: If connection check fails
+        """
+        try:
+            if not self.api:
+                trading_logger.log_warning("API not initialized", {
+                    "broker_type": "FivePaisa"
+                })
+                return False
+            
+            # Check margin balance
+            try:
+                margin_data = self.api.margin()
+                if not margin_data or len(margin_data) == 0:
+                    trading_logger.log_warning("No margin data available", {
+                        "broker_type": "FivePaisa"
+                    })
+                    return False
+                
+                ledger_balance = float(margin_data[0]["Ledgerbalance"])
+                funds_payln = float(margin_data[0]["FundsPayln"])
+                total_balance = ledger_balance + funds_payln
+                
+                trading_logger.log_debug("Margin check completed", {
+                    "ledger_balance": ledger_balance,
+                    "funds_payln": funds_payln,
+                    "total_balance": total_balance
+                })
+                
+            except Exception as e:
+                trading_logger.log_error("Error checking margin", e, {
+                    "broker_type": "FivePaisa"
+                })
+                return False
+            
+            # Check quote availability
+            try:
+                quote = self.get_quote("NIFTY_IND___")
+                if not quote or quote.last <= 0:
+                    trading_logger.log_warning("Quote check failed", {
+                        "broker_type": "FivePaisa",
+                        "quote_last": quote.last if quote else None
+                    })
+                    return False
+                
+                trading_logger.log_debug("Quote check completed", {
+                    "quote_last": quote.last,
+                    "symbol": "NIFTY_IND___"
+                })
+                
+            except Exception as e:
+                trading_logger.log_error("Error checking quote", e, {
+                    "broker_type": "FivePaisa",
+                    "symbol": "NIFTY_IND___"
+                })
+                return False
+            
+            trading_logger.log_info("Connection check successful", {
+                "broker_type": "FivePaisa",
+                "total_balance": total_balance,
+                "quote_last": quote.last if quote else None
+            })
+            return True
+            
+        except Exception as e:
+            context = create_error_context(
+                broker_type="FivePaisa",
+                error=str(e)
+            )
+            trading_logger.log_error("Connection check failed", e, context)
+            return False
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def disconnect(self):
+        """
+        Disconnect from the FivePaisa trading platform.
+        
+        Raises:
+            BrokerConnectionError: If disconnection fails
+        """
+        try:
+            trading_logger.log_info("Disconnecting from FivePaisa", {
+                "broker_type": "FivePaisa"
+            })
+            
+            # Stop streaming if active
+            try:
+                self.stop_streaming()
+            except Exception as e:
+                trading_logger.log_warning("Failed to stop streaming during disconnect", {
+                    "error": str(e)
+                })
+            
+            # Clear API reference
+            if self.api:
+                self.api = None
+                trading_logger.log_info("API reference cleared", {
+                    "broker_type": "FivePaisa"
+                })
+            
+            trading_logger.log_info("Successfully disconnected from FivePaisa", {
+                "broker_type": "FivePaisa"
+            })
+            return True
+            
+        except Exception as e:
+            context = create_error_context(
+                broker_type="FivePaisa",
+                error=str(e)
+            )
+            raise BrokerConnectionError(f"Failed to disconnect from FivePaisa: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        order=lambda x: isinstance(x, Order)
+    )
+    def place_order(self, order: Order, **kwargs) -> Order:
+        """
+        Place an order with the FivePaisa broker with enhanced error handling.
+        
+        Args:
+            order: Order object to place
+            **kwargs: Additional order parameters
+            
+        Returns:
+            Order: Updated order object
+            
+        Raises:
+            ValidationError: If order parameters are invalid
+            OrderError: If order placement fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Placing order with FivePaisa", {
+                "internal_order_id": order.internal_order_id,
+                "long_symbol": order.long_symbol,
+                "order_type": order.order_type,
+                "quantity": order.quantity,
+                "exchange": order.exchange,
+                "paper": order.paper
+            })
+            
+            # Validate mandatory keys
+            mandatory_keys = [
+                "long_symbol", "order_type", "quantity", "price",
+                "exchange", "exchange_segment", "internal_order_id", "paper"
+            ]
+            order_dict = order.to_dict()
+            missing_keys = [key for key in mandatory_keys if key not in order_dict or order_dict[key] is None]
+            
+            if missing_keys:
+                context = create_error_context(
+                    missing_keys=missing_keys,
+                    available_keys=list(order_dict.keys()),
+                    order_data=order_dict
+                )
+                raise ValidationError(f"Missing mandatory keys: {', '.join(missing_keys)}", context)
+            
+            # Set broker and get scrip code
+            order.broker = self.broker
+            try:
+                order.scrip_code = self.exchange_mappings[order.exchange]["symbol_map"].get(order.long_symbol, None)
+            except KeyError as e:
+                context = create_error_context(
+                    exchange=order.exchange,
+                    long_symbol=order.long_symbol,
+                    available_exchanges=list(self.exchange_mappings.keys())
+                )
+                raise OrderError(f"Exchange mapping not found: {str(e)}", context)
+            
+            orig_order_type = order.order_type
+            
+            # Check if we can place the order
+            if order.scrip_code is not None or order.paper:
+                # Map order type
+                if order.order_type in ["BUY", "COVER"]:
+                    order.order_type = "B"
+                elif order.order_type in ["SHORT", "SELL"]:
+                    order.order_type = "S"
+                else:
+                    context = create_error_context(
+                        order_type=order.order_type,
+                        valid_types=["BUY", "COVER", "SHORT", "SELL"]
+                    )
+                    raise ValidationError(f"Invalid order type: {order.order_type}", context)
+                
+                # Generate remote order ID
+                order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
+                
+                if not order.paper:
+                    # Real order placement
+                    try:
+                        # Calculate quantity for MCX
+                        if order.exchange == "M":
+                            min_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(order.long_symbol)
+                            quantity: Optional[int] = None
+                            if min_size is not None and order.quantity is not None:
+                                quantity = int(round(order.quantity / min_size, 0))
+                            else:
+                                trading_logger.log_warning("Could not calculate quantity for MCX", {
+                                    "min_size": min_size,
+                                    "order_quantity": order.quantity,
+                                    "long_symbol": order.long_symbol
+                                })
+                                quantity = order.quantity
+                        else:
+                            quantity = order.quantity
+                        
+                        # Place order with API
+                        out = self.api.place_order(
+                            OrderType=order.order_type,
+                            Exchange=order.exchange,
+                            ExchangeType=order.exchange_segment,
+                            ScripCode=order.scrip_code,
+                            Qty=quantity,
+                            Price=order.price,
+                            RemoteOrderID=order.remote_order_id,
+                        )
+                        
+                        if out is not None:
+                            # Update order with response
+                            order.exch_order_id = out.get("ExchOrderID")
+                            order.broker_order_id = out.get("BrokerOrderID")
+                            order.local_order_id = out.get("LocalOrderID")
+                            order.order_type = orig_order_type
+                            order.orderRef = order.internal_order_id
+                            order.message = out.get("Message")
+                            order.status = out.get("Status")
+                            
+                            # Get exchange order ID
+                            try:
+                                order.exch_order_id = self._get_exchange_order_id(order.broker_order_id, order, delete=False)
+                            except Exception as e:
+                                trading_logger.log_warning("Failed to get exchange order ID", {
+                                    "broker_order_id": order.broker_order_id,
+                                    "error": str(e)
+                                })
+                            
+                            # Get order info
+                            try:
+                                fills = self.get_order_info(broker_order_id=order.broker_order_id, order=order)
+                                order.status = fills.status
+                                order.exch_order_id = fills.exchange_order_id
+                                
+                                if fills.status == OrderStatus.REJECTED:
+                                    trading_logger.log_warning("Order rejected by broker", {
+                                        "order": str(order),
+                                        "broker_order_id": order.broker_order_id
+                                    })
+                                    return order
+                                
+                                if fills.fill_price > 0:
+                                    order.price = fills.fill_price
+                                    
+                            except Exception as e:
+                                trading_logger.log_error("Failed to get order info", e, {
+                                    "broker_order_id": order.broker_order_id,
+                                    "order": str(order)
+                                })
+                            
+                            trading_logger.log_info("Order placed successfully", {
+                                "order": str(order),
+                                "broker_order_id": order.broker_order_id
+                            })
+                            self.log_and_return(order)
+                            return order
+                        else:
+                            context = create_error_context(
+                                order_data=order.to_dict(),
+                                api_response=out
+                            )
+                            raise OrderError("API returned None for order placement", context)
+                            
+                    except Exception as e:
+                        context = create_error_context(
+                            order_data=order.to_dict(),
+                            error=str(e)
+                        )
+                        raise OrderError(f"Failed to place real order: {str(e)}", context)
+                else:
+                    # Paper order
+                    try:
+                        order.order_type = orig_order_type
+                        order.exch_order_id = str(secrets.randbelow(10**15)) + "P"
+                        order.broker_order_id = str(secrets.randbelow(10**8)) + "P"
+                        order.orderRef = order.internal_order_id
+                        order.message = "Paper Order"
+                        order.status = OrderStatus.FILLED
+                        order.scrip_code = 0 if order.scrip_code is None else order.scrip_code
+                        
+                        trading_logger.log_info("Paper order placed successfully", {
+                            "order": str(order),
+                            "broker_order_id": order.broker_order_id
+                        })
+                        
+                    except Exception as e:
+                        context = create_error_context(
+                            order_data=order.to_dict(),
+                            error=str(e)
+                        )
+                        raise OrderError(f"Failed to place paper order: {str(e)}", context)
+                
+                self.log_and_return(order)
+                return order
+            else:
+                # No scrip code found
+                context = create_error_context(
+                    long_symbol=order.long_symbol,
+                    exchange=order.exchange,
+                    scrip_code=order.scrip_code,
+                    paper=order.paper
+                )
+                trading_logger.log_warning("No broker identifier found for symbol", context)
+                self.log_and_return(order)
+                return order
+                
+        except (ValidationError, OrderError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                order_data=order.to_dict() if order else None,
+                error=str(e)
+            )
+            raise OrderError(f"Unexpected error placing order: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        new_price=lambda x: isinstance(x, (int, float)) and x >= 0,
+        new_quantity=lambda x: isinstance(x, (int, float, str)) and (isinstance(x, (int, float)) and x >= 0 or (isinstance(x, str) and x.strip() and float(x.strip()) >= 0))
+    )
     def modify_order(self, **kwargs) -> Order:
         """
-        mandatory_keys = ['broker_order_id', 'new_price', 'new_quantity']
-
+        Modify an existing order with the FivePaisa broker with enhanced error handling.
+        
+        Args:
+            **kwargs: Order modification parameters including:
+                - broker_order_id: Broker order ID to modify
+                - new_price: New price for the order
+                - new_quantity: New quantity for the order
+                
+        Returns:
+            Order: Updated order object
+            
+        Raises:
+            ValidationError: If modification parameters are invalid
+            OrderError: If order modification fails
+            BrokerConnectionError: If broker connection issues
         """
-        mandatory_keys = ["broker_order_id", "new_price", "new_quantity"]
-        missing_keys = [key for key in mandatory_keys if key not in kwargs]
-        if missing_keys:
-            raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = str(kwargs.get("broker_order_id", "0"))
-        new_price = float(kwargs.get("new_price", 0))
-        new_quantity = kwargs.get("new_quantity", 0)
-        order = Order(**self.redis_o.hgetall(broker_order_id))
-        fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
-        if fills.status in [OrderStatus.UNDEFINED, OrderStatus.PENDING]:
-            logger.info("Order not active with exchange and cannot be cancelled. f{fills}")
-        order.status = fills.status
-        if order.status in [OrderStatus.OPEN]:
-            logger.info(
-                f"Modifying order for {broker_order_id} as not filled. Old Price: {order.price}, New Price: {new_price}."
-                f"Old Quantity: {order.quantity}, New Quantity: {new_quantity}, Fill info: {fills}"
-            )
-            exch_order_id = order.exch_order_id
-            if order.exchange == "M":
-                long_symbol = order.long_symbol
-                order_quantity = int(
-                    round(new_quantity / self.exchange_mappings[order.exchange]["contractsize_map"].get(long_symbol), 0)
+        try:
+            trading_logger.log_info("Modifying order with FivePaisa", {
+                "broker_order_id": kwargs.get("broker_order_id"),
+                "new_price": kwargs.get("new_price"),
+                "new_quantity": kwargs.get("new_quantity")
+            })
+            
+            # Validate mandatory keys
+            mandatory_keys = ["broker_order_id", "new_price", "new_quantity"]
+            missing_keys = [key for key in mandatory_keys if key not in kwargs]
+            if missing_keys:
+                context = create_error_context(
+                    missing_keys=missing_keys,
+                    available_keys=list(kwargs.keys())
                 )
-            else:
-                order_quantity = new_quantity - fills.fill_size
-                order_quantity = order_quantity if order_quantity > 0 else 0
-            out = self.api.modify_order(ExchOrderID=exch_order_id, Price=new_price, Qty=order_quantity)
-            if out is None:
-                logger.error(f"Error modifying order {broker_order_id}")
-            else:
+                raise ValidationError(f"Missing mandatory keys: {', '.join(missing_keys)}", context)
+            
+            broker_order_id = str(kwargs.get("broker_order_id", "0"))
+            new_price = float(kwargs.get("new_price", 0))
+            new_quantity = kwargs.get("new_quantity", 0)
+            
+            # Validate parameters
+            if not broker_order_id or broker_order_id == "0":
+                context = create_error_context(
+                    broker_order_id=broker_order_id
+                )
+                raise ValidationError("Invalid broker_order_id", context)
+            
+            if new_price < 0:
+                context = create_error_context(
+                    new_price=new_price
+                )
+                raise ValidationError("New price cannot be negative", context)
+            
+            if new_quantity < 0:
+                context = create_error_context(
+                    new_quantity=new_quantity
+                )
+                raise ValidationError("New quantity cannot be negative", context)
+            
+            # Get order from Redis
+            try:
+                order_data = self.redis_o.hgetall(broker_order_id)
+                if not order_data:
+                    context = create_error_context(
+                        broker_order_id=broker_order_id
+                    )
+                    raise OrderError("Order not found in Redis", context)
+                order = Order(**order_data)
+            except Exception as e:
+                context = create_error_context(
+                    broker_order_id=broker_order_id,
+                    error=str(e)
+                )
+                raise OrderError(f"Failed to retrieve order from Redis: {str(e)}", context)
+            
+            # Get current order info
+            try:
+                fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
+            except Exception as e:
+                trading_logger.log_error("Failed to get order info", e, {
+                    "broker_order_id": broker_order_id,
+                    "order": str(order)
+                })
+                fills = None
+            
+            if fills and fills.status in [OrderStatus.UNDEFINED, OrderStatus.PENDING]:
+                trading_logger.log_warning("Order not active with exchange", {
+                    "broker_order_id": broker_order_id,
+                    "status": fills.status.name if fills.status else None
+                })
+            
+            order.status = fills.status if fills else OrderStatus.UNDEFINED
+            
+            if order.status in [OrderStatus.OPEN]:
+                trading_logger.log_info("Modifying order", {
+                    "broker_order_id": broker_order_id,
+                    "old_price": order.price,
+                    "new_price": new_price,
+                    "old_quantity": order.quantity,
+                    "new_quantity": new_quantity,
+                    "fill_info": str(fills) if fills else None
+                })
+                
                 try:
+                    exch_order_id = order.exch_order_id
+                    
+                    # Calculate order quantity
+                    if order.exchange == "M":
+                        long_symbol = order.long_symbol
+                        contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(long_symbol)
+                        if contract_size:
+                            order_quantity = int(round(new_quantity / contract_size, 0))
+                        else:
+                            trading_logger.log_warning("Contract size not found for MCX", {
+                                "long_symbol": long_symbol,
+                                "exchange": order.exchange
+                            })
+                            order_quantity = new_quantity
+                    else:
+                        order_quantity = new_quantity - (fills.fill_size if fills else 0)
+                        order_quantity = order_quantity if order_quantity > 0 else 0
+                    
+                    # Modify order with API
+                    out = self.api.modify_order(ExchOrderID=exch_order_id, Price=new_price, Qty=order_quantity)
+                    
+                    if out is None:
+                        context = create_error_context(
+                            broker_order_id=broker_order_id,
+                            exch_order_id=exch_order_id,
+                            new_price=new_price,
+                            order_quantity=order_quantity
+                        )
+                        raise OrderError("API returned None for order modification", context)
+                    
                     self.log_and_return(out)
-                    if out["Status"] == 0:
+                    
+                    if out.get("Status") == 0:
+                        # Update order with new values
                         order.price_type = new_price
                         order.quantity = new_quantity
                         order.price = new_price
                         order.broker_order_id = str(out.get("BrokerOrderID", ""))
-                        order_info = self.get_order_info(broker_order_id=order.broker_order_id, order=order)
-                        order.status = order_info.status
-                        order.exch_order_id = order_info.exchange_order_id
-                        self._update_broker_order_id(order.internal_order_id, broker_order_id, out["BrokerOrderID"])
-                        self.redis_o.hmset(
-                            order.broker_order_id, {key: str(val) for key, val in order.to_dict().items()}
-                        )
-                        fills = update_order_status(self, order.internal_order_id, order.broker_order_id)
-                        order.status = fills.status
+                        
+                        # Get updated order info
+                        try:
+                            order_info = self.get_order_info(broker_order_id=order.broker_order_id, order=order)
+                            order.status = order_info.status
+                            order.exch_order_id = order_info.exchange_order_id
+                        except Exception as e:
+                            trading_logger.log_error("Failed to get updated order info", e, {
+                                "broker_order_id": order.broker_order_id
+                            })
+                        
+                        # Update broker order ID
+                        try:
+                            self._update_broker_order_id(order.internal_order_id, broker_order_id, out["BrokerOrderID"])
+                        except Exception as e:
+                            trading_logger.log_warning("Failed to update broker order ID", {
+                                "internal_order_id": order.internal_order_id,
+                                "old_broker_order_id": broker_order_id,
+                                "new_broker_order_id": out["BrokerOrderID"],
+                                "error": str(e)
+                            })
+                        
+                        # Update Redis
+                        try:
+                            self.redis_o.hmset(
+                                order.broker_order_id, 
+                                {key: str(val) for key, val in order.to_dict().items()}
+                            )
+                        except Exception as e:
+                            trading_logger.log_error("Failed to update Redis", e, {
+                                "broker_order_id": order.broker_order_id,
+                                "order_data": order.to_dict()
+                            })
+                        
+                        # Update order status
+                        try:
+                            fills = update_order_status(self, order.internal_order_id, order.broker_order_id)
+                            order.status = fills.status
+                        except Exception as e:
+                            trading_logger.log_error("Failed to update order status", e, {
+                                "internal_order_id": order.internal_order_id,
+                                "broker_order_id": order.broker_order_id
+                            })
+                        
+                        trading_logger.log_info("Order modified successfully", {
+                            "broker_order_id": order.broker_order_id,
+                            "new_price": new_price,
+                            "new_quantity": new_quantity
+                        })
+                    else:
+                        trading_logger.log_warning("Order modification failed", {
+                            "broker_order_id": broker_order_id,
+                            "api_status": out.get("Status"),
+                            "api_response": out
+                        })
+                        
                 except Exception as e:
-                    logger.error(f"Error: {e}", exc_info=True)
+                    context = create_error_context(
+                        broker_order_id=broker_order_id,
+                        new_price=new_price,
+                        new_quantity=new_quantity,
+                        error=str(e)
+                    )
+                    raise OrderError(f"Failed to modify order: {str(e)}", context)
+            else:
+                trading_logger.log_info("Order status does not allow modification", {
+                    "broker_order_id": broker_order_id,
+                    "status": order.status.name if order.status else None
+                })
+            
             self.log_and_return(order)
             return order
-        else:
-            logger.info(
-                f"Order status does not allow modification for {order.broker_order_id}. Status was {order.status}"
+            
+        except (ValidationError, OrderError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                kwargs=kwargs,
+                error=str(e)
             )
-            self.log_and_return(order)
-            return order
+            raise OrderError(f"Unexpected error modifying order: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
     def cancel_order(self, **kwargs) -> Order:
         """
-        mandatory_keys = ['broker_order_id']
-
+        Cancel an existing order with the FivePaisa broker with enhanced error handling.
+        
+        Args:
+            **kwargs: Order cancellation parameters including:
+                - broker_order_id: Broker order ID to cancel
+                
+        Returns:
+            Order: Updated order object
+            
+        Raises:
+            ValidationError: If cancellation parameters are invalid
+            OrderError: If order cancellation fails
+            BrokerConnectionError: If broker connection issues
         """
-        mandatory_keys = ["broker_order_id"]
-        missing_keys = [key for key in mandatory_keys if key not in kwargs]
-        if missing_keys:
-            raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = str(kwargs.get("broker_order_id", "0"))
-
-        order = Order(**self.redis_o.hgetall(broker_order_id))
-        if order.status in [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNDEFINED]:
-            valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-            if valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d"):
-                fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
-                if fills.fill_size < round(float(order.quantity)):
-                    logger.info(
-                        f"Cancelling broker_order_id {broker_order_id} for symbol {order.long_symbol}. "
-                        f"Filled: {str(fills.fill_size)}. Ordered: {order.quantity}"
+        try:
+            trading_logger.log_info("Cancelling order with FivePaisa", {
+                "broker_order_id": kwargs.get("broker_order_id")
+            })
+            
+            # Validate mandatory keys
+            mandatory_keys = ["broker_order_id"]
+            missing_keys = [key for key in mandatory_keys if key not in kwargs]
+            if missing_keys:
+                context = create_error_context(
+                    missing_keys=missing_keys,
+                    available_keys=list(kwargs.keys())
+                )
+                raise ValidationError(f"Missing mandatory keys: {', '.join(missing_keys)}", context)
+            
+            broker_order_id = str(kwargs.get("broker_order_id", "0"))
+            
+            # Validate broker_order_id
+            if not broker_order_id or broker_order_id == "0":
+                context = create_error_context(
+                    broker_order_id=broker_order_id
+                )
+                raise ValidationError("Invalid broker_order_id", context)
+            
+            # Get order from Redis
+            try:
+                order_data = self.redis_o.hgetall(broker_order_id)
+                if not order_data:
+                    context = create_error_context(
+                        broker_order_id=broker_order_id
                     )
-                    out = self.api.cancel_order(exch_order_id=order.exch_order_id)
-                    self.log_and_return(out)
-                    order.broker_order_id = out["BrokerOrderID"]
-                    self._update_broker_order_id(order.internal_order_id, broker_order_id, out["BrokerOrderID"])
-                    self.redis_o.hmset(order.broker_order_id, {key: str(val) for key, val in order.to_dict().items()})
-                    fills = update_order_status(self, order.internal_order_id, order.broker_order_id, eod=True)
-                    self.log_and_return(fills)
-                    order.status = fills.status
-                    order.quantity = fills.fill_size
-                    order.price = fills.fill_price
-                    self.log_and_return(order)
-                    return order
-        self.log_and_return(order)
-        return order
-
-    def _update_broker_order_id(self, internal_order_id: str, old_broker_order_id: str, new_broker_order_id: str):
-        # Retrieve the entry keys
-        entry_keys = self.redis_o.hget(internal_order_id, "entry_keys")
-        # Initialize new_entry_keys as None
-        new_entry_keys = None
-        new_exit_keys = None
-
-        # Check if broker_order_id is in entry_keys
-        if entry_keys and str(old_broker_order_id) in entry_keys:
-            new_entry_keys = entry_keys.replace(str(old_broker_order_id), str(new_broker_order_id))
-        else:
-            # Retrieve the exit keys if broker_order_id is not in entry_keys
-            exit_keys = self.redis_o.hget(internal_order_id, "exit_keys")
-            if exit_keys and str(old_broker_order_id) in exit_keys:
-                new_exit_keys = exit_keys.replace(str(old_broker_order_id), str(new_broker_order_id))
-
-        # Perform Redis operations only if broker_order_id is found in either entry_keys or exit_keys
-        if new_entry_keys is not None or new_exit_keys is not None:
-            pipe = self.redis_o.pipeline()
-            if new_entry_keys is not None:
-                pipe.hset(internal_order_id, "entry_keys", new_entry_keys)
-            if new_exit_keys is not None:
-                pipe.hset(internal_order_id, "exit_keys", new_exit_keys)
-            pipe.rename(str(old_broker_order_id), str(new_broker_order_id))
-            pipe.execute()
-            pipe.reset()
-
-    def get_order_info(self, **kwargs) -> OrderInfo:
-        def return_db_as_fills(order: Order):
-            order_info = OrderInfo()
-            valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-            if valid_date and valid_date != dt.datetime.today().strftime("%Y-%m-%d"):
-                order_info.status = order.status
-            else:
-                order_info.status = OrderStatus.HISTORICAL
-            order_info.order_size = order.quantity
-            order_info.order_price = order.price
-            order_info.fill_size = order.quantity
-            order_info.fill_price = order.price
-            order_info.exchange_order_id = order.exch_order_id
-            order_info.broker = order.broker
-            return order_info
-
-        def get_orderinfo_from_orders(exch_order_id: str, order: Order, broker_order_id: str) -> OrderInfo:
-            orders = pd.DataFrame(self.api.order_book())
-            if len(orders) > 0:
-                fivepaisa_order = orders[orders.BrokerOrderId.astype(str) == str(broker_order_id)]
-                if len(fivepaisa_order) == 1:
-                    if fivepaisa_order.OrderStatus.str.lower().str.contains("rejected").item() is True:
-                        # order cancelled by broker before reaching exchange
-                        logger.info(f"Order Rejected Reason: {str(fivepaisa_order.Reason.item())}")
-                        broker_order_id = str(fivepaisa_order.BrokerOrderId.item())
-                        internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
-                        if internal_order_id is not None:
-                            delete_broker_order_id(self, internal_order_id, broker_order_id)
-                        return OrderInfo(
-                            order_size=order.quantity,
-                            order_price=order.price,
-                            fill_size=0,
-                            fill_price=0,
-                            status=OrderStatus.REJECTED,
-                            broker_order_id=order.broker_order_id,
-                            exchange_order_id=fivepaisa_order.ExchOrderID.item(),
-                            broker=self.broker,
-                        )
+                    raise OrderError("Order not found in Redis", context)
+                order = Order(**order_data)
+            except Exception as e:
+                context = create_error_context(
+                    broker_order_id=broker_order_id,
+                    error=str(e)
+                )
+                raise OrderError(f"Failed to retrieve order from Redis: {str(e)}", context)
+            
+            if order.status in [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNDEFINED]:
+                try:
+                    valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
+                    if valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d"):
+                        # Get current order info
+                        try:
+                            fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
+                        except Exception as e:
+                            trading_logger.log_error("Failed to get order info for cancellation", e, {
+                                "broker_order_id": broker_order_id,
+                                "order": str(order)
+                            })
+                            fills = None
+                        
+                        if fills and fills.fill_size < round(float(order.quantity)):
+                            trading_logger.log_info("Cancelling order", {
+                                "broker_order_id": broker_order_id,
+                                "symbol": order.long_symbol,
+                                "filled": fills.fill_size,
+                                "ordered": order.quantity
+                            })
+                            
+                            # Cancel order with API
+                            try:
+                                out = self.api.cancel_order(exch_order_id=order.exch_order_id)
+                                self.log_and_return(out)
+                                
+                                if out and "BrokerOrderID" in out:
+                                    order.broker_order_id = out["BrokerOrderID"]
+                                    
+                                    # Update broker order ID
+                                    try:
+                                        self._update_broker_order_id(order.internal_order_id, broker_order_id, out["BrokerOrderID"])
+                                    except Exception as e:
+                                        trading_logger.log_warning("Failed to update broker order ID", {
+                                            "internal_order_id": order.internal_order_id,
+                                            "old_broker_order_id": broker_order_id,
+                                            "new_broker_order_id": out["BrokerOrderID"],
+                                            "error": str(e)
+                                        })
+                                    
+                                    # Update Redis
+                                    try:
+                                        self.redis_o.hmset(
+                                            order.broker_order_id, 
+                                            {key: str(val) for key, val in order.to_dict().items()}
+                                        )
+                                    except Exception as e:
+                                        trading_logger.log_error("Failed to update Redis", e, {
+                                            "broker_order_id": order.broker_order_id,
+                                            "order_data": order.to_dict()
+                                        })
+                                    
+                                    # Update order status
+                                    try:
+                                        fills = update_order_status(self, order.internal_order_id, order.broker_order_id, eod=True)
+                                        self.log_and_return(fills)
+                                        order.status = fills.status
+                                        order.quantity = fills.fill_size
+                                        order.price = fills.fill_price
+                                    except Exception as e:
+                                        trading_logger.log_error("Failed to update order status", e, {
+                                            "internal_order_id": order.internal_order_id,
+                                            "broker_order_id": order.broker_order_id
+                                        })
+                                    
+                                    trading_logger.log_info("Order cancelled successfully", {
+                                        "broker_order_id": order.broker_order_id,
+                                        "symbol": order.long_symbol
+                                    })
+                                else:
+                                    trading_logger.log_warning("Order cancellation failed", {
+                                        "broker_order_id": broker_order_id,
+                                        "api_response": out
+                                    })
+                                    
+                            except Exception as e:
+                                context = create_error_context(
+                                    broker_order_id=broker_order_id,
+                                    exch_order_id=order.exch_order_id,
+                                    error=str(e)
+                                )
+                                raise OrderError(f"Failed to cancel order: {str(e)}", context)
+                        else:
+                            trading_logger.log_info("Order already filled or cannot be cancelled", {
+                                "broker_order_id": broker_order_id,
+                                "fill_size": fills.fill_size if fills else None,
+                                "order_quantity": order.quantity
+                            })
                     else:
-                        fill_size = fivepaisa_order.TradedQty.item()
-                        fill_price = fivepaisa_order.AveragePrice.item()
-                        status = OrderStatus.UNDEFINED
-                        if "cancel" in fivepaisa_order.OrderStatus.str.lower().item():
-                            status = OrderStatus.CANCELLED
-                        elif fill_size == round(float(order.quantity)):
-                            status = OrderStatus.FILLED
-                        elif fivepaisa_order.ExchOrderID.item() not in [None, "None", 0, "0"]:
-                            status = OrderStatus.OPEN
+                        trading_logger.log_info("Order is not from today", {
+                            "broker_order_id": broker_order_id,
+                            "valid_date": valid_date,
+                            "today": dt.datetime.today().strftime("%Y-%m-%d")
+                        })
+                except Exception as e:
+                    context = create_error_context(
+                        broker_order_id=broker_order_id,
+                        order_status=order.status.name if order.status else None,
+                        error=str(e)
+                    )
+                    raise OrderError(f"Error processing order cancellation: {str(e)}", context)
+            else:
+                trading_logger.log_info("Order status does not allow cancellation", {
+                    "broker_order_id": broker_order_id,
+                    "status": order.status.name if order.status else None
+                })
+            
+            self.log_and_return(order)
+            return order
+            
+        except (ValidationError, OrderError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                kwargs=kwargs,
+                error=str(e)
+            )
+            raise OrderError(f"Unexpected error cancelling order: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        internal_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        old_broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        new_broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
+    def _update_broker_order_id(self, internal_order_id: str, old_broker_order_id: str, new_broker_order_id: str):
+        """
+        Update broker order ID in Redis with enhanced error handling.
+        
+        Args:
+            internal_order_id: Internal order ID
+            old_broker_order_id: Old broker order ID
+            new_broker_order_id: New broker order ID
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            RedisError: If Redis operations fail
+        """
+        try:
+            trading_logger.log_debug("Updating broker order ID", {
+                "internal_order_id": internal_order_id,
+                "old_broker_order_id": old_broker_order_id,
+                "new_broker_order_id": new_broker_order_id
+            })
+            
+            # Retrieve the entry keys
+            try:
+                entry_keys = self.redis_o.hget(internal_order_id, "entry_keys")
+            except Exception as e:
+                context = create_error_context(
+                    internal_order_id=internal_order_id,
+                    error=str(e)
+                )
+                raise RedisError(f"Failed to retrieve entry keys: {str(e)}", context)
+            
+            # Initialize new_entry_keys as None
+            new_entry_keys = None
+            new_exit_keys = None
+
+            # Check if broker_order_id is in entry_keys
+            if entry_keys and str(old_broker_order_id) in entry_keys:
+                new_entry_keys = entry_keys.replace(str(old_broker_order_id), str(new_broker_order_id))
+                trading_logger.log_debug("Found broker order ID in entry keys", {
+                    "internal_order_id": internal_order_id,
+                    "old_broker_order_id": old_broker_order_id,
+                    "new_broker_order_id": new_broker_order_id
+                })
+            else:
+                # Retrieve the exit keys if broker_order_id is not in entry_keys
+                try:
+                    exit_keys = self.redis_o.hget(internal_order_id, "exit_keys")
+                except Exception as e:
+                    context = create_error_context(
+                        internal_order_id=internal_order_id,
+                        error=str(e)
+                    )
+                    raise RedisError(f"Failed to retrieve exit keys: {str(e)}", context)
+                
+                if exit_keys and str(old_broker_order_id) in exit_keys:
+                    new_exit_keys = exit_keys.replace(str(old_broker_order_id), str(new_broker_order_id))
+                    trading_logger.log_debug("Found broker order ID in exit keys", {
+                        "internal_order_id": internal_order_id,
+                        "old_broker_order_id": old_broker_order_id,
+                        "new_broker_order_id": new_broker_order_id
+                    })
+
+            # Perform Redis operations only if broker_order_id is found in either entry_keys or exit_keys
+            if new_entry_keys is not None or new_exit_keys is not None:
+                try:
+                    pipe = self.redis_o.pipeline()
+                    if new_entry_keys is not None:
+                        pipe.hset(internal_order_id, "entry_keys", new_entry_keys)
+                    if new_exit_keys is not None:
+                        pipe.hset(internal_order_id, "exit_keys", new_exit_keys)
+                    pipe.rename(str(old_broker_order_id), str(new_broker_order_id))
+                    pipe.execute()
+                    pipe.reset()
+                    
+                    trading_logger.log_info("Broker order ID updated successfully", {
+                        "internal_order_id": internal_order_id,
+                        "old_broker_order_id": old_broker_order_id,
+                        "new_broker_order_id": new_broker_order_id
+                    })
+                    
+                except Exception as e:
+                    context = create_error_context(
+                        internal_order_id=internal_order_id,
+                        old_broker_order_id=old_broker_order_id,
+                        new_broker_order_id=new_broker_order_id,
+                        error=str(e)
+                    )
+                    raise RedisError(f"Failed to update broker order ID in Redis: {str(e)}", context)
+            else:
+                trading_logger.log_warning("Broker order ID not found in entry or exit keys", {
+                    "internal_order_id": internal_order_id,
+                    "old_broker_order_id": old_broker_order_id,
+                    "entry_keys": entry_keys,
+                    "exit_keys": exit_keys if 'exit_keys' in locals() else None
+                })
+                
+        except (ValidationError, RedisError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                internal_order_id=internal_order_id,
+                old_broker_order_id=old_broker_order_id,
+                new_broker_order_id=new_broker_order_id,
+                error=str(e)
+            )
+            raise RedisError(f"Unexpected error updating broker order ID: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
+    def get_order_info(self, **kwargs) -> OrderInfo:
+        """
+        Get order information with enhanced error handling.
+        
+        Args:
+            **kwargs: Order info parameters including:
+                - broker_order_id: Broker order ID to get info for
+                - order: Optional Order object
+                
+        Returns:
+            OrderInfo: Order information object
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            OrderError: If order info retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Getting order info", {
+                "broker_order_id": kwargs.get("broker_order_id")
+            })
+            
+            def return_db_as_fills(order: Order):
+                """Return order info from database for historical orders."""
+                try:
+                    order_info = OrderInfo()
+                    valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
+                    if valid_date and valid_date != dt.datetime.today().strftime("%Y-%m-%d"):
+                        order_info.status = order.status
+                    else:
+                        order_info.status = OrderStatus.HISTORICAL
+                    order_info.order_size = order.quantity
+                    order_info.order_price = order.price
+                    order_info.fill_size = order.quantity
+                    order_info.fill_price = order.price
+                    order_info.exchange_order_id = order.exch_order_id
+                    order_info.broker = order.broker
+                    return order_info
+                except Exception as e:
+                    trading_logger.log_error("Error in return_db_as_fills", e, {
+                        "order": str(order)
+                    })
+                    raise
+
+            def get_orderinfo_from_orders(exch_order_id: str, order: Order, broker_order_id: str) -> OrderInfo:
+                """Get order info from order book."""
+                try:
+                    orders = pd.DataFrame(self.api.order_book())
+                    if len(orders) > 0:
+                        fivepaisa_order = orders[orders.BrokerOrderId.astype(str) == str(broker_order_id)]
+                        if len(fivepaisa_order) == 1:
+                            if fivepaisa_order.OrderStatus.str.lower().str.contains("rejected").item() is True:
+                                # order cancelled by broker before reaching exchange
+                                trading_logger.log_info("Order rejected by broker", {
+                                    "broker_order_id": broker_order_id,
+                                    "reason": str(fivepaisa_order.Reason.item())
+                                })
+                                broker_order_id = str(fivepaisa_order.BrokerOrderId.item())
+                                try:
+                                    internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
+                                    if internal_order_id is not None:
+                                        delete_broker_order_id(self, internal_order_id, broker_order_id)
+                                except Exception as e:
+                                    trading_logger.log_warning("Failed to delete broker order ID", {
+                                        "broker_order_id": broker_order_id,
+                                        "error": str(e)
+                                    })
+                                return OrderInfo(
+                                    order_size=order.quantity,
+                                    order_price=order.price,
+                                    fill_size=0,
+                                    fill_price=0,
+                                    status=OrderStatus.REJECTED,
+                                    broker_order_id=order.broker_order_id,
+                                    exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                    broker=self.broker,
+                                )
+                            else:
+                                fill_size = fivepaisa_order.TradedQty.item()
+                                fill_price = fivepaisa_order.AveragePrice.item()
+                                status = OrderStatus.UNDEFINED
+                                if "cancel" in fivepaisa_order.OrderStatus.str.lower().item():
+                                    status = OrderStatus.CANCELLED
+                                elif fill_size == round(float(order.quantity)):
+                                    status = OrderStatus.FILLED
+                                elif fivepaisa_order.ExchOrderID.item() not in [None, "None", 0, "0"]:
+                                    status = OrderStatus.OPEN
+                                else:
+                                    status = OrderStatus.PENDING
+                                if fivepaisa_order.Exch.item() == "M":
+                                    try:
+                                        long_symbol = (
+                                            self.get_long_name_from_broker_identifier(ScripName=pd.Series[order.long_symbol]).item()
+                                            if order
+                                            else self.get_long_name_from_broker_identifier(
+                                                ScripName=fivepaisa_order.ScripName
+                                            ).item()
+                                        )
+                                        contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(long_symbol)
+                                        return OrderInfo(
+                                            order_size=order.quantity,
+                                            order_price=order.price,
+                                            fill_size=fill_size * contract_size,
+                                            fill_price=fill_price,
+                                            status=status,
+                                            broker_order_id=order.broker_order_id,
+                                            exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                            broker=self.broker,
+                                        )
+                                    except Exception as e:
+                                        trading_logger.log_error("Error processing MCX order", e, {
+                                            "broker_order_id": broker_order_id,
+                                            "order": str(order)
+                                        })
+                                        raise
+                                else:
+                                    return OrderInfo(
+                                        order_size=order.quantity,
+                                        order_price=order.price,
+                                        fill_size=fill_size,
+                                        fill_price=fill_price,
+                                        status=status,
+                                        broker_order_id=order.broker_order_id,
+                                        exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                        broker=self.broker,
+                                    )
                         else:
-                            status = OrderStatus.PENDING
-                        if fivepaisa_order.Exch.item() == "M":
-                            long_symbol = (
-                                self.get_long_name_from_broker_identifier(ScripName=pd.Series[order.long_symbol]).item()
-                                if order
-                                else self.get_long_name_from_broker_identifier(
-                                    ScripName=fivepaisa_order.ScripName
-                                ).item()
-                            )
-                            contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(long_symbol)
-                            return OrderInfo(
-                                order_size=order.quantity,
-                                order_price=order.price,
-                                fill_size=fill_size * contract_size,
-                                fill_price=fill_price,
-                                status=status,
-                                broker_order_id=order.broker_order_id,
-                                exchange_order_id=fivepaisa_order.ExchOrderID.item(),
-                                broker=self.broker,
-                            )
-                        else:
+                            trading_logger.log_debug("Found duplicate orders in order book", {
+                                "exch_order_id": exch_order_id,
+                                "broker_order_id": broker_order_id
+                            })
+                            # iterate over order_info
+                            status = OrderStatus.UNDEFINED
+                            for index, row in fivepaisa_order.iterrows():
+                                if row["BrokerOrderId"] == int(broker_order_id):
+                                    order_size = row["Qty"]
+                                    order_price = row["Rate"]
+                                    fill_size = order_size - row["PendingQty"]
+                                    fill_price = row["AveragePrice"]
+                                    if "cancel" in row["OrderStatus"].lower():
+                                        status = OrderStatus.CANCELLED
+                                    elif "reject" in row["OrderStatus"].lower():
+                                        trading_logger.log_info("Order rejected", {
+                                            "broker_order_id": broker_order_id,
+                                            "reason": row['Reason']
+                                        })
+                                        status = OrderStatus.REJECTED
+                                    elif fill_size == order_size:
+                                        status = OrderStatus.FILLED
+                                    elif row["ExchOrderID"] not in [0, "0", None, "None"]:
+                                        status = OrderStatus.OPEN
+                                    else:
+                                        status = OrderStatus.PENDING
+                                    if order.exchange == "M":
+                                        try:
+                                            long_symbol = (
+                                                self.get_long_name_from_broker_identifier(
+                                                    ScripName=pd.Series[order.long_symbol]
+                                                ).item()
+                                                if order.long_symbol is not None
+                                                else self.get_long_name_from_broker_identifier(ScripName=row["ScripName"]).item()
+                                            )
+                                            contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(
+                                                long_symbol
+                                            )
+                                            return OrderInfo(
+                                                order_size=order_size,
+                                                order_price=order_price,
+                                                fill_size=fill_size * contract_size,
+                                                fill_price=fill_price,
+                                                status=status,
+                                                broker_order_id=broker_order_id,
+                                                exchange_order_id=row["ExchOrderID"],
+                                                broker=self.broker,
+                                            )
+                                        except Exception as e:
+                                            trading_logger.log_error("Error processing MCX order from duplicates", e, {
+                                                "broker_order_id": broker_order_id,
+                                                "order": str(order)
+                                            })
+                                            raise
+                                    else:
+                                        return OrderInfo(
+                                            order_size=order_size,
+                                            order_price=order_price,
+                                            fill_size=fill_size,
+                                            fill_price=fill_price,
+                                            status=status,
+                                            broker_order_id=broker_order_id,
+                                            exchange_order_id=row["ExchOrderID"],
+                                            broker=self.broker,
+                                        )
+                    return OrderInfo(
+                        order_size=order.quantity,
+                        order_price=order.price,
+                        fill_size=0,
+                        fill_price=0,
+                        status=OrderStatus.UNDEFINED,
+                        broker_order_id=order.broker_order_id,
+                        exchange_order_id=order.exch_order_id,
+                        broker=self.broker,
+                    )
+                except Exception as e:
+                    context = create_error_context(
+                        exch_order_id=exch_order_id,
+                        broker_order_id=broker_order_id,
+                        order=str(order),
+                        error=str(e)
+                    )
+                    raise OrderError(f"Error getting order info from orders: {str(e)}", context)
+
+            # Validate mandatory keys
+            mandatory_keys = ["broker_order_id"]
+            missing_keys = [key for key in mandatory_keys if key not in kwargs]
+            if missing_keys:
+                context = create_error_context(
+                    missing_keys=missing_keys,
+                    available_keys=list(kwargs.keys())
+                )
+                raise ValidationError(f"Missing mandatory keys: {', '.join(missing_keys)}", context)
+            
+            broker_order_id = str(kwargs.get("broker_order_id", "0"))
+            
+            # Validate broker_order_id
+            if not broker_order_id or broker_order_id == "0":
+                context = create_error_context(
+                    broker_order_id=broker_order_id
+                )
+                raise ValidationError("Invalid broker_order_id", context)
+            
+            # Get order from kwargs or Redis
+            order = kwargs.get("order", None)
+            if order is None:
+                try:
+                    order_data = self.redis_o.hgetall(broker_order_id)
+                    if not order_data:
+                        context = create_error_context(
+                            broker_order_id=broker_order_id
+                        )
+                        raise OrderError("Order not found in Redis", context)
+                    order = Order(**order_data)
+                except Exception as e:
+                    context = create_error_context(
+                        broker_order_id=broker_order_id,
+                        error=str(e)
+                    )
+                    raise OrderError(f"Failed to retrieve order from Redis: {str(e)}", context)
+            
+            # Check for historical orders
+            try:
+                valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
+                if (
+                    valid_date
+                    and valid_date != dt.datetime.today().strftime("%Y-%m-%d")
+                    or (order.remote_order_id == "" and order.broker != self.broker)
+                ):
+                    return return_db_as_fills(order)
+            except Exception as e:
+                trading_logger.log_warning("Error checking order date", {
+                    "broker_order_id": broker_order_id,
+                    "remote_order_id": order.remote_order_id,
+                    "error": str(e)
+                })
+
+            # Handle orders with no data in Redis
+            if str(order.broker_order_id) == "0":
+                return get_orderinfo_from_orders("0", order=order, broker_order_id=broker_order_id)
+
+            # Handle paper trades
+            if str(broker_order_id).endswith("P"):
+                trading_logger.log_debug("Paper trade being skipped", {
+                    "broker_order_id": broker_order_id
+                })
+                return OrderInfo(
+                    order_size=order.quantity,
+                    order_price=order.price,
+                    fill_size=order.quantity,
+                    fill_price=order.price,
+                    status=OrderStatus.FILLED,
+                    broker_order_id=order.broker_order_id,
+                    broker=self.broker,
+                )
+            
+            # Check order date
+            remote_order_id = order.remote_order_id
+            try:
+                valid_date, _ = valid_datetime(remote_order_id[:8], "%Y-%m-%d")
+                if not (valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d")):
+                    # we cannot update orders that were placed before today
+                    return OrderInfo(
+                        order_size=order.quantity,
+                        order_price=order.price,
+                        fill_size=order.quantity,
+                        fill_price=order.price,
+                        status=OrderStatus.HISTORICAL,
+                        broker_order_id=order.broker_order_id,
+                        exchange_order_id=order.exch_order_id,
+                        broker=self.broker,
+                    )
+            except Exception as e:
+                trading_logger.log_warning("Error checking remote order date", {
+                    "broker_order_id": broker_order_id,
+                    "remote_order_id": remote_order_id,
+                    "error": str(e)
+                })
+            
+            # Handle orders with no exchange order ID
+            if order.exch_order_id in [0, "0", None, "None"]:
+                if "reject" in order.message.lower() or "cancel" in order.message.lower():
+                    fills = OrderInfo()
+                    if "reject" in order.message.lower():
+                        fills.status = OrderStatus.REJECTED
+                    if "cancel" in order.message.lower():
+                        fills.status = OrderStatus.CANCELLED
+                    fills.fill_price = 0
+                    fills.fill_size = 0
+                    fills.broker = self.broker.name
+                    fills.broker_order_id = order.broker_order_id
+                    fills.order_price = order.price
+                    fills.order_size = order.quantity
+                    return fills
+                return get_orderinfo_from_orders("0", order=order, broker_order_id=broker_order_id)
+            else:
+                # Handle orders with exchange order ID
+                exchange = order.exchange
+                if exchange == "M":
+                    if order.exch_order_id not in ["0", "None", 0, None]:
+                        return get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
+                else:
+                    try:
+                        long_symbol = order.long_symbol
+                        exch = self.exchange_mappings[order.exchange]["exchange_map"].get(long_symbol)
+                        req_list_ = [
+                            {
+                                "Exch": exch,
+                                "ExchOrderID": order.exch_order_id,
+                                "ExchType": order.exchange_segment,
+                                "ScripCode": order.scrip_code,
+                            }
+                        ]
+                        trade_info = self.api.fetch_trade_info(req_list_)
+                        if trade_info is None:
+                            return get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
+                        trade_details = trade_info["TradeDetail"]
+                        if len(trade_details) > 0:
+                            price = [trade["Qty"] * trade["Rate"] for trade in trade_details]
+                            filled = [trade["Qty"] for trade in trade_details]
+                            price = np.sum(price)
+                            fill_size = np.sum(filled)
+                            fill_price = price / fill_size
+                            status = OrderStatus.UNDEFINED
+                            if str(trade_info["Status"]) == "Cancelled":
+                                status = OrderStatus.CANCELLED
+                            elif fill_size == round(float(order.quantity)):
+                                status = OrderStatus.FILLED
+                            elif trade_details[0].get("ExchOrderID") not in [None, "None", 0, "0"]:
+                                status = OrderStatus.OPEN
+                            else:
+                                status = OrderStatus.PENDING
+                            trading_logger.log_debug("Trade details processed", {
+                                "broker_order_id": broker_order_id,
+                                "fill_size": fill_size,
+                                "fill_price": fill_price,
+                                "status": status.name if status else None
+                            })
                             return OrderInfo(
                                 order_size=order.quantity,
                                 order_price=order.price,
@@ -546,305 +1890,271 @@ class FivePaisa(BrokerBase):
                                 fill_price=fill_price,
                                 status=status,
                                 broker_order_id=order.broker_order_id,
-                                exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                exchange_order_id=trade_details[0].get("ExchOrderID"),
                                 broker=self.broker,
                             )
-                else:
-                    logger.debug(
-                        f"Found duplicate orders with same exchange order id in order book. exchange order id:{exch_order_id}"
-                    )
-                    # iterate over order_info
-                    status = OrderStatus.UNDEFINED
-                    for index, row in fivepaisa_order.iterrows():
-                        if row["BrokerOrderId"] == int(broker_order_id):
-                            order_size = row["Qty"]
-                            order_price = row["Rate"]
-                            fill_size = order_size - row["PendingQty"]
-                            fill_price = row["AveragePrice"]
-                            if "cancel" in row["OrderStatus"].lower():
-                                status = OrderStatus.CANCELLED
-                            elif "reject" in row["OrderStatus"].lower():
-                                logger.info(f"Order Rejected Reason: {row['Reason']}")
-                                status = OrderStatus.REJECTED
-                            elif fill_size == order_size:
-                                status = OrderStatus.FILLED
-                            elif row["ExchOrderID"] not in [0, "0", None, "None"]:
-                                status = OrderStatus.OPEN
-                            else:
-                                status = OrderStatus.PENDING
-                            if order.exchange == "M":
-                                long_symbol = (
-                                    self.get_long_name_from_broker_identifier(
-                                        ScripName=pd.Series[order.long_symbol]
-                                    ).item()
-                                    if order.long_symbol is not None
-                                    else self.get_long_name_from_broker_identifier(ScripName=row["ScripName"]).item()
-                                )
-                                contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(
-                                    long_symbol
-                                )
-                                return OrderInfo(
-                                    order_size=order_size,
-                                    order_price=order_price,
-                                    fill_size=fill_size * contract_size,
-                                    fill_price=fill_price,
-                                    status=status,
-                                    broker_order_id=broker_order_id,
-                                    exchange_order_id=row["ExchOrderID"],
-                                    broker=self.broker,
-                                )
-                            else:
-                                return OrderInfo(
-                                    order_size=order_size,
-                                    order_price=order_price,
-                                    fill_size=fill_size,
-                                    fill_price=fill_price,
-                                    status=status,
-                                    broker_order_id=broker_order_id,
-                                    exchange_order_id=row["ExchOrderID"],
-                                    broker=self.broker,
-                                )
+                        else:
+                            return get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
+                    except Exception as e:
+                        context = create_error_context(
+                            broker_order_id=broker_order_id,
+                            exchange=exchange,
+                            long_symbol=order.long_symbol,
+                            error=str(e)
+                        )
+                        raise OrderError(f"Error processing trade info: {str(e)}", context)
+            
+            trading_logger.log_warning("No valid return path found for order info", {
+                "broker_order_id": broker_order_id
+            })
             return OrderInfo(
-                order_size=order.quantity,
-                order_price=order.price,
+                order_size=0,
+                order_price=0,
                 fill_size=0,
                 fill_price=0,
                 status=OrderStatus.UNDEFINED,
-                broker_order_id=order.broker_order_id,
-                exchange_order_id=order.exch_order_id,
+                broker_order_id="",
+                exchange_order_id="",
                 broker=self.broker,
             )
-
-        mandatory_keys = ["broker_order_id"]
-        missing_keys = [key for key in mandatory_keys if key not in kwargs]
-        if missing_keys:
-            raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
-        broker_order_id = str(kwargs.get("broker_order_id", "0"))
-        order = kwargs.get("order", None)
-        if order is None:
-            order = Order(**self.redis_o.hgetall(broker_order_id))
-        valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-        if (
-            valid_date
-            and valid_date != dt.datetime.today().strftime("%Y-%m-%d")
-            or (order.remote_order_id == "" and order.broker != self.broker)
-        ):
-            return return_db_as_fills(order)
-
-        if str(order.broker_order_id) == "0":  # no data in redis
-            out = get_orderinfo_from_orders("0", order=order, broker_order_id=broker_order_id)
-            return out
-
-        if str(broker_order_id).endswith("P"):
-            logger.debug(f"Paper Trade: {broker_order_id} being skipped")
-            return OrderInfo(
-                order_size=order.quantity,
-                order_price=order.price,
-                fill_size=order.quantity,
-                fill_price=order.price,
-                status=OrderStatus.FILLED,
-                broker_order_id=order.broker_order_id,
-                broker=self.broker,
+            
+        except (ValidationError, OrderError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                kwargs=kwargs,
+                error=str(e)
             )
-        remote_order_id = order.remote_order_id
-        valid_date, _ = valid_datetime(remote_order_id[:8], "%Y-%m-%d")
-        if not (valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d")):
-            # we cannot update orders that were placed before today
-            return OrderInfo(
-                order_size=order.quantity,
-                order_price=order.price,
-                fill_size=order.quantity,
-                fill_price=order.price,
-                status=OrderStatus.HISTORICAL,
-                broker_order_id=order.broker_order_id,
-                exchange_order_id=order.exch_order_id,
-                broker=self.broker,
-            )
-        if order.exch_order_id in [0, "0", None, "None"]:
-            if "reject" in order.message.lower() or "cancel" in order.message.lower():
-                fills = OrderInfo()
-                if "reject" in order.message.lower():
-                    fills.status = OrderStatus.REJECTED
-                if "cancel" in order.message.lower():
-                    fills.status = OrderStatus.CANCELLED
-                fills.fill_price = 0
-                fills.fill_size = 0
-                fills.broker = self.broker.name
-                fills.broker_order_id = order.broker_order_id
-                fills.order_price = order.price
-                fills.order_size = order.quantity
-                return fills
-            out = get_orderinfo_from_orders("0", order=order, broker_order_id=broker_order_id)
-            return out
-        else:
-            exchange = order.exchange
-            if exchange == "M":
-                if order.exch_order_id not in ["0", "None", 0, None]:
-                    out = get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
-                    return out
-            else:
-                long_symbol = order.long_symbol
-                exch = self.exchange_mappings[order.exchange]["exchange_map"].get(long_symbol)
-                req_list_ = [
-                    {
-                        "Exch": exch,
-                        "ExchOrderID": order.exch_order_id,
-                        "ExchType": order.exchange_segment,
-                        "ScripCode": order.scrip_code,
-                    }
-                ]
-                trade_info = self.api.fetch_trade_info(req_list_)
-                if trade_info is None:
-                    out = get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
-                    return out
-                trade_details = trade_info["TradeDetail"]
-                if len(trade_details) > 0:
-                    price = [trade["Qty"] * trade["Rate"] for trade in trade_details]
-                    filled = [trade["Qty"] for trade in trade_details]
-                    price = np.sum(price)
-                    fill_size = np.sum(filled)
-                    fill_price = price / fill_size
-                    status = OrderStatus.UNDEFINED
-                    if str(trade_info["Status"]) == "Cancelled":
-                        status = OrderStatus.CANCELLED
-                    elif fill_size == round(float(order.quantity)):
-                        status = OrderStatus.FILLED
-                    elif trade_details[0].get("ExchOrderID") not in [None, "None", 0, "0"]:
-                        status = OrderStatus.OPEN
-                    else:
-                        status = OrderStatus.PENDING
-                    logger.debug(
-                        f"Fill prices: {' '.join(str(trade['Rate']) for trade in trade_details)}, Fill Sizes: {' '.join(str(trade['Qty']) for trade in trade_details)}"
-                    )
-                    return OrderInfo(
-                        order_size=order.quantity,
-                        order_price=order.price,
-                        fill_size=fill_size,
-                        fill_price=fill_price,
-                        status=status,
-                        broker_order_id=order.broker_order_id,
-                        exchange_order_id=trade_details[0].get("ExchOrderID"),
-                        broker=self.broker,
-                    )
-                else:
-                    out = get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
-                    return out
-        logger.error("get_order_info: No valid return path found.")
-        return OrderInfo(
-            order_size=0,
-            order_price=0,
-            fill_size=0,
-            fill_price=0,
-            status=OrderStatus.UNDEFINED,
-            broker_order_id="",
-            exchange_order_id="",
-            broker=self.broker,
-        )
+            raise OrderError(f"Unexpected error getting order info: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        symbols=lambda x: x is not None,
+        date_start=lambda x: valid_datetime(x)[0] is not False,
+        date_end=lambda x: valid_datetime(x)[0] is not False,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_historical(
         self,
         symbols: Union[str, pd.DataFrame, dict],
-        date_start: str,
-        date_end: str = dt.datetime.today().strftime("%Y-%m-%d"),
-        exchange: str = "N",  # Fix type for `exchange`
-        periodicity: str = "1m",  # Fix type for `periodicity`
+        date_start: Union[str, dt.datetime, dt.date],
+        date_end: Union[str, dt.datetime, dt.date] = dt.datetime.today().strftime("%Y-%m-%d"),
+        exchange: str = "N",
+        periodicity: str = "1m",
         market_close_time: str = "15:30:00",
     ) -> Dict[str, List[HistoricalData]]:
         """
-        Retrieves historical bars from 5paisa.
-
+        Retrieves historical bars from FivePaisa with enhanced error handling.
+        
         Args:
-            symbols (Union[str,dict,pd.DataFrame]): If dataframe is provided, it needs to contain columns [long_symbol, Scripcode].
+            symbols: If dataframe is provided, it needs to contain columns [long_symbol, Scripcode].
                 If dict is provided, it needs to contain (long_symbol, scrip_code, exch, exch_type). Else symbol long_name.
-            date_start (str): Date formatted as YYYY-MM-DD.
-            date_end (str): Date formatted as YYYY-MM-DD.
-            periodicity (str): Defaults to '1m'.
-            market_close_time (str): Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
-            dest_folder (str, optional): Path to data folder. Defaults to None. If provided, historical data is saved to dest_folder as rds file.
-
+            date_start: Start date (can be string, datetime, or date object).
+            date_end: End date (can be string, datetime, or date object).
+            exchange: Exchange name. Defaults to "N".
+            periodicity: Defaults to '1m'.
+            market_close_time: Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            
         Returns:
             Dict[str, List[HistoricalData]]: Dictionary with historical data for each symbol.
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If historical data retrieval fails
+            BrokerConnectionError: If broker connection issues
         """
-        scripCode = None
-        # Determine the format of symbols and create a DataFrame
-        if isinstance(symbols, str):
-            exchange = self.map_exchange_for_api(symbols, exchange)
-            scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
-            if scripCode:
-                symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
-            else:
-                logger.error(f"Did not get ScripCode for {symbols}")
-                return {}
-        elif isinstance(symbols, dict):
-            scripCode = symbols.get("scrip_code")
-            if scripCode:
-                symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
-            else:
-                logger.error(f"Did not get ScripCode for {symbols}")
-                return {}
-        else:
-            symbols_pd = symbols
-
-        out = {}  # Initialize the output dictionary
-
-        for index, row_outer in symbols_pd.iterrows():
-            logger.debug(f"{str(index)}:{str(len(symbols))}:{row_outer['long_symbol']}")
-            exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
-            historical_data_list = []
-            exch = exchange
-            exch_type = (
-                symbols.get("exch_type")
-                if isinstance(symbols, dict)
-                else self.exchange_mappings[exchange]["exchangetype_map"].get(row_outer["long_symbol"])
-            )
-            s = row_outer["long_symbol"].replace("/", "-")
-            row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
-            date_start_str, _ = valid_datetime(date_start, "%Y-%m-%d")
-            date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
-            data = self.api.historical_data(
-                exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
-            )
-            if not (data is None or len(data) == 0):
-                data.columns = ["date", "open", "high", "low", "close", "volume"]
-                data["date"] = pd.to_datetime(data["date"])
-                data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
-                data = data[data["date"].dt.time < pd.to_datetime(market_close_time).time()]
-
-                # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
-                if any(period in periodicity for period in ["d"]):
-                    data["date"] = data["date"].dt.floor("D")
-
-                for _, row in data.iterrows():
-                    historical_data = HistoricalData(
-                        date=row.get("date"),
-                        open=row.get("open"),
-                        high=row.get("high"),
-                        low=row.get("low"),
-                        close=row.get("close"),
-                        volume=row.get("volume"),
-                        intoi=row.get("intoi"),
-                        oi=row.get("oi"),
-                    )
-                    historical_data_list.append(historical_data)
-            else:
-                logger.debug(f"No data found for {row_outer['long_symbol']}")
-                historical_data_list.append(
-                    HistoricalData(
-                        date=dt.datetime(1970, 1, 1),
-                        open=float("nan"),
-                        high=float("nan"),
-                        low=float("nan"),
-                        close=float("nan"),
-                        volume=0,
-                        intoi=0,
-                        oi=0,
-                    )
+        try:
+            trading_logger.log_info("Getting historical data", {
+                "symbols_type": type(symbols).__name__,
+                "date_start": date_start,
+                "date_end": date_end,
+                "exchange": exchange,
+                "periodicity": periodicity
+            })
+            
+            scripCode = None
+            # Determine the format of symbols and create a DataFrame
+            try:
+                if isinstance(symbols, str):
+                    exchange = self.map_exchange_for_api(symbols, exchange)
+                    scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
+                    if scripCode:
+                        symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
+                    else:
+                        trading_logger.log_warning("ScripCode not found for symbol", {
+                            "symbol": symbols,
+                            "exchange": exchange
+                        })
+                        return {}
+                elif isinstance(symbols, dict):
+                    scripCode = symbols.get("scrip_code")
+                    if scripCode:
+                        symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
+                    else:
+                        trading_logger.log_warning("ScripCode not found in dict", {
+                            "symbols": symbols
+                        })
+                        return {}
+                else:
+                    symbols_pd = symbols
+            except Exception as e:
+                context = create_error_context(
+                    symbols_type=type(symbols).__name__,
+                    symbols=str(symbols),
+                    error=str(e)
                 )
+                raise MarketDataError(f"Error processing symbols: {str(e)}", context)
 
-            out[row_outer["long_symbol"]] = historical_data_list
+            out = {}  # Initialize the output dictionary
 
-        return out
+            for index, row_outer in symbols_pd.iterrows():
+                try:
+                    trading_logger.log_debug("Processing symbol for historical data", {
+                        "index": index,
+                        "symbol_count": len(symbols_pd),
+                        "long_symbol": row_outer['long_symbol']
+                    })
+                    
+                    exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
+                    historical_data_list = []
+                    exch = exchange
+                    exch_type = (
+                        symbols.get("exch_type")
+                        if isinstance(symbols, dict)
+                        else self.exchange_mappings[exchange]["exchangetype_map"].get(row_outer["long_symbol"])
+                    )
+                    
+                    s = row_outer["long_symbol"].replace("/", "-")
+                    row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
+                    
+                    try:
+                        date_start_str, _ = valid_datetime(date_start, "%Y-%m-%d")
+                        date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
+                    except Exception as e:
+                        trading_logger.log_error("Error validating dates", e, {
+                            "date_start": date_start,
+                            "date_end": date_end
+                        })
+                        continue
+                    
+                    try:
+                        data = self.api.historical_data(
+                            exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
+                        )
+                    except Exception as e:
+                        trading_logger.log_error("Error fetching historical data from API", e, {
+                            "exch": exch,
+                            "exch_type": exch_type,
+                            "scripcode": row_outer["Scripcode"],
+                            "periodicity": periodicity,
+                            "date_start": date_start_str,
+                            "date_end": date_end_str
+                        })
+                        continue
+                    
+                    if not (data is None or len(data) == 0):
+                        try:
+                            data.columns = ["date", "open", "high", "low", "close", "volume"]
+                            data["date"] = pd.to_datetime(data["date"])
+                            data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
+                            data = data[data["date"].dt.time < pd.to_datetime(market_close_time).time()]
 
+                            # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
+                            if any(period in periodicity for period in ["d"]):
+                                data["date"] = data["date"].dt.floor("D")
+
+                            for _, row in data.iterrows():
+                                historical_data = HistoricalData(
+                                    date=row.get("date"),
+                                    open=row.get("open"),
+                                    high=row.get("high"),
+                                    low=row.get("low"),
+                                    close=row.get("close"),
+                                    volume=row.get("volume"),
+                                    intoi=row.get("intoi"),
+                                    oi=row.get("oi"),
+                                )
+                                historical_data_list.append(historical_data)
+                                
+                            trading_logger.log_debug("Historical data processed successfully", {
+                                "symbol": row_outer["long_symbol"],
+                                "data_points": len(historical_data_list)
+                            })
+                            
+                        except Exception as e:
+                            trading_logger.log_error("Error processing historical data", e, {
+                                "symbol": row_outer["long_symbol"],
+                                "data_shape": data.shape if data is not None else None
+                            })
+                            historical_data_list.append(
+                                HistoricalData(
+                                    date=dt.datetime(1970, 1, 1),
+                                    open=float("nan"),
+                                    high=float("nan"),
+                                    low=float("nan"),
+                                    close=float("nan"),
+                                    volume=0,
+                                    intoi=0,
+                                    oi=0,
+                                )
+                            )
+                    else:
+                        trading_logger.log_debug("No data found for symbol", {
+                            "symbol": row_outer["long_symbol"]
+                        })
+                        historical_data_list.append(
+                            HistoricalData(
+                                date=dt.datetime(1970, 1, 1),
+                                open=float("nan"),
+                                high=float("nan"),
+                                low=float("nan"),
+                                close=float("nan"),
+                                volume=0,
+                                intoi=0,
+                                oi=0,
+                            )
+                        )
+
+                    out[row_outer["long_symbol"]] = historical_data_list
+                    
+                except Exception as e:
+                    trading_logger.log_error("Error processing symbol", e, {
+                        "index": index,
+                        "long_symbol": row_outer.get("long_symbol", "unknown"),
+                        "symbols_count": len(symbols_pd)
+                    })
+                    continue
+
+            trading_logger.log_info("Historical data retrieval completed", {
+                "symbols_processed": len(out),
+                "total_symbols": len(symbols_pd)
+            })
+            
+            return out
+            
+        except (ValidationError, MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                symbols_type=type(symbols).__name__,
+                date_start=date_start,
+                date_end=date_end,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error getting historical data: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        bar_duration=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        adj=lambda x: isinstance(x, bool)
+    )
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_close(
         self,
         long_symbol: str,
@@ -853,424 +2163,1364 @@ class FivePaisa(BrokerBase):
         timestamp: dt.datetime = dt.datetime(1970, 1, 1),
         adj=False,
     ) -> float:
-        """Get last traded price from five paisa
-
-        Args:
-            long_symbol (str): long symbol
-            bar_duration (str, optional): Defaults to '1m'.
-            timestamp (dt.datetime, optional): Formatted as %Y-%m-%d%T%H:%M:%S. Defaults to None and then provides the last traded price
-            adj (bool, optional): If True, provide hlc3 for the shortlisted bar. Defaults to False.
-
-        Returns:
-            float: last traded price on or before timestamp. None if no price found
         """
-        exchange = self.map_exchange_for_api(long_symbol, exchange)
-        if timestamp is None:
-            timestamp = dt.datetime.now()
-        elif isinstance(timestamp, str):
-            timestamp, _ = valid_datetime(timestamp)
-        cutoff_time = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
-
-        md = self.api.historical_data(
-            exchange,
-            self.exchange_mappings[exchange]["exchangetype_map"].get(long_symbol),
-            self.exchange_mappings["N"]["symbol_map"].get(long_symbol),
-            bar_duration,
-            (timestamp - dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
-            cutoff_time,
-        )
-        if md is not None:
-            md = md.loc[md.Datetime <= cutoff_time,].tail(1).squeeze()
-            if adj:
-                return (md.High + md.Low + md.Close) / 3
+        Get last traded price from FivePaisa with enhanced error handling.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name. Defaults to "N".
+            bar_duration: Bar duration. Defaults to "1m".
+            timestamp: Formatted as %Y-%m-%d%T%H:%M:%S. Defaults to None and then provides the last traded price.
+            adj: If True, provide hlc3 for the shortlisted bar. Defaults to False.
+            
+        Returns:
+            float: Last traded price on or before timestamp. NaN if no price found.
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If price retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Getting close price", {
+                "long_symbol": long_symbol,
+                "exchange": exchange,
+                "bar_duration": bar_duration,
+                "timestamp": timestamp.isoformat() if timestamp else None,
+                "adj": adj
+            })
+            
+            try:
+                exchange = self.map_exchange_for_api(long_symbol, exchange)
+            except Exception as e:
+                context = create_error_context(
+                    long_symbol=long_symbol,
+                    exchange=exchange,
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to map exchange: {str(e)}", context)
+            
+            # Process timestamp
+            try:
+                if timestamp is None:
+                    timestamp = dt.datetime.now()
+                elif isinstance(timestamp, str):
+                    timestamp, _ = valid_datetime(timestamp)
+                cutoff_time = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+            except Exception as e:
+                context = create_error_context(
+                    timestamp=timestamp,
+                    error=str(e)
+                )
+                raise MarketDataError(f"Error processing timestamp: {str(e)}", context)
+            
+            # Get exchange mappings
+            try:
+                exch_type = self.exchange_mappings[exchange]["exchangetype_map"].get(long_symbol)
+                scrip_code = self.exchange_mappings["N"]["symbol_map"].get(long_symbol)
+            except KeyError as e:
+                context = create_error_context(
+                    exchange=exchange,
+                    long_symbol=long_symbol,
+                    available_exchanges=list(self.exchange_mappings.keys())
+                )
+                raise MarketDataError(f"Exchange mapping not found: {str(e)}", context)
+            
+            if not scrip_code:
+                trading_logger.log_warning("Scrip code not found for symbol", {
+                    "long_symbol": long_symbol,
+                    "exchange": exchange
+                })
+                return float("nan")
+            
+            # Fetch historical data
+            try:
+                md = self.api.historical_data(
+                    exchange,
+                    exch_type,
+                    scrip_code,
+                    bar_duration,
+                    (timestamp - dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+                    cutoff_time,
+                )
+            except Exception as e:
+                context = create_error_context(
+                    exchange=exchange,
+                    exch_type=exch_type,
+                    scrip_code=scrip_code,
+                    bar_duration=bar_duration,
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to fetch historical data: {str(e)}", context)
+            
+            if md is not None and len(md) > 0:
+                try:
+                    md = md.loc[md.Datetime <= cutoff_time,].tail(1).squeeze()
+                    
+                    if adj:
+                        result = (md.High + md.Low + md.Close) / 3
+                        trading_logger.log_debug("Adjusted close price calculated", {
+                            "long_symbol": long_symbol,
+                            "high": md.High,
+                            "low": md.Low,
+                            "close": md.Close,
+                            "result": result
+                        })
+                    else:
+                        result = md.Close
+                        trading_logger.log_debug("Close price retrieved", {
+                            "long_symbol": long_symbol,
+                            "close": result
+                        })
+                    
+                    return result
+                    
+                except Exception as e:
+                    trading_logger.log_error("Error processing market data", e, {
+                        "long_symbol": long_symbol,
+                        "data_shape": md.shape if md is not None else None
+                    })
+                    return float("nan")
             else:
-                return md.Close
-        else:
-            return float("nan")
+                trading_logger.log_warning("No market data found", {
+                    "long_symbol": long_symbol,
+                    "exchange": exchange,
+                    "timestamp": cutoff_time
+                })
+                return float("nan")
+                
+        except (ValidationError, MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                bar_duration=bar_duration,
+                timestamp=timestamp.isoformat() if timestamp else None,
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error getting close price: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
     def map_exchange_for_api(self, long_symbol, exchange):
-        return exchange[0]
+        """
+        Map exchange for API calls with enhanced error handling.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name
+            
+        Returns:
+            str: Mapped exchange for API calls
+            
+        Raises:
+            ValidationError: If parameters are invalid
+        """
+        try:
+            trading_logger.log_debug("Mapping exchange for API", {
+                "long_symbol": long_symbol,
+                "exchange": exchange
+            })
+            
+            if not exchange or len(exchange) == 0:
+                context = create_error_context(
+                    long_symbol=long_symbol,
+                    exchange=exchange
+                )
+                raise ValidationError("Exchange cannot be empty", context)
+            
+            result = exchange[0]
+            
+            trading_logger.log_debug("Exchange mapped for API", {
+                "long_symbol": long_symbol,
+                "original_exchange": exchange,
+                "mapped_exchange": result
+            })
+            
+            return result
+            
+        except (ValidationError, IndexError) as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise ValidationError(f"Error mapping exchange for API: {str(e)}", context)
+        except Exception as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise ValidationError(f"Unexpected error mapping exchange for API: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
     def map_exchange_for_db(self, long_symbol, exchange):
-        if exchange[0] == "N":
-            return "NSE"
-        elif exchange[0] == "B":
-            return "BSE"
-        else:
-            return exchange
+        """
+        Map exchange for database operations with enhanced error handling.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name
+            
+        Returns:
+            str: Mapped exchange for database operations
+            
+        Raises:
+            ValidationError: If parameters are invalid
+        """
+        try:
+            trading_logger.log_debug("Mapping exchange for DB", {
+                "long_symbol": long_symbol,
+                "exchange": exchange
+            })
+            
+            if not exchange or len(exchange) == 0:
+                context = create_error_context(
+                    long_symbol=long_symbol,
+                    exchange=exchange
+                )
+                raise ValidationError("Exchange cannot be empty", context)
+            
+            if exchange[0] == "N":
+                result = "NSE"
+            elif exchange[0] == "B":
+                result = "BSE"
+            else:
+                result = exchange
+            
+            trading_logger.log_debug("Exchange mapped for DB", {
+                "long_symbol": long_symbol,
+                "original_exchange": exchange,
+                "mapped_exchange": result
+            })
+            
+            return result
+            
+        except (ValidationError, IndexError) as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise ValidationError(f"Error mapping exchange for DB: {str(e)}", context)
+        except Exception as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise ValidationError(f"Unexpected error mapping exchange for DB: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        date_string=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
     def convert_to_ist(self, date_string):
         """
-        Convert a string in the format '/Date(1732010010000)/' to IST date and time.
-
+        Convert a string in the format '/Date(1732010010000)/' to IST date and time with enhanced error handling.
+        
         Args:
-            date_string (str): The string containing the date in /Date(milliseconds)/ format.
-
+            date_string: The string containing the date in /Date(milliseconds)/ format.
+            
         Returns:
             str: The corresponding date and time in IST (yyyy-mm-dd hh:mm:ss).
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            DataError: If date conversion fails
         """
-        # Extract the timestamp using regex
-        match = re.search(r"/Date\((\d+)\)/", date_string)
-        if not match:
-            logger.error(f"Invalid date format. Expected '/Date(milliseconds)/'.Received {date_string}")
-            return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Convert the timestamp from milliseconds to seconds
-        timestamp_ms = int(match.group(1))
-        timestamp_s = timestamp_ms / 1000
+        try:
+            trading_logger.log_debug("Converting to IST", {
+                "date_string": date_string
+            })
+            
+            if not date_string or not isinstance(date_string, str):
+                context = create_error_context(
+                    date_string=date_string,
+                    date_string_type=type(date_string)
+                )
+                raise ValidationError("Invalid date string", context)
+            
+            # Extract the timestamp using regex
+            match = re.search(r"/Date\((\d+)\)/", date_string)
+            if not match:
+                trading_logger.log_warning("Invalid date format", {
+                    "date_string": date_string,
+                    "expected_format": "/Date(milliseconds)/"
+                })
+                return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            try:
+                # Convert the timestamp from milliseconds to seconds
+                timestamp_ms = int(match.group(1))
+                timestamp_s = timestamp_ms / 1000
 
-        # Convert to UTC datetime
-        utc_time = dt.datetime.utcfromtimestamp(timestamp_s)
+                # Convert to UTC datetime
+                utc_time = dt.datetime.utcfromtimestamp(timestamp_s)
 
-        # Convert to IST by adding 5 hours and 30 minutes
-        ist_time = utc_time + dt.timedelta(hours=5, minutes=30)
+                # Convert to IST by adding 5 hours and 30 minutes
+                ist_time = utc_time + dt.timedelta(hours=5, minutes=30)
 
-        # Format the IST datetime
-        return ist_time.strftime("%Y-%m-%d %H:%M:%S")
+                # Format the IST datetime
+                result = ist_time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                trading_logger.log_debug("Date converted to IST successfully", {
+                    "date_string": date_string,
+                    "timestamp_ms": timestamp_ms,
+                    "ist_time": result
+                })
+                
+                return result
+                
+            except (ValueError, OverflowError) as e:
+                context = create_error_context(
+                    date_string=date_string,
+                    timestamp_ms=timestamp_ms if 'timestamp_ms' in locals() else None,
+                    error=str(e)
+                )
+                raise DataError(f"Error converting timestamp: {str(e)}", context)
+                
+        except (ValidationError, DataError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                date_string=date_string,
+                error=str(e)
+            )
+            raise DataError(f"Unexpected error converting to IST: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_quote(self, long_symbol: str, exchange="NSE") -> Price:
-        """Get Quote details of a symbol
-
+        """
+        Get quote details of a symbol with enhanced error handling.
+        
         Args:
-            long_symbol (str): long symbol
-            exchange (str): Exchange name. Defaults to "NSE".
-
+            long_symbol: Trading symbol
+            exchange: Exchange name. Defaults to "NSE".
+            
         Returns:
             Price: Quote details.
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If quote retrieval fails
+            BrokerConnectionError: If broker connection issues
         """
-        mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
-        market_feed = Price()  # Initialize with default values
-        market_feed.src = "fp"
-        market_feed.symbol = long_symbol
-        exch_type = self.exchange_mappings[mapped_exchange]["exchangetype_map"].get(long_symbol)
-        scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
-
-        if scrip_code is None:
-            logger.error(f"No scrip code found for symbol: {long_symbol}")
-            return market_feed  # Return default Price object if no scrip code is found
-
-        req_list = [
-            {"Exch": mapped_exchange, "ExchType": exch_type, "ScripCode": scrip_code},
-        ]
         try:
-            out = self.api.fetch_market_feed_scrip(req_list)
-            snapshot = out["Data"][0]
-            out = self.api.fetch_market_depth_by_scrip(
-                Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
-            )
-            market_depth_data = out["MarketDepthData"]
-            bids = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 66]
-            asks = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 83]
-
-            # Get the best bid and best ask
-            best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
-            best_ask = min(asks, key=lambda x: x["Price"]) if asks else None
-
-            # Extract prices and quantities
-            best_bid_price = best_bid["Price"] if best_bid else None
-            best_bid_quantity = best_bid["Quantity"] if best_bid else None
-
-            best_ask_price = best_ask["Price"] if best_ask else None
-            best_ask_quantity = best_ask["Quantity"] if best_ask else None
-
-            # Update market_feed with fetched data
-            market_feed.ask = best_ask_price if best_ask_price is not None and best_ask_price != 0 else market_feed.ask
-            market_feed.bid = best_bid_price if best_bid_price is not None and best_bid_price != 0 else market_feed.bid
-            market_feed.bid_volume = (
-                best_bid_quantity if best_bid_quantity is not None and best_bid_quantity > 0 else market_feed.bid_volume
-            )
-            market_feed.ask_volume = (
-                best_ask_quantity if best_ask_quantity is not None and best_ask_quantity > 0 else market_feed.ask_volume
-            )
-            market_feed.exchange = snapshot["Exch"]
-            market_feed.high = snapshot["High"] if snapshot["High"] > 0 else market_feed.high
-            market_feed.low = snapshot["Low"] if snapshot["Low"] > 0 else market_feed.low
-            market_feed.last = snapshot["LastRate"] if snapshot["LastRate"] > 0 else market_feed.last
-            market_feed.prior_close = snapshot["PClose"] if snapshot["PClose"] > 0 else market_feed.prior_close
-            market_feed.volume = snapshot["TotalQty"] if snapshot["TotalQty"] > 0 else market_feed.volume
-            market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            logger.error(f"Error fetching quote for symbol {long_symbol}: {str(e)}", exc_info=True)
-
-        return market_feed
-
-    def start_quotes_streaming(self, operation: str, symbols=List[str], ext_callback=None, exchange="NSE"):
-        logger.info(f"Operation: {operation}, symbols: {symbols},exchange:{exchange}")
-        mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
-
-        def map_to_price(json_data):
-            price = Price()
-            price.src = "fp"
-            price.bid = json_data.get("BidRate", float("nan"))
-            price.ask = json_data.get("OffRate", float("nan"))
-            price.bid_volume = json_data.get("BidQty", float("nan"))
-            price.ask_volume = json_data.get("OffQty", float("nan"))
-            price.last = json_data.get("LastRate", float("nan"))
-            price.prior_close = json_data.get("PClose", float("nan"))
-            price.high = json_data.get("High", float("nan"))
-            price.low = json_data.get("Low", float("nan"))
-            price.volume = json_data.get("TotalQty", float("nan"))
-            price.symbol = self.exchange_mappings[json_data["Exch"]]["symbol_map_reversed"].get(json_data.get("Token"))
-            price.exchange = self.map_exchange_for_db(price.symbol, json_data["Exch"])
-            price.timestamp = self.convert_to_ist(json_data["TickDt"])
-            return price
-
-        def on_message(ws, message):
+            trading_logger.log_info("Fetching quote", {
+                "long_symbol": long_symbol,
+                "exchange": exchange
+            })
+            
+            mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
+            market_feed = Price()  # Initialize with default values
+            market_feed.src = "fp"
+            market_feed.symbol = long_symbol
+            
             try:
-                data_str = message.replace("\/", "/")
-                json_data = json.loads(data_str)
-                if len(json_data) == 1:
-                    price = map_to_price(json_data[0])
-                    ext_callback(price)
-            except Exception:
-                logger.error(f"{traceback.format_exc()}")
-
-        def error_data(ws, err):
-            try:
-                logger.error(f"WebSocket error: {err}")
-                reconnect()
-            except Exception as e:
-                logger.error(f"Error handling WebSocket error: {e}")
-
-        def reconnect():
-            logger.info("Attempting to reconnect...")
-            time.sleep(5)  # Wait for a few seconds before reconnecting
-            try:
-                req_data = expand_symbols_to_request(
-                    self.subscribed_symbols
-                )  # Store req_data for reconnection purposes
-                connect_and_receive(req_data)
-            except Exception as e:
-                logger.error(f"Reconnection failed: {e}")
-                reconnect()
-
-        # Function to connect and receive data
-        def connect_and_receive(req_data):
-            self.api.connect(req_data)  # Implement your connection logic here
-            self.api.receive_data(on_message)
-            self.api.error_data(error_data)
-
-        def expand_symbols_to_request(symbols: list):
-            req_list = []
-            for long_symbol in symbols:
-                market_feed = Price()
-                market_feed.src = "fp"
-                market_feed.symbol = long_symbol
                 exch_type = self.exchange_mappings[mapped_exchange]["exchangetype_map"].get(long_symbol)
                 scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
-                if scrip_code is None:
-                    logger.error(f"Did not find scrip_code for {long_symbol}")
-                    continue
-                req_list.append({"Exch": mapped_exchange, "ExchType": exch_type, "ScripCode": scrip_code})
-                return req_list
-
-        def update_current_subscriptions(operation, symbols):
-            if operation == "s":
-                self.subscribed_symbols.extend(symbols)
-            elif operation == "u":
-                self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
-
-        update_current_subscriptions(operation, symbols)
-        req_list = expand_symbols_to_request(symbols)
-        if req_list is not None and len(req_list) > 0:
-            req_data = self.api.Request_Feed("mf", operation, req_list)
-            # Start the connection and receiving data in a separate thread
-            if self.subscribe_thread is None:
-                self.subscribe_thread = threading.Thread(
-                    target=connect_and_receive, args=(req_data,), name="MarketDataStreamer"
+            except KeyError as e:
+                context = create_error_context(
+                    mapped_exchange=mapped_exchange,
+                    long_symbol=long_symbol,
+                    available_exchanges=list(self.exchange_mappings.keys())
                 )
-                self.subscribe_thread.start()
-                time.sleep(2)
-            else:
-                logger.info(f"Requesting streaming for {json.dumps(req_data)}")
-                self.api.ws.send(json.dumps(req_data))
+                raise MarketDataError(f"Exchange mapping not found: {str(e)}", context)
 
-    def stop_streaming(self):
-        self.api.close_data()
+            if scrip_code is None:
+                context = create_error_context(
+                    long_symbol=long_symbol,
+                    mapped_exchange=mapped_exchange,
+                    available_symbols=list(self.exchange_mappings[mapped_exchange]["symbol_map"].keys())
+                )
+                trading_logger.log_warning("No scrip code found for symbol", context)
+                return market_feed  # Return default Price object if no scrip code is found
 
-    def get_position(self, long_symbol: str = "") -> Union[pd.DataFrame, int]:
-        """Retrieves position from 5paisa
+            req_list = [
+                {"Exch": mapped_exchange, "ExchType": exch_type, "ScripCode": scrip_code},
+            ]
+            
+            try:
+                # Fetch market feed
+                out = self.api.fetch_market_feed_scrip(req_list)
+                if not out or "Data" not in out or len(out["Data"]) == 0:
+                    context = create_error_context(
+                        long_symbol=long_symbol,
+                        mapped_exchange=mapped_exchange,
+                        scrip_code=scrip_code,
+                        api_response=out
+                    )
+                    raise MarketDataError("No market feed data received", context)
+                
+                snapshot = out["Data"][0]
+                
+                # Fetch market depth
+                out = self.api.fetch_market_depth_by_scrip(
+                    Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
+                )
+                
+                if not out or "MarketDepthData" not in out:
+                    context = create_error_context(
+                        long_symbol=long_symbol,
+                        mapped_exchange=mapped_exchange,
+                        scrip_code=scrip_code,
+                        api_response=out
+                    )
+                    raise MarketDataError("No market depth data received", context)
+                
+                market_depth_data = out["MarketDepthData"]
+                bids = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 66]
+                asks = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 83]
 
-        Args:
-            long_symbol (str, optional): symbol name. Defaults to None and returns all positions
+                # Get the best bid and best ask
+                best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
+                best_ask = min(asks, key=lambda x: x["Price"]) if asks else None
 
-        Returns:
-            Union[pd.DataFrame, int]: siged position if long_symbol is not None. Else dataframe containing all positions
+                # Extract prices and quantities
+                best_bid_price = best_bid["Price"] if best_bid else None
+                best_bid_quantity = best_bid["Quantity"] if best_bid else None
+
+                best_ask_price = best_ask["Price"] if best_ask else None
+                best_ask_quantity = best_ask["Quantity"] if best_ask else None
+
+                # Update market_feed with fetched data
+                market_feed.ask = best_ask_price if best_ask_price is not None and best_ask_price != 0 else market_feed.ask
+                market_feed.bid = best_bid_price if best_bid_price is not None and best_bid_price != 0 else market_feed.bid
+                market_feed.bid_volume = (
+                    best_bid_quantity if best_bid_quantity is not None and best_bid_quantity > 0 else market_feed.bid_volume
+                )
+                market_feed.ask_volume = (
+                    best_ask_quantity if best_ask_quantity is not None and best_ask_quantity > 0 else market_feed.ask_volume
+                )
+                market_feed.exchange = snapshot["Exch"]
+                market_feed.high = snapshot["High"] if snapshot["High"] > 0 else market_feed.high
+                market_feed.low = snapshot["Low"] if snapshot["Low"] > 0 else market_feed.low
+                market_feed.last = snapshot["LastRate"] if snapshot["LastRate"] > 0 else market_feed.last
+                market_feed.prior_close = snapshot["PClose"] if snapshot["PClose"] > 0 else market_feed.prior_close
+                market_feed.volume = snapshot["TotalQty"] if snapshot["TotalQty"] > 0 else market_feed.volume
+                market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                trading_logger.log_debug("Quote fetched successfully", {
+                    "long_symbol": long_symbol,
+                    "bid": market_feed.bid,
+                    "ask": market_feed.ask,
+                    "last": market_feed.last,
+                    "volume": market_feed.volume
+                })
+                
+            except Exception as e:
+                context = create_error_context(
+                    long_symbol=long_symbol,
+                    mapped_exchange=mapped_exchange,
+                    scrip_code=scrip_code,
+                    error=str(e)
+                )
+                trading_logger.log_error("Error fetching quote", e, context)
+                raise MarketDataError(f"Error fetching quote for symbol {long_symbol}: {str(e)}", context)
+
+            return market_feed
+            
+        except (ValidationError, MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error fetching quote: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        operation=lambda x: isinstance(x, str) and x in ["s", "u"],
+        symbols=lambda x: isinstance(x, list) and len(x) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
+    def start_quotes_streaming(self, operation: str, symbols=List[str], ext_callback=None, exchange="NSE"):
         """
-        holding = pd.DataFrame(self.api.holdings())
-        holding = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(holding) == 0 else holding
-        if len(holding) > 0:
-            holding["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=holding.Symbol)
-            holding = holding.loc[:, ["long_symbol", "Quantity"]]
-            holding.columns = ["long_symbol", "quantity"]
-        position = pd.DataFrame(self.api.positions())
-        position = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(position) == 0 else position
-        if len(position) > 0:
-            position["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=position.ScripName)
-            position = position.loc[:, ["long_symbol", "NetQty"]]
-            position.columns = ["long_symbol", "quantity"]
-        merged_df = pd.merge(position, holding, on="long_symbol", how="outer")
-        result = merged_df.groupby("long_symbol", as_index=False).agg({"quantity_x": "sum", "quantity_y": "sum"})
-        result["quantity"] = result.quantity_y + result.quantity_x
-        result = result.loc[:, ["long_symbol", "quantity"]]
-        if long_symbol is None:
-            return result
-        else:
-            pos = result.loc[result.long_symbol == long_symbol, "quantity"]
-            if len(pos) == 0:
-                return 0
-            elif len(pos) == 1:
-                return pos.item()
+        Start quotes streaming with enhanced error handling.
+        
+        Args:
+            operation: Operation type ("s" for subscribe, "u" for unsubscribe)
+            symbols: List of symbols to stream
+            ext_callback: External callback function
+            exchange: Exchange name. Defaults to "NSE".
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If streaming fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Starting quotes streaming", {
+                "operation": operation,
+                "symbols_count": len(symbols),
+                "exchange": exchange
+            })
+            
+            if not symbols or len(symbols) == 0:
+                context = create_error_context(
+                    symbols=symbols
+                )
+                raise ValidationError("Symbols list cannot be empty", context)
+            
+            try:
+                mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
+            except Exception as e:
+                context = create_error_context(
+                    symbols=symbols,
+                    exchange=exchange,
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to map exchange: {str(e)}", context)
+
+            def map_to_price(json_data):
+                """Map JSON data to Price object."""
+                try:
+                    price = Price()
+                    price.src = "fp"
+                    price.bid = json_data.get("BidRate", float("nan"))
+                    price.ask = json_data.get("OffRate", float("nan"))
+                    price.bid_volume = json_data.get("BidQty", float("nan"))
+                    price.ask_volume = json_data.get("OffQty", float("nan"))
+                    price.last = json_data.get("LastRate", float("nan"))
+                    price.prior_close = json_data.get("PClose", float("nan"))
+                    price.high = json_data.get("High", float("nan"))
+                    price.low = json_data.get("Low", float("nan"))
+                    price.volume = json_data.get("TotalQty", float("nan"))
+                    price.symbol = self.exchange_mappings[json_data["Exch"]]["symbol_map_reversed"].get(json_data.get("Token"))
+                    price.exchange = self.map_exchange_for_db(price.symbol, json_data["Exch"])
+                    price.timestamp = self.convert_to_ist(json_data["TickDt"])
+                    return price
+                except Exception as e:
+                    trading_logger.log_error("Error mapping price data", e, {
+                        "json_data": json_data
+                    })
+                    raise
+
+            def on_message(ws, message):
+                """Handle incoming WebSocket messages."""
+                try:
+                    data_str = message.replace("\/", "/")
+                    json_data = json.loads(data_str)
+                    if len(json_data) == 1:
+                        price = map_to_price(json_data[0])
+                        if ext_callback:
+                            ext_callback(price)
+                except Exception as e:
+                    trading_logger.log_error("Error processing WebSocket message", e, {
+                        "message": message
+                    })
+
+            def error_data(ws, err):
+                """Handle WebSocket errors."""
+                try:
+                    trading_logger.log_error("WebSocket error", {
+                        "error": str(err)
+                    })
+                    reconnect()
+                except Exception as e:
+                    trading_logger.log_error("Error handling WebSocket error", e, {
+                        "original_error": str(err)
+                    })
+
+            def reconnect():
+                """Reconnect to WebSocket."""
+                trading_logger.log_info("Attempting to reconnect...")
+                time.sleep(5)  # Wait for a few seconds before reconnecting
+                try:
+                    req_data = expand_symbols_to_request(
+                        self.subscribed_symbols
+                    )  # Store req_data for reconnection purposes
+                    connect_and_receive(req_data)
+                except Exception as e:
+                    trading_logger.log_error("Reconnection failed", e, {
+                        "subscribed_symbols": self.subscribed_symbols
+                    })
+                    reconnect()
+
+            def connect_and_receive(req_data):
+                """Connect and receive data."""
+                try:
+                    self.api.connect(req_data)
+                    self.api.receive_data(on_message)
+                    self.api.error_data(error_data)
+                except Exception as e:
+                    trading_logger.log_error("Error in connect_and_receive", e, {
+                        "req_data": req_data
+                    })
+                    raise
+
+            def expand_symbols_to_request(symbols: list):
+                """Expand symbols to request format."""
+                try:
+                    req_list = []
+                    for long_symbol in symbols:
+                        market_feed = Price()
+                        market_feed.src = "fp"
+                        market_feed.symbol = long_symbol
+                        exch_type = self.exchange_mappings[mapped_exchange]["exchangetype_map"].get(long_symbol)
+                        scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
+                        if scrip_code is None:
+                            trading_logger.log_warning("Scrip code not found for symbol", {
+                                "long_symbol": long_symbol,
+                                "mapped_exchange": mapped_exchange
+                            })
+                            continue
+                        req_list.append({"Exch": mapped_exchange, "ExchType": exch_type, "ScripCode": scrip_code})
+                    return req_list
+                except Exception as e:
+                    trading_logger.log_error("Error expanding symbols to request", e, {
+                        "symbols": symbols,
+                        "mapped_exchange": mapped_exchange
+                    })
+                    raise
+
+            def update_current_subscriptions(operation, symbols):
+                """Update current subscriptions."""
+                try:
+                    if operation == "s":
+                        self.subscribed_symbols.extend(symbols)
+                        trading_logger.log_info("Symbols subscribed", {
+                            "symbols": symbols,
+                            "total_subscribed": len(self.subscribed_symbols)
+                        })
+                    elif operation == "u":
+                        self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
+                        trading_logger.log_info("Symbols unsubscribed", {
+                            "symbols": symbols,
+                            "total_subscribed": len(self.subscribed_symbols)
+                        })
+                except Exception as e:
+                    trading_logger.log_error("Error updating subscriptions", e, {
+                        "operation": operation,
+                        "symbols": symbols
+                    })
+                    raise
+
+            try:
+                update_current_subscriptions(operation, symbols)
+                req_list = expand_symbols_to_request(symbols)
+                
+                if req_list is not None and len(req_list) > 0:
+                    req_data = self.api.Request_Feed("mf", operation, req_list)
+                    
+                    # Start the connection and receiving data in a separate thread
+                    if self.subscribe_thread is None:
+                        self.subscribe_thread = threading.Thread(
+                            target=connect_and_receive, args=(req_data,), name="MarketDataStreamer"
+                        )
+                        self.subscribe_thread.start()
+                        time.sleep(2)
+                        trading_logger.log_info("Streaming thread started", {
+                            "thread_name": "MarketDataStreamer"
+                        })
+                    else:
+                        trading_logger.log_info("Requesting streaming for existing connection", {
+                            "req_data": json.dumps(req_data)
+                        })
+                        self.api.ws.send(json.dumps(req_data))
+                else:
+                    trading_logger.log_warning("No valid request list generated", {
+                        "symbols": symbols,
+                        "req_list": req_list
+                    })
+                    
+            except Exception as e:
+                context = create_error_context(
+                    operation=operation,
+                    symbols=symbols,
+                    exchange=exchange,
+                    error=str(e)
+                )
+                raise MarketDataError(f"Error starting quotes streaming: {str(e)}", context)
+                
+        except (ValidationError, MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                operation=operation,
+                symbols=symbols,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error starting quotes streaming: {str(e)}", context)
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def stop_streaming(self):
+        """
+        Stop quotes streaming with enhanced error handling.
+        
+        Raises:
+            BrokerConnectionError: If stopping streaming fails
+        """
+        try:
+            trading_logger.log_info("Stopping quotes streaming")
+            
+            try:
+                self.api.close_data()
+                trading_logger.log_info("Streaming stopped successfully")
+            except Exception as e:
+                context = create_error_context(
+                    error=str(e)
+                )
+                raise BrokerConnectionError(f"Failed to stop streaming: {str(e)}", context)
+                
+        except BrokerConnectionError:
+            raise
+        except Exception as e:
+            context = create_error_context(
+                error=str(e)
+            )
+            raise BrokerConnectionError(f"Unexpected error stopping streaming: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0)
+    )
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def get_position(self, long_symbol: str = "") -> Union[pd.DataFrame, int]:
+        """
+        Retrieves position from FivePaisa with enhanced error handling.
+        
+        Args:
+            long_symbol: Symbol name. Defaults to "" and returns all positions
+            
+        Returns:
+            Union[pd.DataFrame, int]: Signed position if long_symbol is not None. 
+            Else dataframe containing all positions
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            MarketDataError: If position retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Getting position", {
+                "long_symbol": long_symbol if long_symbol else "all"
+            })
+            
+            # Get holdings data
+            try:
+                holding = pd.DataFrame(self.api.holdings())
+                holding = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(holding) == 0 else holding
+                if len(holding) > 0:
+                    try:
+                        holding["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=holding.Symbol)
+                        holding = holding.loc[:, ["long_symbol", "Quantity"]]
+                        holding.columns = ["long_symbol", "quantity"]
+                    except Exception as e:
+                        trading_logger.log_error("Error processing holdings data", e, {
+                            "holdings_count": len(holding)
+                        })
+                        holding = pd.DataFrame(columns=["long_symbol", "quantity"])
+            except Exception as e:
+                context = create_error_context(
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to retrieve holdings: {str(e)}", context)
+            
+            # Get positions data
+            try:
+                position = pd.DataFrame(self.api.positions())
+                position = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(position) == 0 else position
+                if len(position) > 0:
+                    try:
+                        position["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=position.ScripName)
+                        position = position.loc[:, ["long_symbol", "NetQty"]]
+                        position.columns = ["long_symbol", "quantity"]
+                    except Exception as e:
+                        trading_logger.log_error("Error processing positions data", e, {
+                            "positions_count": len(position)
+                        })
+                        position = pd.DataFrame(columns=["long_symbol", "quantity"])
+            except Exception as e:
+                context = create_error_context(
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to retrieve positions: {str(e)}", context)
+            
+            # Merge holdings and positions
+            try:
+                merged_df = pd.merge(position, holding, on="long_symbol", how="outer")
+                result = merged_df.groupby("long_symbol", as_index=False).agg({"quantity_x": "sum", "quantity_y": "sum"})
+                result["quantity"] = result.quantity_y + result.quantity_x
+                result = result.loc[:, ["long_symbol", "quantity"]]
+                
+                trading_logger.log_debug("Position data processed", {
+                    "holdings_count": len(holding),
+                    "positions_count": len(position),
+                    "merged_count": len(result)
+                })
+                
+            except Exception as e:
+                context = create_error_context(
+                    holdings_count=len(holding),
+                    positions_count=len(position),
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to merge position data: {str(e)}", context)
+            
+            # Return appropriate result
+            if long_symbol is None or long_symbol == "":
+                trading_logger.log_info("Returning all positions", {
+                    "position_count": len(result)
+                })
+                return result
             else:
-                return Exception
+                try:
+                    pos = result.loc[result.long_symbol == long_symbol, "quantity"]
+                    if len(pos) == 0:
+                        trading_logger.log_info("No position found for symbol", {
+                            "long_symbol": long_symbol
+                        })
+                        return 0
+                    elif len(pos) == 1:
+                        position_value = pos.item()
+                        trading_logger.log_info("Position retrieved for symbol", {
+                            "long_symbol": long_symbol,
+                            "quantity": position_value
+                        })
+                        return position_value
+                    else:
+                        context = create_error_context(
+                            long_symbol=long_symbol,
+                            position_count=len(pos)
+                        )
+                        raise MarketDataError(f"Multiple positions found for symbol: {long_symbol}", context)
+                except Exception as e:
+                    if isinstance(e, MarketDataError):
+                        raise
+                    context = create_error_context(
+                        long_symbol=long_symbol,
+                        result_data=str(result),
+                        error=str(e)
+                    )
+                    raise MarketDataError(f"Error retrieving position for symbol: {str(e)}", context)
+                    
+        except (ValidationError, MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error getting position: {str(e)}", context)
 
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_orders_today(self, **kwargs) -> pd.DataFrame:
-        orders = self.api.order_book()
-        orders = pd.DataFrame.from_dict(orders)
-        if len(orders.index) > 0:
-            orders = orders.assign(long_symbol=self.get_long_name_from_broker_identifier(ScripName=orders.ScripName))
-            return orders
-        else:
-            return None
+        """
+        Get today's orders with enhanced error handling.
+        
+        Returns:
+            pd.DataFrame: DataFrame containing today's orders or None if no orders
+            
+        Raises:
+            MarketDataError: If order retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Getting orders for today")
+            
+            try:
+                orders = self.api.order_book()
+                orders = pd.DataFrame.from_dict(orders)
+                
+                if len(orders.index) > 0:
+                    try:
+                        orders = orders.assign(long_symbol=self.get_long_name_from_broker_identifier(ScripName=orders.ScripName))
+                        trading_logger.log_info("Orders retrieved successfully", {
+                            "order_count": len(orders)
+                        })
+                        return orders
+                    except Exception as e:
+                        trading_logger.log_error("Error processing orders data", e, {
+                            "order_count": len(orders)
+                        })
+                        return None
+                else:
+                    trading_logger.log_info("No orders found for today")
+                    return None
+                    
+            except Exception as e:
+                context = create_error_context(
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to retrieve orders: {str(e)}", context)
+                
+        except (MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error getting orders: {str(e)}", context)
 
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_trades_today(self, **kwargs) -> pd.DataFrame:
-        trades = self.api.get_tradebook()
-        trades = pd.DataFrame.from_dict(trades)
-        if len(trades) > 0:
-            trades = trades.loc[trades.Status == 0, "TradeBookDetail"]
-            trades = pd.DataFrame([trade for trade in trades])
-            trades.ExchangeTradeTime = trades.ExchangeTradeTime.apply(self._convert_date_string)
-            trades = trades.assign(long_symbol=self.get_long_name_from_broker_identifier(ScripName=trades.ScripName))
-            return trades
-        else:
-            return None
+        """
+        Get today's trades with enhanced error handling.
+        
+        Returns:
+            pd.DataFrame: DataFrame containing today's trades or None if no trades
+            
+        Raises:
+            MarketDataError: If trade retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Getting trades for today")
+            
+            try:
+                trades = self.api.get_tradebook()
+                trades = pd.DataFrame.from_dict(trades)
+                
+                if len(trades) > 0:
+                    try:
+                        trades = trades.loc[trades.Status == 0, "TradeBookDetail"]
+                        trades = pd.DataFrame([trade for trade in trades])
+                        trades.ExchangeTradeTime = trades.ExchangeTradeTime.apply(self._convert_date_string)
+                        trades = trades.assign(long_symbol=self.get_long_name_from_broker_identifier(ScripName=trades.ScripName))
+                        
+                        trading_logger.log_info("Trades retrieved successfully", {
+                            "trade_count": len(trades)
+                        })
+                        return trades
+                    except Exception as e:
+                        trading_logger.log_error("Error processing trades data", e, {
+                            "trade_count": len(trades)
+                        })
+                        return None
+                else:
+                    trading_logger.log_info("No trades found for today")
+                    return None
+                    
+            except Exception as e:
+                context = create_error_context(
+                    error=str(e)
+                )
+                raise MarketDataError(f"Failed to retrieve trades: {str(e)}", context)
+                
+        except (MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                error=str(e)
+            )
+            raise MarketDataError(f"Unexpected error getting trades: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        ScripName=lambda x: isinstance(x, pd.Series) and len(x) > 0
+    )
     def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
         """
-        Generates Long Name.
-
+        Generates Long Name with enhanced error handling.
+        
         Args:
             kwargs: Arbitrary keyword arguments. Expected key:
                 - ScripName (pd.Series): position.ScripName from 5paisa position.
-
+                
         Returns:
             pd.Series: Long name.
-        """
-        ScripName = kwargs.get("ScripName")
-        if ScripName is None:
-            raise ValueError("Missing required argument: 'ScripName'")
-        ScripName = ScripName.reset_index(drop=True)
-        symbol = ScripName.str.split().str[0]
-        sec_type = pd.Series("", index=np.arange(len(ScripName)))
-        expiry = pd.Series("", index=np.arange(len(ScripName)))
-        right = pd.Series("", index=np.arange(len(ScripName)))
-        strike = pd.Series("", index=np.arange(len(ScripName)))
-        type_map = {
-            6: "OPT",
-            4: "FUT",
-            1: "STK",
-        }
-        sec_types = ScripName.str.split().str.len().map(type_map)
-        for idx, sec_type in enumerate(sec_types):
-            if sec_type == "OPT":
-                expiry.iloc[idx] = pd.to_datetime(("-").join(ScripName[idx].split()[1:4])).strftime("%Y%m%d")
-                right_map = {
-                    "PE": "PUT",
-                    "CE": "CALL",
-                }
-                right.iloc[idx] = right_map.get(ScripName[idx].split()[4])
-                strike.iloc[idx] = ScripName[idx].split()[5].strip("0").strip(".")
-            elif sec_type == "FUT":
-                expiry.iloc[idx] = pd.to_datetime(("-").join(ScripName[idx].split()[1:4])).strftime("%Y%m%d")
-
-        return symbol + "_" + sec_types + "_" + expiry + "_" + right + "_" + strike
-
-    def _get_exchange_order_id(self, broker_order_id: str, order: Order = Order(), delete: bool = True) -> str:
-        """Retrieves exchange order id for trades executed today.
-
-        Args:
-            broker_order_id (str): broker order id
-            order (Order, optional): Order object. Defaults to None.
-            delete (bool, optional): if True, broker order id is deleted from redis, if no exchange order id is found
-            Defaults to True.
-
-        Returns:
-            str: exchange order if available, else empty string
-        """
-
-        def get_exchange_order_id_from_orders(broker_order_id: str) -> str:
-            orders = pd.DataFrame(self.api.order_book())
-            fivepaisa_order = orders[orders.BrokerOrderId == int(broker_order_id)]
-            if len(fivepaisa_order) == 1:
-                return str(fivepaisa_order.ExchOrderID.item())
-            else:
-                logger.error(f"Trade {broker_order_id} did not exist in 5paisa.")
-                return "0"
-
-        exch_order_id = "0"
-        if order is None:
-            order = Order(**self.redis_o.hgetall(broker_order_id))
-        if order.exch_order_id not in ["0", "None", 0, None]:
-            return order.exch_order_id
-        else:
-            exch = order.exchange
-            if exch != "M":
-                remote_order_id = order.remote_order_id
-            else:
-                remote_order_id = broker_order_id
-            req_list_ = [{"Exch": exch, "RemoteOrderID": remote_order_id}]
-            status = self.api.fetch_order_status(req_list_)
-            if status is not None and len(status["OrdStatusResLst"]) > 0:
-                for sub_status in status["OrdStatusResLst"]:
-                    if str(sub_status.get("ScripCode")) == str(order.scrip_code):
-                        exch_order_id = str(sub_status.get("ExchOrderID") or "")
-                        logger.info(f"Retrieving Exchange ID {exch_order_id}")
-                        return exch_order_id
-
-            exch_order_id = get_exchange_order_id_from_orders(broker_order_id)
-            if exch_order_id not in ["0", "None", 0, ""]:
-                return exch_order_id
-            else:
-                logger.error(f"Order for {broker_order_id} did not exist in 5paisa orderbook.")
-                if delete:
-                    logger.error(
-                        f"Deleting {broker_order_id} "
-                        f"for intenal order {self.redis_o.hget(broker_order_id, 'orderRef')}"
-                    )
-                    delete_broker_order_id(self, self.redis_o.hget(broker_order_id, "orderRef"), broker_order_id)
-                return "0"
-
-    def _convert_date_string(self, date_string: str) -> dt.datetime:
-        """convert 5paisa datestring in positions/orders to datetime
-
-        Args:
-            date_string (str): 5paisa datetime string
-
+            
         Raises:
-            ValueError: _description_
+            ValidationError: If parameters are invalid
+            DataError: If data processing fails
+        """
+        try:
+            trading_logger.log_info("Generating long name from broker identifier", {
+                "scrip_name_count": len(kwargs.get("ScripName", pd.Series()))
+            })
+            
+            ScripName = kwargs.get("ScripName")
+            if ScripName is None:
+                context = create_error_context(
+                    available_keys=list(kwargs.keys())
+                )
+                raise ValidationError("Missing required argument: 'ScripName'", context)
+            
+            if not isinstance(ScripName, pd.Series) or len(ScripName) == 0:
+                context = create_error_context(
+                    scrip_name_type=type(ScripName),
+                    scrip_name_length=len(ScripName) if hasattr(ScripName, '__len__') else None
+                )
+                raise ValidationError("ScripName must be a non-empty pandas Series", context)
+            
+            try:
+                ScripName = ScripName.reset_index(drop=True)
+                symbol = ScripName.str.split().str[0]
+                sec_type = pd.Series("", index=np.arange(len(ScripName)))
+                expiry = pd.Series("", index=np.arange(len(ScripName)))
+                right = pd.Series("", index=np.arange(len(ScripName)))
+                strike = pd.Series("", index=np.arange(len(ScripName)))
+                
+                type_map = {
+                    6: "OPT",
+                    4: "FUT",
+                    1: "STK",
+                }
+                sec_types = ScripName.str.split().str.len().map(type_map)
+                
+                for idx, sec_type in enumerate(sec_types):
+                    try:
+                        if sec_type == "OPT":
+                            expiry.iloc[idx] = pd.to_datetime(("-").join(ScripName[idx].split()[1:4])).strftime("%Y%m%d")
+                            right_map = {
+                                "PE": "PUT",
+                                "CE": "CALL",
+                            }
+                            right.iloc[idx] = right_map.get(ScripName[idx].split()[4])
+                            strike.iloc[idx] = ScripName[idx].split()[5].strip("0").strip(".")
+                        elif sec_type == "FUT":
+                            expiry.iloc[idx] = pd.to_datetime(("-").join(ScripName[idx].split()[1:4])).strftime("%Y%m%d")
+                    except Exception as e:
+                        trading_logger.log_warning("Error processing scrip name", {
+                            "index": idx,
+                            "scrip_name": ScripName[idx] if idx < len(ScripName) else None,
+                            "error": str(e)
+                        })
+                
+                result = symbol + "_" + sec_types + "_" + expiry + "_" + right + "_" + strike
+                
+                trading_logger.log_debug("Long name generated successfully", {
+                    "input_count": len(ScripName),
+                    "output_count": len(result)
+                })
+                
+                return result
+                
+            except Exception as e:
+                context = create_error_context(
+                    scrip_name_sample=ScripName.head(3).tolist() if len(ScripName) > 0 else None,
+                    error=str(e)
+                )
+                raise DataError(f"Error processing scrip names: {str(e)}", context)
+                
+        except (ValidationError, DataError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                kwargs=kwargs,
+                error=str(e)
+            )
+            raise DataError(f"Unexpected error generating long name: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        delete=lambda x: isinstance(x, bool)
+    )
+    def _get_exchange_order_id(self, broker_order_id: str, order: Order = Order(), delete: bool = True) -> str:
+        """
+        Retrieves exchange order id for trades executed today with enhanced error handling.
+        
+        Args:
+            broker_order_id: Broker order ID
+            order: Order object. Defaults to empty Order.
+            delete: If True, broker order id is deleted from redis if no exchange order id is found. Defaults to True.
+            
+        Returns:
+            str: Exchange order ID if available, else "0"
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            OrderError: If order retrieval fails
+            BrokerConnectionError: If broker connection issues
+        """
+        try:
+            trading_logger.log_info("Getting exchange order ID", {
+                "broker_order_id": broker_order_id,
+                "delete": delete
+            })
+            
+            def get_exchange_order_id_from_orders(broker_order_id: str) -> str:
+                """Get exchange order ID from order book."""
+                try:
+                    orders = pd.DataFrame(self.api.order_book())
+                    fivepaisa_order = orders[orders.BrokerOrderId == int(broker_order_id)]
+                    if len(fivepaisa_order) == 1:
+                        exch_order_id = str(fivepaisa_order.ExchOrderID.item())
+                        trading_logger.log_debug("Exchange order ID found in order book", {
+                            "broker_order_id": broker_order_id,
+                            "exch_order_id": exch_order_id
+                        })
+                        return exch_order_id
+                    else:
+                        trading_logger.log_warning("Trade not found in order book", {
+                            "broker_order_id": broker_order_id,
+                            "order_count": len(fivepaisa_order)
+                        })
+                        return "0"
+                except Exception as e:
+                    trading_logger.log_error("Error getting exchange order ID from orders", e, {
+                        "broker_order_id": broker_order_id
+                    })
+                    return "0"
+
+            exch_order_id = "0"
+            
+            # Get order from Redis if not provided
+            if order is None or not order.internal_order_id:
+                try:
+                    order_data = self.redis_o.hgetall(broker_order_id)
+                    if not order_data:
+                        context = create_error_context(
+                            broker_order_id=broker_order_id
+                        )
+                        raise OrderError("Order not found in Redis", context)
+                    order = Order(**order_data)
+                except Exception as e:
+                    context = create_error_context(
+                        broker_order_id=broker_order_id,
+                        error=str(e)
+                    )
+                    raise OrderError(f"Failed to retrieve order from Redis: {str(e)}", context)
+            
+            # Check if order already has exchange order ID
+            if order.exch_order_id not in ["0", "None", 0, None]:
+                trading_logger.log_debug("Order already has exchange order ID", {
+                    "broker_order_id": broker_order_id,
+                    "exch_order_id": order.exch_order_id
+                })
+                return order.exch_order_id
+            else:
+                # Try to get exchange order ID from API
+                try:
+                    exch = order.exchange
+                    if exch != "M":
+                        remote_order_id = order.remote_order_id
+                    else:
+                        remote_order_id = broker_order_id
+                    
+                    req_list_ = [{"Exch": exch, "RemoteOrderID": remote_order_id}]
+                    status = self.api.fetch_order_status(req_list_)
+                    
+                    if status is not None and len(status.get("OrdStatusResLst", [])) > 0:
+                        for sub_status in status["OrdStatusResLst"]:
+                            if str(sub_status.get("ScripCode")) == str(order.scrip_code):
+                                exch_order_id = str(sub_status.get("ExchOrderID") or "")
+                                trading_logger.log_info("Retrieved exchange order ID from API", {
+                                    "broker_order_id": broker_order_id,
+                                    "exch_order_id": exch_order_id
+                                })
+                                return exch_order_id
+                    else:
+                        trading_logger.log_warning("No order status found from API", {
+                            "broker_order_id": broker_order_id,
+                            "exchange": exch,
+                            "remote_order_id": remote_order_id
+                        })
+                        
+                except Exception as e:
+                    trading_logger.log_error("Error fetching order status from API", e, {
+                        "broker_order_id": broker_order_id,
+                        "exchange": order.exchange
+                    })
+
+                # Try to get from order book
+                exch_order_id = get_exchange_order_id_from_orders(broker_order_id)
+                if exch_order_id not in ["0", "None", 0, ""]:
+                    trading_logger.log_info("Exchange order ID found in order book", {
+                        "broker_order_id": broker_order_id,
+                        "exch_order_id": exch_order_id
+                    })
+                    return exch_order_id
+                else:
+                    trading_logger.log_warning("Order not found in order book", {
+                        "broker_order_id": broker_order_id
+                    })
+                    
+                    if delete:
+                        try:
+                            internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
+                            trading_logger.log_info("Deleting broker order ID", {
+                                "broker_order_id": broker_order_id,
+                                "internal_order_id": internal_order_id
+                            })
+                            delete_broker_order_id(self, internal_order_id, broker_order_id)
+                        except Exception as e:
+                            trading_logger.log_error("Error deleting broker order ID", e, {
+                                "broker_order_id": broker_order_id
+                            })
+                    
+                    return "0"
+                    
+        except (ValidationError, OrderError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                broker_order_id=broker_order_id,
+                delete=delete,
+                error=str(e)
+            )
+            raise OrderError(f"Unexpected error getting exchange order ID: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        date_string=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
+    def _convert_date_string(self, date_string: str) -> dt.datetime:
+        """
+        Convert 5paisa datestring in positions/orders to datetime with enhanced error handling.
+        
+        Args:
+            date_string: 5paisa datetime string
+            
         Returns:
             dt.datetime: datetime object
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            DataError: If date conversion fails
         """
-        # Extract timestamp and timezone offset from the string
-        # match = re.match(r"/Date\((\d+)([-+]\d{2})(\d{2})\)/", date_string)
-        pattern = r"/Date\((\d+)([+-]\d{4})\)/"
-        match = re.match(pattern, date_string)
-        if match:
-            timestamp = int(match.group(1))
-            # timezone_hours = int(match.group(2))
-            # timezone_minutes = int(match.group(3))
-            # Create a datetime object using the timestamp and timezone offset
-            temp = dt.datetime.fromtimestamp(timestamp / 1000)
-            return temp
-        else:
-            logger.error("incorrect datestring format: {date_string}")
-            time.time()
-            return dt.datetime(1970, 1, 1)
+        try:
+            trading_logger.log_debug("Converting date string", {
+                "date_string": date_string
+            })
+            
+            if not date_string or not isinstance(date_string, str):
+                context = create_error_context(
+                    date_string=date_string,
+                    date_string_type=type(date_string)
+                )
+                raise ValidationError("Invalid date string", context)
+            
+            # Extract timestamp and timezone offset from the string
+            pattern = r"/Date\((\d+)([+-]\d{4})\)/"
+            match = re.match(pattern, date_string)
+            
+            if match:
+                try:
+                    timestamp = int(match.group(1))
+                    # Create a datetime object using the timestamp
+                    result = dt.datetime.fromtimestamp(timestamp / 1000)
+                    
+                    trading_logger.log_debug("Date string converted successfully", {
+                        "date_string": date_string,
+                        "timestamp": timestamp,
+                        "result": result.isoformat()
+                    })
+                    
+                    return result
+                except (ValueError, OverflowError) as e:
+                    context = create_error_context(
+                        date_string=date_string,
+                        timestamp=timestamp if 'timestamp' in locals() else None,
+                        error=str(e)
+                    )
+                    raise DataError(f"Error converting timestamp: {str(e)}", context)
+            else:
+                trading_logger.log_warning("Incorrect date string format", {
+                    "date_string": date_string,
+                    "expected_pattern": pattern
+                })
+                return dt.datetime(1970, 1, 1)
+                
+        except (ValidationError, DataError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                date_string=date_string,
+                error=str(e)
+            )
+            raise DataError(f"Unexpected error converting date string: {str(e)}", context)
 
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    )
     def get_min_lot_size(self, long_symbol, exchange="N") -> int:
-        exchange = self.map_exchange_for_api(long_symbol, exchange)
-        code = self.exchange_mappings[exchange]["symbol_map"].get(long_symbol)
-        if code is not None:
-            return self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
-        else:
-            return 0
+        """
+        Get minimum lot size for a symbol with enhanced error handling.
+        
+        Args:
+            long_symbol: Trading symbol
+            exchange: Exchange name. Defaults to "N".
+            
+        Returns:
+            int: Minimum lot size for the symbol
+            
+        Raises:
+            ValidationError: If parameters are invalid
+            SymbolError: If symbol lookup fails
+        """
+        try:
+            trading_logger.log_info("Getting minimum lot size", {
+                "long_symbol": long_symbol,
+                "exchange": exchange
+            })
+            
+            try:
+                exchange = self.map_exchange_for_api(long_symbol, exchange)
+            except Exception as e:
+                context = create_error_context(
+                    long_symbol=long_symbol,
+                    exchange=exchange,
+                    error=str(e)
+                )
+                raise SymbolError(f"Failed to map exchange: {str(e)}", context)
+            
+            try:
+                code = self.exchange_mappings[exchange]["symbol_map"].get(long_symbol)
+            except KeyError as e:
+                context = create_error_context(
+                    exchange=exchange,
+                    long_symbol=long_symbol,
+                    available_exchanges=list(self.exchange_mappings.keys())
+                )
+                raise SymbolError(f"Exchange mapping not found: {str(e)}", context)
+            
+            if code is not None:
+                try:
+                    lot_size = self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
+                    trading_logger.log_debug("Lot size retrieved successfully", {
+                        "long_symbol": long_symbol,
+                        "exchange": exchange,
+                        "code": code,
+                        "lot_size": lot_size
+                    })
+                    return lot_size
+                except Exception as e:
+                    trading_logger.log_warning("Error retrieving lot size from codes", {
+                        "long_symbol": long_symbol,
+                        "exchange": exchange,
+                        "code": code,
+                        "error": str(e)
+                    })
+                    return 0
+            else:
+                trading_logger.log_warning("Symbol code not found", {
+                    "long_symbol": long_symbol,
+                    "exchange": exchange
+                })
+                return 0
+                
+        except (ValidationError, SymbolError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                long_symbol=long_symbol,
+                exchange=exchange,
+                error=str(e)
+            )
+            raise SymbolError(f"Unexpected error getting minimum lot size: {str(e)}", context)
