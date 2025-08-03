@@ -16,6 +16,31 @@ from .exceptions import (
 )
 from . import trading_logger
 
+# Global flag to disable execution time logging for debugging
+DISABLE_EXECUTION_TIME_LOGGING = False
+
+# Global flag to disable retry functionality for debugging
+DISABLE_RETRY = False
+
+def set_execution_time_logging(enabled: bool = True):
+    """Enable or disable execution time logging globally.
+    
+    Args:
+        enabled: If True, enable execution time logging. If False, disable it.
+    """
+    global DISABLE_EXECUTION_TIME_LOGGING
+    DISABLE_EXECUTION_TIME_LOGGING = not enabled
+
+def set_retry_enabled(enabled: bool = True):
+    """Enable or disable retry functionality globally.
+    
+    Args:
+        enabled: If True, enable retry functionality. If False, disable it.
+    """
+    global DISABLE_RETRY
+    DISABLE_RETRY = not enabled
+
+
 
 def retry_on_error(
     max_retries: int = 3,
@@ -39,6 +64,10 @@ def retry_on_error(
         on_final_failure: Optional callback called on final failure.
     """
     def decorator(func: Callable) -> Callable:
+        # Skip retry logic if disabled globally
+        if DISABLE_RETRY:
+            return func
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             last_exception = None
@@ -173,17 +202,6 @@ def validate_inputs(**validations: Dict[str, Any]) -> Callable:
     return decorator
 
 
-# Global flag to disable execution time logging for debugging
-DISABLE_EXECUTION_TIME_LOGGING = False
-
-def set_execution_time_logging(enabled: bool = True):
-    """Enable or disable execution time logging globally.
-    
-    Args:
-        enabled: If True, enable execution time logging. If False, disable it.
-    """
-    global DISABLE_EXECUTION_TIME_LOGGING
-    DISABLE_EXECUTION_TIME_LOGGING = not enabled
 
 def log_execution_time(func: Callable) -> Callable:
     """Decorator to log function execution time.

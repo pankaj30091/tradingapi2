@@ -642,6 +642,11 @@ class Shoonya(BrokerBase):
                 "symbol_map_reversed": dict(zip(group["Scripcode"], group["long_symbol"])),
                 "tradingsymbol_map": dict(zip(group["long_symbol"], group["trading_symbol"])),
             }
+        trading_logger.log_info("Symbology update completed", {
+            "total_exchanges": len(self.exchange_mappings),
+            "total_symbols": len(codes),
+        })
+
         return codes
 
     def log_and_return(self, any_object):
