@@ -898,6 +898,8 @@ def get_open_position_by_order(
             sq_off_order.message = "Expiration Paper Order"
             sq_off_order.status = OrderStatus.FILLED
             sq_off_order.long_symbol = symbol
+            sq_off_order.scrip_code = hget_with_default(broker, entry_key, "scrip_code", "0")
+            sq_off_order.price_type = "LMT*1"
             _process_broker_order_update(broker, sq_off_order, symbol)
         return expire
 

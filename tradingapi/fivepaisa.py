@@ -456,7 +456,7 @@ class FivePaisa(BrokerBase):
     )
     def connect(self, redis_db: int):
         """
-        Connect to FivePaisa trading platform with enhanced error handling.
+        Connect to FivePaisa trading platform with enhanced session management.
         
         Args:
             redis_db: Redis database number
@@ -494,6 +494,188 @@ class FivePaisa(BrokerBase):
                 )
                 raise AuthenticationError(f"Error extracting credentials: {str(e)}", context)
 
+        def _verify_session(self):
+            """Verify if the current session is valid using existing is_connected method."""
+            return self.is_connected()
+
+        def _restore_session_from_token(susertoken_path):
+            """Attempt to restore session from existing token."""
+            try:
+                client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+                if not client_id:
+                    trading_logger.log_warning("CLIENT_ID not configured for session restore", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                
+                with open(susertoken_path, "r") as file:
+                    susertoken = file.read().strip()
+                
+                if not susertoken:
+                    trading_logger.log_warning("Empty token file", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                
+                self.api = FivePaisaClient(cred=extract_credentials())
+                self.api.set_access_token(susertoken, client_id)
+                
+                # Verify the session is actually working
+                if _verify_session(self):
+                    trading_logger.log_info("Session restored from token", {
+                        "broker": self.broker.name
+                    })
+                    return True
+                else:
+                    trading_logger.log_warning("Session restoration failed - token may be invalid", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                    
+            except Exception as e:
+                trading_logger.log_warning("Failed to restore session", e, {
+                    "broker": self.broker.name
+                })
+                return False
+
+        def _fresh_login(susertoken_path):
+            """Perform fresh login with TOTP retry logic."""
+            try:
+                trading_logger.log_info("Performing fresh login", {
+                    "broker": self.broker.name
+                })
+                
+                self.api = FivePaisaClient(cred=extract_credentials())
+                max_attempts = 5
+                
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        trading_logger.log_info(f"Fresh login attempt {attempt}/{max_attempts}", {
+                            "broker": self.broker.name
+                        })
+                        
+                        totp_token = config.get(f"{self.broker.name}.TOTP_TOKEN")
+                        if not totp_token:
+                            raise AuthenticationError("TOTP_TOKEN not configured")
+                        
+                        otp = pyotp.TOTP(totp_token).now()
+                        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+                        pin = config.get(f"{self.broker.name}.PIN")
+                        
+                        if not client_id or not pin:
+                            raise AuthenticationError("CLIENT_ID or PIN not configured")
+                        
+                        self.api.get_totp_session(client_id, otp, pin)
+                        
+                        if self.api.access_token:
+                            trading_logger.log_info("Fresh login successful", {
+                                "broker": self.broker.name,
+                                "attempt": attempt
+                            })
+                            
+                            susertoken = self.api.access_token
+                            
+                            # Save token
+                            try:
+                                with open(susertoken_path, "w") as file:
+                                    file.write(susertoken)
+                                trading_logger.log_info("Token saved successfully", {
+                                    "broker": self.broker.name
+                                })
+                                return  # Success, exit retry loop
+                            except Exception as e:
+                                trading_logger.log_warning("Failed to save token", e, {
+                                    "broker": self.broker.name,
+                                    "susertoken_path": susertoken_path
+                                })
+                                # Continue even if save fails, as we have a valid session
+                                return
+                        else:
+                            trading_logger.log_warning("Login attempt failed - no access token", {
+                                "broker": self.broker.name,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts
+                            })
+                            if attempt < max_attempts:
+                                time.sleep(40)  # Wait for fresh TOTP
+                            else:
+                                raise AuthenticationError("Login failed - no access token received")
+                                
+                    except Exception as e:
+                        trading_logger.log_error(f"Login attempt {attempt} failed", e, {
+                            "broker": self.broker.name,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts
+                        })
+                        if attempt < max_attempts:
+                            time.sleep(40)  # Wait for fresh TOTP
+                        else:
+                            raise AuthenticationError(f"Fresh login failed after {max_attempts} attempts: {str(e)}")
+                            
+            except Exception as e:
+                context = create_error_context(
+                    susertoken_path=susertoken_path,
+                    error=str(e)
+                )
+                raise AuthenticationError(f"Error in _fresh_login: {str(e)}", context)
+
+        def get_connected():
+            """Main connection logic with robust session management."""
+            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            
+            if not susertoken_path:
+                context = create_error_context(
+                    broker_name=self.broker.name,
+                    config_keys=list(config.keys())
+                )
+                raise BrokerConnectionError("USERTOKEN path not configured", context)
+            
+            # Check if we can use existing token
+            if os.path.exists(susertoken_path):
+                try:
+                    mod_time = os.path.getmtime(susertoken_path)
+                    mod_datetime = dt.datetime.fromtimestamp(mod_time)
+                    today = dt.datetime.now().date()
+                    
+                    if mod_datetime.date() == today:
+                        trading_logger.log_info("Attempting to use existing token", {
+                            "broker": self.broker.name,
+                            "token_date": mod_datetime.date()
+                        })
+                        
+                        # Try to restore session from token
+                        if _restore_session_from_token(susertoken_path):
+                            return True  # Successfully connected using existing token
+                        else:
+                            trading_logger.log_info("Existing token failed verification, performing fresh login", {
+                                "broker": self.broker.name
+                            })
+                            # Fall back to fresh login
+                            _fresh_login(susertoken_path)
+                            return True
+                    else:
+                        trading_logger.log_info("Token is from previous day, performing fresh login", {
+                            "broker": self.broker.name,
+                            "token_date": mod_datetime.date(),
+                            "today": today
+                        })
+                        _fresh_login(susertoken_path)
+                        return True
+                        
+                except Exception as e:
+                    trading_logger.log_warning("Error checking token file, performing fresh login", e, {
+                        "broker": self.broker.name,
+                        "susertoken_path": susertoken_path
+                    })
+                    _fresh_login(susertoken_path)
+                    return True
+            else:
+                trading_logger.log_info("No existing token found, performing fresh login", {
+                    "broker": self.broker.name
+                })
+                _fresh_login(susertoken_path)
+                return True
+
         try:
             trading_logger.log_info("Connecting to FivePaisa", {
                 "redis_db": redis_db,
@@ -510,122 +692,25 @@ class FivePaisa(BrokerBase):
             # Update symbology
             try:
                 self.codes = self.update_symbology()
+                trading_logger.log_debug("Symbology updated successfully", {
+                    "codes_shape": self.codes.shape if hasattr(self.codes, 'shape') else None
+                })
             except Exception as e:
                 trading_logger.log_warning("Failed to update symbology", {
                     "error": str(e)
                 })
             
-            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
-            logged_in_user = False
-            
-            # Try to use existing token
-            if os.path.exists(susertoken_path):
-                try:
-                    mod_time = os.path.getmtime(susertoken_path)
-                    mod_datetime = dt.datetime.fromtimestamp(mod_time)
-                    today = dt.datetime.now().date()
-                    
-                    if mod_datetime.date() == today:
-                        with open(susertoken_path, "r") as file:
-                            susertoken = file.read().strip()
-                        
-                        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
-                        if not client_id:
-                            raise AuthenticationError("CLIENT_ID not configured")
-                        
-                        self.api = FivePaisaClient(cred=extract_credentials())
-                        self.api.set_access_token(susertoken, client_id)
-                        
-                        if self.api.Login_check() == ".ASPXAUTH=None":
-                            logged_in_user = False
-                            trading_logger.log_warning("Existing token is invalid", {
-                                "susertoken_path": susertoken_path
-                            })
-                        else:
-                            logged_in_user = True
-                            trading_logger.log_info("Successfully used existing token", {
-                                "susertoken_path": susertoken_path
-                            })
-                except Exception as e:
-                    trading_logger.log_warning("Failed to use existing token", {
-                        "susertoken_path": susertoken_path,
-                        "error": str(e)
-                    })
-                    logged_in_user = False
-            
-            # Login with new token if needed
-            if not logged_in_user:
-                try:
-                    self.api = FivePaisaClient(cred=extract_credentials())
-                    max_attempts = 5
-                    
-                    for attempt in range(1, max_attempts + 1):
-                        try:
-                            totp_token = config.get(f"{self.broker.name}.TOTP_TOKEN")
-                            if not totp_token:
-                                raise AuthenticationError("TOTP_TOKEN not configured")
-                            
-                            otp = pyotp.TOTP(totp_token).now()
-                            client_id = config.get(f"{self.broker.name}.CLIENT_ID")
-                            pin = config.get(f"{self.broker.name}.PIN")
-                            
-                            if not client_id or not pin:
-                                raise AuthenticationError("CLIENT_ID or PIN not configured")
-                            
-                            self.api.get_totp_session(client_id, otp, pin)
-                            
-                            if self.api.access_token:
-                                trading_logger.log_info("Connected successfully", {
-                                    "attempt": attempt,
-                                    "max_attempts": max_attempts
-                                })
-                                susertoken = self.api.access_token
-                                
-                                # Save token
-                                try:
-                                    with open(susertoken_path, "w") as file:
-                                        file.write(susertoken)
-                                    logged_in_user = True
-                                    break
-                                except Exception as e:
-                                    trading_logger.log_warning("Failed to save token", {
-                                        "susertoken_path": susertoken_path,
-                                        "error": str(e)
-                                    })
-                            else:
-                                trading_logger.log_warning("Login attempt failed", {
-                                    "attempt": attempt,
-                                    "max_attempts": max_attempts
-                                })
-                                if attempt < max_attempts:
-                                    time.sleep(40)
-                        except Exception as e:
-                            trading_logger.log_error("Error during login attempt", e, {
-                                "attempt": attempt,
-                                "max_attempts": max_attempts
-                            })
-                            if attempt < max_attempts:
-                                time.sleep(40)
-                    
-                    if not logged_in_user:
-                        context = create_error_context(
-                            max_attempts=max_attempts,
-                            broker_name=self.broker.name
-                        )
-                        raise AuthenticationError("Failed to obtain access token after all attempts", context)
-                        
-                except Exception as e:
-                    context = create_error_context(
-                        broker_name=self.broker.name,
-                        error=str(e)
-                    )
-                    raise AuthenticationError(f"Login failed: {str(e)}", context)
+            # Get connected using robust session management
+            get_connected()
             
             # Set up Redis connection
             try:
                 self.redis_o = redis.Redis(db=redis_db, charset="utf-8", decode_responses=True)
                 # Test Redis connection
                 self.redis_o.ping()
+                trading_logger.log_debug("Redis connection established", {
+                    "redis_db": redis_db
+                })
             except Exception as e:
                 context = create_error_context(
                     redis_db=redis_db,
@@ -636,6 +721,9 @@ class FivePaisa(BrokerBase):
             # Set starting order IDs
             try:
                 self.starting_order_ids_int = set_starting_internal_ids_int(redis_db=self.redis_o)
+                trading_logger.log_debug("Starting order IDs set", {
+                    "starting_order_ids_int": self.starting_order_ids_int
+                })
             except Exception as e:
                 trading_logger.log_warning("Failed to set starting order IDs", {
                     "error": str(e),
@@ -643,7 +731,6 @@ class FivePaisa(BrokerBase):
                 })
 
             trading_logger.log_info("Successfully connected to FivePaisa", {
-                "logged_in_user": logged_in_user,
                 "redis_db": redis_db
             })
             return True

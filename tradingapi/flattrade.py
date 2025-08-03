@@ -381,7 +381,7 @@ class FlatTrade(BrokerBase):
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     def connect(self, redis_db: int):
         """
-        Connect to FlatTrade trading platform with enhanced error handling.
+        Connect to FlatTrade trading platform with enhanced session management.
         
         Args:
             redis_db: Redis database number
@@ -418,6 +418,47 @@ class FlatTrade(BrokerBase):
                 )
                 raise AuthenticationError(f"Error extracting credentials: {str(e)}", context)
 
+        def _verify_session(self):
+            """Verify if the current session is valid using existing is_connected method."""
+            return self.is_connected()
+
+        def _restore_session_from_token(susertoken_path):
+            """Attempt to restore session from existing token."""
+            try:
+                credentials = extract_credentials()
+                user = credentials["user"]
+                pwd = credentials["pwd"]
+                
+                with open(susertoken_path, "r") as file:
+                    susertoken = file.read().strip()
+                
+                if not susertoken:
+                    trading_logger.log_warning("Empty token file", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                
+                self.api = FlatTradeApiPy()
+                self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
+                
+                # Verify the session is actually working
+                if _verify_session(self):
+                    trading_logger.log_info("Session restored from token", {
+                        "broker": self.broker.name
+                    })
+                    return True
+                else:
+                    trading_logger.log_warning("Session restoration failed - token may be invalid", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                    
+            except Exception as e:
+                trading_logger.log_warning("Failed to restore session", e, {
+                    "broker": self.broker.name
+                })
+                return False
+
         def _fresh_login(susertoken_path):
             """Perform fresh login with enhanced error handling."""
             try:
@@ -453,17 +494,18 @@ class FlatTrade(BrokerBase):
                     encoded_item = hashlib.sha256(item.encode()).hexdigest()
                     return encoded_item
 
-                async def get_authcode():
+                def get_authcode():
                     try:
-                        async with httpx.AsyncClient(http2=True, headers=headers) as client:
-                            response = await client.post(routes["session"])
+                        with requests.Session() as session:
+                            session.headers.update(headers)
+                            response = session.post(routes["session"])
                             if response.status_code == 200:
                                 sid = response.text
                                 trading_logger.log_debug("Session created successfully", {
                                     "sid": sid[:10] + "..." if len(sid) > 10 else sid
                                 })
 
-                                response = await client.post(
+                                response = session.post(
                                     routes["ftauth"],
                                     json={
                                         "UserName": user,
@@ -484,7 +526,7 @@ class FlatTrade(BrokerBase):
                                         trading_logger.log_info("Duplicate session detected, retrying with override", {
                                             "emsg": response_data.get("emsg")
                                         })
-                                        response = await client.post(
+                                        response = session.post(
                                             routes["ftauth"],
                                             json={
                                                 "UserName": user,
@@ -549,10 +591,10 @@ class FlatTrade(BrokerBase):
                         )
                         raise AuthenticationError(f"Error in get_authcode: {str(e)}", context)
 
-                async def get_apitoken(code):
+                def get_apitoken(code):
                     try:
-                        async with httpx.AsyncClient(http2=True) as client:
-                            response = await client.post(
+                        with requests.Session() as session:
+                            response = session.post(
                                 routes["apitoken"],
                                 json={
                                     "api_key": api_key,
@@ -588,13 +630,13 @@ class FlatTrade(BrokerBase):
                 max_attempts = 5
                 for attempt in range(1, max_attempts + 1):
                     try:
-                        trading_logger.log_info(f"Login attempt {attempt}/{max_attempts}", {
+                        trading_logger.log_info(f"Fresh login attempt {attempt}/{max_attempts}", {
                             "broker_name": self.broker.name,
                             "user": user
                         })
                         
-                        request_token = asyncio.run(get_authcode())
-                        susertoken = asyncio.run(get_apitoken(request_token))
+                        request_token = get_authcode()
+                        susertoken = get_apitoken(request_token)
                         
                         trading_logger.log_info("Fresh login completed successfully", {
                             "user": user,
@@ -656,6 +698,63 @@ class FlatTrade(BrokerBase):
                 )
                 raise AuthenticationError(f"Error in _fresh_login: {str(e)}", context)
 
+        def get_connected():
+            """Main connection logic with robust session management."""
+            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            
+            if not susertoken_path:
+                context = create_error_context(
+                    broker_name=self.broker.name,
+                    config_keys=list(config.keys())
+                )
+                raise BrokerConnectionError("USERTOKEN path not configured", context)
+            
+            # Check if we can use existing token
+            if os.path.exists(susertoken_path):
+                try:
+                    mod_time = os.path.getmtime(susertoken_path)
+                    mod_datetime = dt.datetime.fromtimestamp(mod_time)
+                    today = dt.datetime.now().date()
+                    
+                    if mod_datetime.date() == today:
+                        trading_logger.log_info("Attempting to use existing token", {
+                            "broker": self.broker.name,
+                            "token_date": mod_datetime.date()
+                        })
+                        
+                        # Try to restore session from token
+                        if _restore_session_from_token(susertoken_path):
+                            return True  # Successfully connected using existing token
+                        else:
+                            trading_logger.log_info("Existing token failed verification, performing fresh login", {
+                                "broker": self.broker.name
+                            })
+                            # Fall back to fresh login
+                            _fresh_login(susertoken_path)
+                            return True
+                    else:
+                        trading_logger.log_info("Token is from previous day, performing fresh login", {
+                            "broker": self.broker.name,
+                            "token_date": mod_datetime.date(),
+                            "today": today
+                        })
+                        _fresh_login(susertoken_path)
+                        return True
+                        
+                except Exception as e:
+                    trading_logger.log_warning("Error checking token file, performing fresh login", e, {
+                        "broker": self.broker.name,
+                        "susertoken_path": susertoken_path
+                    })
+                    _fresh_login(susertoken_path)
+                    return True
+            else:
+                trading_logger.log_info("No existing token found, performing fresh login", {
+                    "broker": self.broker.name
+                })
+                _fresh_login(susertoken_path)
+                return True
+
         try:
             trading_logger.log_info("Connecting to FlatTrade", {
                 "redis_db": redis_db,
@@ -681,69 +780,8 @@ class FlatTrade(BrokerBase):
                     "error": str(e)
                 })
             
-            # Handle token-based authentication
-            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
-            fresh_login_needed = True
-            
-            # Try to use existing token
-            if os.path.exists(susertoken_path):
-                try:
-                    mod_time = os.path.getmtime(susertoken_path)
-                    mod_datetime = dt.datetime.fromtimestamp(mod_time)
-                    today = dt.datetime.now().date()
-                    
-                    if mod_datetime.date() == today:
-                        trading_logger.log_info("Using existing token", {
-                            "susertoken_path": susertoken_path
-                        })
-                        
-                        credentials = extract_credentials()
-                        user = credentials["user"]
-                        pwd = credentials["pwd"]
-                        
-                        with open(susertoken_path, "r") as file:
-                            susertoken = file.read().strip()
-                        
-                        if not susertoken:
-                            trading_logger.log_warning("Empty token file, performing fresh login")
-                            fresh_login_needed = True
-                        else:
-                            try:
-                                self.api = FlatTradeApiPy()
-                                self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
-                                
-                                # Test the session
-                                if self.is_connected():
-                                    fresh_login_needed = False
-                                    trading_logger.log_info("Existing token is valid", {
-                                        "susertoken_path": susertoken_path
-                                    })
-                                else:
-                                    trading_logger.log_warning("Existing token is invalid", {
-                                        "susertoken_path": susertoken_path
-                                    })
-                                    fresh_login_needed = True
-                            except Exception as e:
-                                trading_logger.log_warning("Failed to use existing token", {
-                                    "susertoken_path": susertoken_path,
-                                    "error": str(e)
-                                })
-                                fresh_login_needed = True
-                    else:
-                        trading_logger.log_info("Token is from previous day, performing fresh login", {
-                            "mod_date": mod_datetime.date(),
-                            "today": today
-                        })
-                except Exception as e:
-                    trading_logger.log_warning("Failed to check existing token", {
-                        "susertoken_path": susertoken_path,
-                        "error": str(e)
-                    })
-                    fresh_login_needed = True
-            
-            # Perform fresh login if needed
-            if fresh_login_needed:
-                _fresh_login(susertoken_path)
+            # Get connected using robust session management
+            get_connected()
             
             # Set up Redis connection
             try:
@@ -773,8 +811,7 @@ class FlatTrade(BrokerBase):
                 })
 
             trading_logger.log_info("Successfully connected to FlatTrade", {
-                "redis_db": redis_db,
-                "fresh_login": fresh_login_needed
+                "redis_db": redis_db
             })
             return True
 

@@ -370,7 +370,17 @@ class Shoonya(BrokerBase):
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
     def connect(self, redis_db: int):
+        """
+        Connect to Shoonya trading platform with enhanced session management.
+        
+        Args:
+            redis_db: Redis database number
+            
+        Raises:
+            ValueError: If configuration is missing or connection fails
+        """
         def _fresh_login(susertoken_path):
+            """Perform fresh login with TOTP retry logic."""
             user = config.get(f"{self.broker.name}.USER")
             pwd = config.get(f"{self.broker.name}.PWD")
             vc = config.get(f"{self.broker.name}.VC")
@@ -396,7 +406,7 @@ class Shoonya(BrokerBase):
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
-                    trading_logger.log_info(f"Login attempt {attempt}/{max_attempts}", {
+                    trading_logger.log_info(f"Fresh login attempt {attempt}/{max_attempts}", {
                         "broker": self.broker.name
                     })
                     
@@ -456,63 +466,114 @@ class Shoonya(BrokerBase):
                         })
                         raise
 
+        def _verify_session(self):
+            """Verify if the current session is valid using existing is_connected method."""
+            return self.is_connected()
+
+        def _restore_session_from_token(susertoken_path):
+            """Attempt to restore session from existing token."""
+            try:
+                user = config.get(f"{self.broker.name}.USER")
+                pwd = config.get(f"{self.broker.name}.PWD")
+                
+                if not user or not pwd:
+                    trading_logger.log_warning("Missing credentials for session restore", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                
+                with open(susertoken_path, "r") as file:
+                    susertoken = file.read().strip()
+                
+                if not susertoken:
+                    trading_logger.log_warning("Empty susertoken file", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                
+                self.api = ShoonyaApiPy()
+                self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
+                
+                # Verify the session is actually working
+                if _verify_session(self):
+                    trading_logger.log_info("Session restored from token", {
+                        "broker": self.broker.name
+                    })
+                    return True
+                else:
+                    trading_logger.log_warning("Session restoration failed - token may be invalid", {
+                        "broker": self.broker.name
+                    })
+                    return False
+                    
+            except Exception as e:
+                trading_logger.log_warning("Failed to restore session", e, {
+                    "broker": self.broker.name
+                })
+                return False
+
+        def get_connected():
+            """Main connection logic with robust session management."""
+            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            
+            if not susertoken_path:
+                trading_logger.log_error("USERTOKEN path not configured", {
+                    "broker": self.broker.name
+                })
+                raise ValueError("USERTOKEN path not configured")
+            
+            # Check if we can use existing token
+            if os.path.exists(susertoken_path):
+                try:
+                    mod_time = os.path.getmtime(susertoken_path)
+                    mod_datetime = dt.datetime.fromtimestamp(mod_time)
+                    today = dt.datetime.now().date()
+                    
+                    if mod_datetime.date() == today:
+                        trading_logger.log_info("Attempting to use existing token", {
+                            "broker": self.broker.name,
+                            "token_date": mod_datetime.date()
+                        })
+                        
+                        # Try to restore session from token
+                        if _restore_session_from_token(susertoken_path):
+                            return True  # Successfully connected using existing token
+                        else:
+                            trading_logger.log_info("Existing token failed verification, performing fresh login", {
+                                "broker": self.broker.name
+                            })
+                            # Fall back to fresh login
+                            _fresh_login(susertoken_path)
+                            return True
+                    else:
+                        trading_logger.log_info("Token is from previous day, performing fresh login", {
+                            "broker": self.broker.name,
+                            "token_date": mod_datetime.date(),
+                            "today": today
+                        })
+                        _fresh_login(susertoken_path)
+                        return True
+                        
+                except Exception as e:
+                    trading_logger.log_warning("Error checking token file, performing fresh login", e, {
+                        "broker": self.broker.name,
+                        "susertoken_path": susertoken_path
+                    })
+                    _fresh_login(susertoken_path)
+                    return True
+            else:
+                trading_logger.log_info("No existing token found, performing fresh login", {
+                    "broker": self.broker.name
+                })
+                _fresh_login(susertoken_path)
+                return True
+
         if config.get(f"{self.broker.name}") != {}:
             try:
                 self.codes = self.update_symbology()
-                susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
                 
-                if not susertoken_path:
-                    trading_logger.log_error("USERTOKEN path not configured", {
-                        "broker": self.broker.name
-                    })
-                    raise ValueError("USERTOKEN path not configured")
-                
-                fresh_login_needed = True
-                if os.path.exists(susertoken_path):
-                    try:
-                        mod_time = os.path.getmtime(susertoken_path)
-                        mod_datetime = dt.datetime.fromtimestamp(mod_time)
-                        today = dt.datetime.now().date()
-                        if mod_datetime.date() == today:
-                            fresh_login_needed = False
-                            user = config.get(f"{self.broker.name}.USER")
-                            pwd = config.get(f"{self.broker.name}.PWD")
-                            
-                            if not user or not pwd:
-                                trading_logger.log_warning("Missing credentials for session restore", {
-                                    "broker": self.broker.name
-                                })
-                                fresh_login_needed = True
-                            else:
-                                try:
-                                    with open(susertoken_path, "r") as file:
-                                        susertoken = file.read().strip()
-                                    
-                                    if not susertoken:
-                                        trading_logger.log_warning("Empty susertoken file", {
-                                            "broker": self.broker.name
-                                        })
-                                        fresh_login_needed = True
-                                    else:
-                                        self.api = ShoonyaApiPy()
-                                        self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
-                                        trading_logger.log_info("Session restored from token", {
-                                            "broker": self.broker.name
-                                        })
-                                except Exception as e:
-                                    trading_logger.log_warning("Failed to restore session", e, {
-                                        "broker": self.broker.name
-                                    })
-                                    fresh_login_needed = True
-                    except Exception as e:
-                        trading_logger.log_warning("Error checking token file", e, {
-                            "broker": self.broker.name,
-                            "susertoken_path": susertoken_path
-                        })
-                        fresh_login_needed = True
-
-                if fresh_login_needed:
-                    _fresh_login(susertoken_path)
+                # Get connected using robust session management
+                get_connected()
 
                 # Initialize Redis connection with error handling
                 try:
@@ -946,7 +1007,9 @@ class Shoonya(BrokerBase):
         mandatory_keys = ['broker_order_id']
 
         """
-
+        trading_logger.log_info("Getting order info", {
+            "broker_order_id": kwargs.get("broker_order_id")
+        })
         def return_db_as_fills(order: Order):
             order_info = OrderInfo()
             valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")

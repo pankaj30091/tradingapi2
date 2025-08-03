@@ -192,30 +192,30 @@ class Order:
         self.long_symbol = long_symbol
         self.price_type = price_type
         self.order_type = order_type
-        self.quantity = self._convert_to_int(quantity)
-        self.price = self._convert_to_float(price)
+        self.quantity = self._convert_to_int(quantity, "quantity")
+        self.price = self._convert_to_float(price, "price")
         self.exchange = exchange
         self.exchange_segment = exchange_segment
         self.internal_order_id = internal_order_id
         self.remote_order_id = remote_order_id
-        self.scrip_code = self._convert_to_int(scrip_code)
+        self.scrip_code = self._convert_to_int(scrip_code, "scrip_code")
         self.exch_order_id = exch_order_id
         self.broker_order_id = broker_order_id
-        self.stoploss_price = self._convert_to_float(stoploss_price)
-        self.is_stoploss_order = self._convert_to_bool(is_stoploss_order)
-        self.ioc_order = self._convert_to_bool(ioc_order)
+        self.stoploss_price = self._convert_to_float(stoploss_price, "stoploss_price")
+        self.is_stoploss_order = self._convert_to_bool(is_stoploss_order, "is_stoploss_order")
+        self.ioc_order = self._convert_to_bool(ioc_order, "ioc_order")
         self.scripdata = scripdata
         self.orderRef = orderRef
-        self.order_id = self._convert_to_int(order_id)
-        self.local_order_id = self._convert_to_int(local_order_id)
-        self.disqty = 0 if disqty == 'None' else self._convert_to_int(disqty)
+        self.order_id = self._convert_to_int(order_id, "order_id")
+        self.local_order_id = self._convert_to_int(local_order_id, "local_order_id")
+        self.disqty = 0 if disqty == 'None' else self._convert_to_int(disqty, "disqty")
         self.message = message
         self.vtd = vtd
         self.ahplaced = ahplaced
-        self.IsGTCOrder = self._convert_to_bool(IsGTCOrder)
-        self.IsEOSOrder = self._convert_to_bool(IsEOSOrder)
-        self.paper = self._convert_to_bool(paper)
-        self.is_intraday = self._convert_to_bool(is_intraday)
+        self.IsGTCOrder = self._convert_to_bool(IsGTCOrder, "IsGTCOrder")
+        self.IsEOSOrder = self._convert_to_bool(IsEOSOrder, "IsEOSOrder")
+        self.paper = self._convert_to_bool(paper, "paper")
+        self.is_intraday = self._convert_to_bool(is_intraday, "is_intraday")
         self.additional_info = additional_info
 
         # Setting status using enum
@@ -246,7 +246,7 @@ class Order:
         except KeyError:
             return Brokers.UNDEFINED
 
-    def _convert_to_int(self, value: Any) -> int:
+    def _convert_to_int(self, value: Any, argument_name: str = "unknown") -> int:
         """
         Convert a value to an integer if possible, otherwise return 0.
         Handles various types including strings, floats, and objects that can be converted to numbers.
@@ -257,7 +257,8 @@ class Order:
                 logger.warning("Received None value, returning 0", extra={
                     "value": value,
                     "default": 0,
-                    "method": "_convert_to_int"
+                    "method": "_convert_to_int",
+                    "argument_name": argument_name
                 })
                 return 0
             
@@ -277,7 +278,8 @@ class Order:
                     logger.warning("Empty string value, returning 0", extra={
                         "value": repr(value),
                         "default": 0,
-                        "method": "_convert_to_int"
+                        "method": "_convert_to_int",
+                        "argument_name": argument_name
                     })
                     return 0
                 
@@ -288,7 +290,8 @@ class Order:
                     logger.warning("Failed to convert string to int", extra={
                         "value": repr(value),
                         "default": 0,
-                        "method": "_convert_to_int"
+                        "method": "_convert_to_int",
+                        "argument_name": argument_name
                     })
                     return 0
             
@@ -302,7 +305,8 @@ class Order:
                             "value": repr(value),
                             "value_type": type(value).__name__,
                             "default": 0,
-                            "method": "_convert_to_int"
+                            "method": "_convert_to_int",
+                            "argument_name": argument_name
                         })
                         return 0
                     
@@ -312,7 +316,8 @@ class Order:
                         "value": repr(value),
                         "value_type": type(value).__name__,
                         "default": 0,
-                        "method": "_convert_to_int"
+                        "method": "_convert_to_int",
+                        "argument_name": argument_name
                     })
                     return 0
                     
@@ -320,11 +325,12 @@ class Order:
             logger.error("Error converting value to int", exc_info=True, extra={
                 "value": repr(value),
                 "value_type": type(value).__name__,
-                "method": "_convert_to_int"
+                "method": "_convert_to_int",
+                "argument_name": argument_name
             })
             return 0
 
-    def _convert_to_float(self, value: Any) -> float:
+    def _convert_to_float(self, value: Any, argument_name: str = "unknown") -> float:
         """
         Convert a value to a float if possible, otherwise return NaN.
         Handles various types including strings, integers, and objects that can be converted to numbers.
@@ -335,7 +341,8 @@ class Order:
                 logger.warning("Received None value, returning NaN", extra={
                     "value": value,
                     "default": float("nan"),
-                    "method": "_convert_to_float"
+                    "method": "_convert_to_float",
+                    "argument_name": argument_name
                 })
                 return float("nan")
             
@@ -351,7 +358,8 @@ class Order:
                     logger.warning("Empty string value, returning NaN", extra={
                         "value": repr(value),
                         "default": float("nan"),
-                        "method": "_convert_to_float"
+                        "method": "_convert_to_float",
+                        "argument_name": argument_name
                     })
                     return float("nan")
                 
@@ -361,7 +369,8 @@ class Order:
                     logger.warning("Failed to convert string to float", extra={
                         "value": repr(value),
                         "default": float("nan"),
-                        "method": "_convert_to_float"
+                        "method": "_convert_to_float",
+                        "argument_name": argument_name
                     })
                     return float("nan")
             
@@ -375,7 +384,8 @@ class Order:
                             "value": repr(value),
                             "value_type": type(value).__name__,
                             "default": float("nan"),
-                            "method": "_convert_to_float"
+                            "method": "_convert_to_float",
+                            "argument_name": argument_name
                         })
                         return float("nan")
                     
@@ -385,19 +395,21 @@ class Order:
                         "value": repr(value),
                         "value_type": type(value).__name__,
                         "default": float("nan"),
-                        "method": "_convert_to_float"
+                        "method": "_convert_to_float",
+                        "argument_name": argument_name
                     })
                     return float("nan")
-                    
+                
         except Exception as e:
             logger.error("Error converting value to float", exc_info=True, extra={
                 "value": repr(value),
                 "value_type": type(value).__name__,
-                "method": "_convert_to_float"
+                "method": "_convert_to_float",
+                "argument_name": argument_name
             })
             return float("nan")
 
-    def _convert_to_bool(self, value: Any) -> bool:
+    def _convert_to_bool(self, value: Any, argument_name: str = "unknown") -> bool:
         """
         Convert a value to a boolean if possible.
         """
@@ -414,7 +426,8 @@ class Order:
             logger.error("Error converting value to bool", exc_info=True, extra={
                 "value": value,
                 "value_type": type(value).__name__,
-                "method": "_convert_to_bool"
+                "method": "_convert_to_bool",
+                "argument_name": argument_name
             })
             return False
 
