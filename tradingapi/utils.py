@@ -656,7 +656,7 @@ def contains_earlier_date(input_string: str, comparison_date: str, market_close_
 @validate_inputs(
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    broker_entry_side=lambda x: x is None or (isinstance(x, str) and x in ['B', 'S'])
+    broker_entry_side=lambda x: x is None or (isinstance(x, str) and x in ['BUY', 'SHORT'])
 )
 def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_side: str) -> list[str]:
     """Get a list of internal order IDs for a specified symbol, strategy and entry side combination.

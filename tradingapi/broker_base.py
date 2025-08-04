@@ -109,13 +109,6 @@ def _validate_price(price):
     except (ValueError, TypeError):
         return False
 
-@validate_inputs(
-    long_symbol=lambda x: isinstance(x, str),
-    order_type=lambda x: isinstance(x, str),
-    quantity=lambda x: _validate_quantity(x),
-    exchange=lambda x: isinstance(x, str),
-    price=lambda x: _validate_price(x)
-)
 class Order:
     def __init__(
         self,
@@ -442,21 +435,6 @@ class Order:
         return json.dumps(self.to_dict(), indent=4, default=str)
 
 
-@validate_inputs(
-    bid=lambda x: _validate_price(x),
-    ask=lambda x: _validate_price(x),
-    bid_volume=lambda x: _validate_quantity(x),
-    ask_volume=lambda x: _validate_quantity(x),
-    prior_close=lambda x: _validate_price(x),
-    last=lambda x: _validate_price(x),
-    high=lambda x: _validate_price(x),
-    low=lambda x: _validate_price(x),
-    volume=lambda x: _validate_quantity(x),
-    symbol=lambda x: isinstance(x, str),
-    exchange=lambda x: isinstance(x, str),
-    src=lambda x: isinstance(x, str),
-    timestamp=lambda x: isinstance(x, str)
-)
 class Price:
     def __init__(
         self,
