@@ -24,8 +24,7 @@ import requests
 from chameli.dateutils import valid_datetime, get_expiry
 from NorenRestApiPy.NorenApi import NorenApi
 
-from .broker_base import (BrokerBase, Brokers, HistoricalData, Order,
-                          OrderInfo, OrderStatus, Price)
+from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
 from .config import get_config
 from .utils import set_starting_internal_ids_int, update_order_status
 from . import trading_logger
@@ -35,16 +34,16 @@ from .error_handling import validate_inputs, log_execution_time, retry_on_error
 logger = logging.getLogger(__name__)
 
 
-
-
-
 # Exception handler
 def my_handler(typ, value, trace):
-    trading_logger.log_error("Unhandled exception", {
-        "exception_type": typ.__name__,
-        "exception_value": str(value),
-        "traceback": "".join(traceback.format_tb(trace))
-    })
+    trading_logger.log_error(
+        "Unhandled exception",
+        {
+            "exception_type": typ.__name__,
+            "exception_value": str(value),
+            "traceback": "".join(traceback.format_tb(trace)),
+        },
+    )
 
 
 sys.excepthook = my_handler
@@ -58,6 +57,7 @@ class ShoonyaApiPy(NorenApi):
         )
         global api
         api = self
+
 
 @log_execution_time
 @retry_on_error(max_retries=3, delay=2.0, backoff_factor=2.0)
@@ -366,19 +366,20 @@ class Shoonya(BrokerBase):
             return reverse_split_fno(long_name, exchange).upper()
         else:
             return reverse_split_cash(long_name, exchange).upper()
-    
+
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
     def connect(self, redis_db: int):
         """
         Connect to Shoonya trading platform with enhanced session management.
-        
+
         Args:
             redis_db: Redis database number
-            
+
         Raises:
             ValueError: If configuration is missing or connection fails
         """
+
         def _fresh_login(susertoken_path):
             """Perform fresh login with TOTP retry logic."""
             user = config.get(f"{self.broker.name}.USER")
@@ -386,30 +387,34 @@ class Shoonya(BrokerBase):
             vc = config.get(f"{self.broker.name}.VC")
             app_key = config.get(f"{self.broker.name}.APPKEY")
             token = config.get(f"{self.broker.name}.TOKEN")
-            
+
             # Validate required configuration
             if not all([user, pwd, vc, app_key, token]):
                 missing_configs = []
-                if not user: missing_configs.append("USER")
-                if not pwd: missing_configs.append("PWD")
-                if not vc: missing_configs.append("VC")
-                if not app_key: missing_configs.append("APPKEY")
-                if not token: missing_configs.append("TOKEN")
-                
-                trading_logger.log_error("Missing required configuration", {
-                    "broker": self.broker.name,
-                    "missing_configs": missing_configs
-                })
+                if not user:
+                    missing_configs.append("USER")
+                if not pwd:
+                    missing_configs.append("PWD")
+                if not vc:
+                    missing_configs.append("VC")
+                if not app_key:
+                    missing_configs.append("APPKEY")
+                if not token:
+                    missing_configs.append("TOKEN")
+
+                trading_logger.log_error(
+                    "Missing required configuration", {"broker": self.broker.name, "missing_configs": missing_configs}
+                )
                 raise ValueError(f"Missing required configuration: {', '.join(missing_configs)}")
-            
+
             # TOTP retry logic to handle stale tokens
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
-                    trading_logger.log_info(f"Fresh login attempt {attempt}/{max_attempts}", {
-                        "broker": self.broker.name
-                    })
-                    
+                    trading_logger.log_info(
+                        f"Fresh login attempt {attempt}/{max_attempts}", {"broker": self.broker.name}
+                    )
+
                     self.api = ShoonyaApiPy()
                     out = self.api.login(
                         userid=user,
@@ -419,51 +424,52 @@ class Shoonya(BrokerBase):
                         api_secret=app_key,
                         imei="abc12345",
                     )
-                    
+
                     if not out or "susertoken" not in out:
-                        trading_logger.log_warning("Login attempt failed - invalid response", {
-                            "broker": self.broker.name,
-                            "attempt": attempt,
-                            "max_attempts": max_attempts,
-                            "response": str(out)
-                        })
+                        trading_logger.log_warning(
+                            "Login attempt failed - invalid response",
+                            {
+                                "broker": self.broker.name,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "response": str(out),
+                            },
+                        )
                         if attempt < max_attempts:
                             time.sleep(40)  # Wait for fresh TOTP
                             continue
                         else:
-                            trading_logger.log_error("Login failed after all attempts", {
-                                "broker": self.broker.name,
-                                "max_attempts": max_attempts
-                            })
+                            trading_logger.log_error(
+                                "Login failed after all attempts",
+                                {"broker": self.broker.name, "max_attempts": max_attempts},
+                            )
                             raise ValueError("Login failed - invalid response from broker after all attempts")
-                    
+
                     susertoken = out["susertoken"]
-                    
+
                     # Ensure directory exists
                     os.makedirs(os.path.dirname(susertoken_path), exist_ok=True)
-                    
+
                     with open(susertoken_path, "w") as file:
                         file.write(susertoken)
-                    
-                    trading_logger.log_info("Fresh login successful", {
-                        "broker": self.broker.name,
-                        "attempt": attempt
-                    })
+
+                    trading_logger.log_info("Fresh login successful", {"broker": self.broker.name, "attempt": attempt})
                     return  # Success, exit retry loop
-                    
+
                 except Exception as e:
-                    trading_logger.log_error(f"Login attempt {attempt} failed", e, {
-                        "broker": self.broker.name,
-                        "attempt": attempt,
-                        "max_attempts": max_attempts
-                    })
+                    trading_logger.log_error(
+                        f"Login attempt {attempt} failed",
+                        e,
+                        {"broker": self.broker.name, "attempt": attempt, "max_attempts": max_attempts},
+                    )
                     if attempt < max_attempts:
                         time.sleep(40)  # Wait for fresh TOTP
                     else:
-                        trading_logger.log_error("Login failed after all attempts", e, {
-                            "broker": self.broker.name,
-                            "max_attempts": max_attempts
-                        })
+                        trading_logger.log_error(
+                            "Login failed after all attempts",
+                            e,
+                            {"broker": self.broker.name, "max_attempts": max_attempts},
+                        )
                         raise
 
         def _verify_session(self):
@@ -475,103 +481,92 @@ class Shoonya(BrokerBase):
             try:
                 user = config.get(f"{self.broker.name}.USER")
                 pwd = config.get(f"{self.broker.name}.PWD")
-                
+
                 if not user or not pwd:
-                    trading_logger.log_warning("Missing credentials for session restore", {
-                        "broker": self.broker.name
-                    })
+                    trading_logger.log_warning("Missing credentials for session restore", {"broker": self.broker.name})
                     return False
-                
+
                 with open(susertoken_path, "r") as file:
                     susertoken = file.read().strip()
-                
+
                 if not susertoken:
-                    trading_logger.log_warning("Empty susertoken file", {
-                        "broker": self.broker.name
-                    })
+                    trading_logger.log_warning("Empty susertoken file", {"broker": self.broker.name})
                     return False
-                
+
                 self.api = ShoonyaApiPy()
                 self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
-                
+
                 # Verify the session is actually working
                 if _verify_session(self):
-                    trading_logger.log_info("Session restored from token", {
-                        "broker": self.broker.name
-                    })
+                    trading_logger.log_info("Session restored from token", {"broker": self.broker.name})
                     return True
                 else:
-                    trading_logger.log_warning("Session restoration failed - token may be invalid", {
-                        "broker": self.broker.name
-                    })
+                    trading_logger.log_warning(
+                        "Session restoration failed - token may be invalid", {"broker": self.broker.name}
+                    )
                     return False
-                    
+
             except Exception as e:
-                trading_logger.log_warning("Failed to restore session", e, {
-                    "broker": self.broker.name
-                })
+                trading_logger.log_warning("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
         def get_connected():
             """Main connection logic with robust session management."""
             susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
-            
+
             if not susertoken_path:
-                trading_logger.log_error("USERTOKEN path not configured", {
-                    "broker": self.broker.name
-                })
+                trading_logger.log_error("USERTOKEN path not configured", {"broker": self.broker.name})
                 raise ValueError("USERTOKEN path not configured")
-            
+
             # Check if we can use existing token
             if os.path.exists(susertoken_path):
                 try:
                     mod_time = os.path.getmtime(susertoken_path)
                     mod_datetime = dt.datetime.fromtimestamp(mod_time)
                     today = dt.datetime.now().date()
-                    
+
                     if mod_datetime.date() == today:
-                        trading_logger.log_info("Attempting to use existing token", {
-                            "broker": self.broker.name,
-                            "token_date": mod_datetime.date()
-                        })
-                        
+                        trading_logger.log_info(
+                            "Attempting to use existing token",
+                            {"broker": self.broker.name, "token_date": mod_datetime.date()},
+                        )
+
                         # Try to restore session from token
                         if _restore_session_from_token(susertoken_path):
                             return True  # Successfully connected using existing token
                         else:
-                            trading_logger.log_info("Existing token failed verification, performing fresh login", {
-                                "broker": self.broker.name
-                            })
+                            trading_logger.log_info(
+                                "Existing token failed verification, performing fresh login",
+                                {"broker": self.broker.name},
+                            )
                             # Fall back to fresh login
                             _fresh_login(susertoken_path)
                             return True
                     else:
-                        trading_logger.log_info("Token is from previous day, performing fresh login", {
-                            "broker": self.broker.name,
-                            "token_date": mod_datetime.date(),
-                            "today": today
-                        })
+                        trading_logger.log_info(
+                            "Token is from previous day, performing fresh login",
+                            {"broker": self.broker.name, "token_date": mod_datetime.date(), "today": today},
+                        )
                         _fresh_login(susertoken_path)
                         return True
-                        
+
                 except Exception as e:
-                    trading_logger.log_warning("Error checking token file, performing fresh login", e, {
-                        "broker": self.broker.name,
-                        "susertoken_path": susertoken_path
-                    })
+                    trading_logger.log_warning(
+                        "Error checking token file, performing fresh login",
+                        e,
+                        {"broker": self.broker.name, "susertoken_path": susertoken_path},
+                    )
                     _fresh_login(susertoken_path)
                     return True
             else:
-                trading_logger.log_info("No existing token found, performing fresh login", {
-                    "broker": self.broker.name
-                })
+                trading_logger.log_info("No existing token found, performing fresh login", {"broker": self.broker.name})
                 _fresh_login(susertoken_path)
                 return True
 
         if config.get(f"{self.broker.name}") != {}:
             try:
                 self.codes = self.update_symbology()
-                
+
                 # Get connected using robust session management
                 get_connected()
 
@@ -580,28 +575,22 @@ class Shoonya(BrokerBase):
                     self.redis_o = redis.Redis(db=redis_db, charset="utf-8", decode_responses=True)
                     # Test Redis connection
                     self.redis_o.ping()
-                    trading_logger.log_info("Redis connection established", {
-                        "broker": self.broker.name,
-                        "redis_db": redis_db
-                    })
+                    trading_logger.log_info(
+                        "Redis connection established", {"broker": self.broker.name, "redis_db": redis_db}
+                    )
                 except Exception as e:
-                    trading_logger.log_error("Redis connection failed", e, {
-                        "broker": self.broker.name,
-                        "redis_db": redis_db
-                    })
+                    trading_logger.log_error(
+                        "Redis connection failed", e, {"broker": self.broker.name, "redis_db": redis_db}
+                    )
                     raise
-                
+
                 self.starting_order_ids_int = set_starting_internal_ids_int(redis_db=self.redis_o)
-                
+
             except Exception as e:
-                trading_logger.log_error("Connection setup failed", e, {
-                    "broker": self.broker.name
-                })
+                trading_logger.log_error("Connection setup failed", e, {"broker": self.broker.name})
                 raise
         else:
-            trading_logger.log_error("Configuration file not found.", {
-                "broker": self.broker.name
-            })
+            trading_logger.log_error("Configuration file not found.", {"broker": self.broker.name})
             sys.exit(1)
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
@@ -609,71 +598,57 @@ class Shoonya(BrokerBase):
     def is_connected(self):
         try:
             # Check if API object exists
-            if not hasattr(self, 'api') or self.api is None:
-                trading_logger.log_warning("API object not initialized", {
-                    "broker": self.broker.name
-                })
+            if not hasattr(self, "api") or self.api is None:
+                trading_logger.log_warning("API object not initialized", {"broker": self.broker.name})
                 return False
-            
+
             # Check limits
             try:
                 limits = self.api.get_limits()
                 if not limits:
-                    trading_logger.log_warning("Empty limits response", {
-                        "broker": self.broker.name
-                    })
+                    trading_logger.log_warning("Empty limits response", {"broker": self.broker.name})
                     return False
-                
+
                 cash = limits.get("cash")
                 if cash is None:
-                    trading_logger.log_warning("No cash information in limits", {
-                        "broker": self.broker.name,
-                        "limits": str(limits)
-                    })
+                    trading_logger.log_warning(
+                        "No cash information in limits", {"broker": self.broker.name, "limits": str(limits)}
+                    )
                     return False
-                
+
                 cash_float = float(cash)
                 if cash_float <= 0:
-                    trading_logger.log_warning("Cash balance is zero or negative", {
-                        "broker": self.broker.name,
-                        "cash": cash_float
-                    })
+                    trading_logger.log_warning(
+                        "Cash balance is zero or negative", {"broker": self.broker.name, "cash": cash_float}
+                    )
                     return False
-                
+
             except Exception as e:
-                trading_logger.log_error("Failed to get limits", e, {
-                    "broker": self.broker.name
-                })
+                trading_logger.log_error("Failed to get limits", e, {"broker": self.broker.name})
                 return False
-            
+
             # Test quote fetching with a known symbol
             try:
                 quote = self.get_quote("NIFTY_IND___")
                 if not quote or quote.last <= 0:
-                    trading_logger.log_warning("Quote test failed", {
-                        "broker": self.broker.name,
-                        "quote_last": quote.last if quote else None
-                    })
+                    trading_logger.log_warning(
+                        "Quote test failed", {"broker": self.broker.name, "quote_last": quote.last if quote else None}
+                    )
                     return False
-                
+
             except Exception as e:
-                trading_logger.log_error("Quote test failed", e, {
-                    "broker": self.broker.name
-                })
+                trading_logger.log_error("Quote test failed", e, {"broker": self.broker.name})
                 return False
-            
-            trading_logger.log_debug("Connection check successful", {
-                "broker": self.broker.name,
-                "cash": cash_float,
-                "quote_last": quote.last if quote else None
-            })
-            
+
+            trading_logger.log_debug(
+                "Connection check successful",
+                {"broker": self.broker.name, "cash": cash_float, "quote_last": quote.last if quote else None},
+            )
+
             return True
-            
+
         except Exception as e:
-            trading_logger.log_error("Login error", e, {
-                "broker": self.broker.name
-            })
+            trading_logger.log_error("Login error", e, {"broker": self.broker.name})
             return False
 
     def disconnect(self):
@@ -703,10 +678,13 @@ class Shoonya(BrokerBase):
                 "symbol_map_reversed": dict(zip(group["Scripcode"], group["long_symbol"])),
                 "tradingsymbol_map": dict(zip(group["long_symbol"], group["trading_symbol"])),
             }
-        trading_logger.log_info("Symbology update completed", {
-            "total_exchanges": len(self.exchange_mappings),
-            "total_symbols": len(codes),
-        })
+        trading_logger.log_info(
+            "Symbology update completed",
+            {
+                "total_exchanges": len(self.exchange_mappings),
+                "total_symbols": len(codes),
+            },
+        )
 
         return codes
 
@@ -732,55 +710,54 @@ class Shoonya(BrokerBase):
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     @log_execution_time
     @validate_inputs(
-        order=lambda x: x is not None and hasattr(x, 'long_symbol'),
+        order=lambda x: x is not None and hasattr(x, "long_symbol"),
         long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         quantity=lambda x: isinstance(x, (int, float)) and x > 0,
         price=lambda x: isinstance(x, (int, float)) and x >= 0,
-        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
     def place_order(self, order: Order, **kwargs) -> Order:
         try:
             order.broker = self.broker
-            
+
             # Validate exchange mapping exists
             if order.exchange not in self.exchange_mappings:
-                trading_logger.log_error("Exchange not found in mappings", {
-                    "exchange": order.exchange,
-                    "available_exchanges": list(self.exchange_mappings.keys())
-                })
+                trading_logger.log_error(
+                    "Exchange not found in mappings",
+                    {"exchange": order.exchange, "available_exchanges": list(self.exchange_mappings.keys())},
+                )
                 return order
-            
+
             order.scrip_code = self.exchange_mappings[order.exchange]["symbol_map"].get(order.long_symbol, None)
             orig_order_type = order.order_type
-            
+
             if order.scrip_code is not None or order.paper:  # if paper, we dont check for valid scrip_code
                 if order.order_type == "BUY" or order.order_type == "COVER":
                     order.order_type = "B"
                 elif order.order_type == "SHORT" or order.order_type == "SELL":
                     order.order_type = "S"
                 else:
-                    trading_logger.log_error("Invalid order type", {
-                        "order_type": order.order_type,
-                        "long_symbol": order.long_symbol
-                    })
+                    trading_logger.log_error(
+                        "Invalid order type", {"order_type": order.order_type, "long_symbol": order.long_symbol}
+                    )
                     return order
-                
-                order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
-                
+                if order.remote_order_id is None or order.remote_order_id == "":
+                    order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
+
                 if not order.paper:
                     try:
                         quantity = order.quantity
                         product_type = "C" if "_STK_" in order.long_symbol else "M"  # M is NRML , 'I' is MIS
                         price_type = "LMT" if order.price > 0 else "MKT"
                         trading_symbol = self._get_tradingsymbol_from_longname(order.long_symbol, order.exchange)
-                        
+
                         if not trading_symbol:
-                            trading_logger.log_error("Failed to get trading symbol", {
-                                "long_symbol": order.long_symbol,
-                                "exchange": order.exchange
-                            })
+                            trading_logger.log_error(
+                                "Failed to get trading symbol",
+                                {"long_symbol": order.long_symbol, "exchange": order.exchange},
+                            )
                             return order
-                        
+
                         out = self.api.place_order(
                             buy_or_sell=order.order_type,
                             product_type=product_type,
@@ -794,72 +771,61 @@ class Shoonya(BrokerBase):
                             retention="DAY",
                             remarks=order.internal_order_id,
                         )
-                        
-                        trading_logger.log_info("Shoonya order info", {
-                            "order_info": json.dumps(out, indent=4, default=str)
-                        })
-                        
+
+                        trading_logger.log_info(
+                            "Shoonya order info", {"order_info": json.dumps(out, indent=4, default=str)}
+                        )
+
                         if not out:
-                            trading_logger.log_error("Empty response from broker", {
-                                "order": str(order)
-                            })
+                            trading_logger.log_error("Empty response from broker", {"order": str(order)})
                             return order
-                        
+
                         if out.get("stat") is None:
-                            trading_logger.log_error("Error placing order", {
-                                "order": str(order),
-                                "response": str(out)
-                            })
+                            trading_logger.log_error("Error placing order", {"order": str(order), "response": str(out)})
                             return order
-                        
+
                         if out["stat"].upper() == "OK":
                             order.broker_order_id = out.get("norenordno")
                             order.exch_order_id = out.get("norenordno")
                             order.order_type = orig_order_type
                             order.orderRef = order.internal_order_id
-                            
+
                             if not order.broker_order_id:
-                                trading_logger.log_error("No broker order ID in response", {
-                                    "order": str(order),
-                                    "response": str(out)
-                                })
+                                trading_logger.log_error(
+                                    "No broker order ID in response", {"order": str(order), "response": str(out)}
+                                )
                                 return order
-                            
+
                             try:
                                 fills = self.get_order_info(broker_order_id=order.broker_order_id)
                                 order.exch_order_id = fills.exchange_order_id
                                 order.status = fills.status
                             except Exception as e:
-                                trading_logger.log_error("Failed to get order info", e, {
-                                    "broker_order_id": order.broker_order_id
-                                })
+                                trading_logger.log_error(
+                                    "Failed to get order info", e, {"broker_order_id": order.broker_order_id}
+                                )
                                 # Continue with default status
                                 order.status = OrderStatus.PENDING
-                            
+
                             try:
                                 order.message = self.api.single_order_history(order.broker_order_id)[0].get("rejreason")
                             except Exception as e:
-                                trading_logger.log_error("Error getting order history", e, {
-                                    "broker_order_id": order.broker_order_id
-                                })
-                            
+                                trading_logger.log_error(
+                                    "Error getting order history", e, {"broker_order_id": order.broker_order_id}
+                                )
+
                             if order.price == 0:
                                 if fills.fill_price > 0 and order.price == 0:
                                     order.price = fills.fill_price
-                                    trading_logger.log_info("Placed Order", {
-                                        "order": str(order)
-                                    })
+                                    trading_logger.log_info("Placed Order", {"order": str(order)})
                         else:
-                            trading_logger.log_error("Order placement failed", {
-                                "order": str(order),
-                                "response": str(out)
-                            })
+                            trading_logger.log_error(
+                                "Order placement failed", {"order": str(order), "response": str(out)}
+                            )
                             return order
-                            
+
                     except Exception as e:
-                        trading_logger.log_error("Exception during order placement", e, {
-                            "order": str(order)
-                        })
+                        trading_logger.log_error("Exception during order placement", e, {"order": str(order)})
                         return order
                 else:
                     order.order_type = orig_order_type
@@ -869,32 +835,26 @@ class Shoonya(BrokerBase):
                     order.message = "Paper Order"
                     order.status = OrderStatus.FILLED
                     order.scrip_code = 0 if order.scrip_code is None else order.scrip_code
-                    trading_logger.log_info("Placed Paper Order", {
-                        "order": str(order)
-                    })
-                
+                    trading_logger.log_info("Placed Paper Order", {"order": str(order)})
+
                 self.log_and_return(order)
                 return order
-            
+
             if order.scrip_code is None:
-                trading_logger.log_info("No broker identifier found for symbol", {
-                    "long_symbol": order.long_symbol
-                })
-            
+                trading_logger.log_info("No broker identifier found for symbol", {"long_symbol": order.long_symbol})
+
             self.log_and_return(order)
             return order
-            
+
         except Exception as e:
-            trading_logger.log_error("Unexpected error in place_order", e, {
-                "order": str(order) if order else "None"
-            })
+            trading_logger.log_error("Unexpected error in place_order", e, {"order": str(order) if order else "None"})
             return order
 
     @log_execution_time
     @validate_inputs(
         broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         new_price=lambda x: isinstance(x, (int, float)) and x >= 0,
-        new_quantity=lambda x: isinstance(x, (int, float)) and x > 0
+        new_quantity=lambda x: isinstance(x, (int, float)) and x > 0,
     )
     def modify_order(self, **kwargs) -> Order:
         """
@@ -912,14 +872,17 @@ class Shoonya(BrokerBase):
         if order.broker_order_id != "0":
             fills = self.get_order_info(broker_order_id=broker_order_id)
             if order.status in [OrderStatus.OPEN]:
-                trading_logger.log_info("Modifying entry order", {
-                    "broker_order_id": broker_order_id,
-                    "old_price": order.price,
-                    "new_price": new_price,
-                    "old_quantity": order.quantity,
-                    "new_quantity": new_quantity,
-                    "current_fills": str(fills.fill_size)
-                })
+                trading_logger.log_info(
+                    "Modifying entry order",
+                    {
+                        "broker_order_id": broker_order_id,
+                        "old_price": order.price,
+                        "new_price": new_price,
+                        "old_quantity": order.quantity,
+                        "new_quantity": new_quantity,
+                        "current_fills": str(fills.fill_size),
+                    },
+                )
                 long_symbol = order.long_symbol
                 exchange = order.exchange
                 trading_symbol = self._get_tradingsymbol_from_longname(long_symbol, exchange)
@@ -933,9 +896,7 @@ class Shoonya(BrokerBase):
                     newprice=new_price,
                 )
                 if out is None:
-                    trading_logger.log_error("Error modifying order", {
-                        "broker_order_id": broker_order_id
-                    })
+                    trading_logger.log_error("Error modifying order", {"broker_order_id": broker_order_id})
                 elif out["stat"].upper() == "OK":
                     self.log_and_return(out)
                     order.quantity = new_quantity
@@ -950,18 +911,16 @@ class Shoonya(BrokerBase):
                 self.log_and_return(order)
                 return order
             else:
-                trading_logger.log_info("Order status does not allow modification", {
-                    "broker_order_id": order.broker_order_id,
-                    "status": str(order.status)
-                })
+                trading_logger.log_info(
+                    "Order status does not allow modification",
+                    {"broker_order_id": order.broker_order_id, "status": str(order.status)},
+                )
                 self.log_and_return(order)
                 return order
         return Order()
 
     @log_execution_time
-    @validate_inputs(
-        broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0
-    )
+    @validate_inputs(broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0)
     def cancel_order(self, **kwargs):
         """
         mandatory_keys = ['broker_order_id']
@@ -979,12 +938,15 @@ class Shoonya(BrokerBase):
             if valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d"):
                 fills = self.get_order_info(broker_order_id=broker_order_id)
                 if fills.fill_size < round(float(order.quantity)):
-                    trading_logger.log_info("Cancelling broker order", {
-                        "broker_order_id": broker_order_id,
-                        "long_symbol": order.long_symbol,
-                        "filled": str(fills.fill_size),
-                        "ordered": order.quantity
-                    })
+                    trading_logger.log_info(
+                        "Cancelling broker order",
+                        {
+                            "broker_order_id": broker_order_id,
+                            "long_symbol": order.long_symbol,
+                            "filled": str(fills.fill_size),
+                            "ordered": order.quantity,
+                        },
+                    )
                     out = self.api.cancel_order(orderno=broker_order_id)
                     self.log_and_return(out)
                     fills = update_order_status(self, order.internal_order_id, broker_order_id, eod=True)
@@ -999,17 +961,14 @@ class Shoonya(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     @log_execution_time
-    @validate_inputs(
-        broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0
-    )
+    @validate_inputs(broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0)
     def get_order_info(self, **kwargs) -> OrderInfo:
         """
         mandatory_keys = ['broker_order_id']
 
         """
-        trading_logger.log_info("Getting order info", {
-            "broker_order_id": kwargs.get("broker_order_id")
-        })
+        trading_logger.log_debug("Getting order info", {"broker_order_id": kwargs.get("broker_order_id")})
+
         def return_db_as_fills(order: Order):
             order_info = OrderInfo()
             valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
@@ -1042,9 +1001,7 @@ class Shoonya(BrokerBase):
         }
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if str(broker_order_id).endswith("P"):
-            trading_logger.log_debug("Paper Trade being skipped", {
-                "broker_order_id": broker_order_id
-            })
+            trading_logger.log_debug("Paper Trade being skipped", {"broker_order_id": broker_order_id})
             return OrderInfo(
                 order_size=order.quantity,
                 order_price=order.price,
@@ -1074,9 +1031,7 @@ class Shoonya(BrokerBase):
             order_info.status = OrderStatus.UNDEFINED
             return order_info
 
-        trading_logger.log_debug("Order Status", {
-            "order_status": json.dumps(out, indent=4, default=str)
-        })
+        trading_logger.log_debug("Order Status", {"order_status": json.dumps(out, indent=4, default=str)})
         latest_status = out[0]
         order_info.order_size = int(latest_status.get("qty"))
         order_info.order_price = float(latest_status.get("prc"))
@@ -1099,7 +1054,7 @@ class Shoonya(BrokerBase):
         date_end=lambda x: valid_datetime(x)[0] is not False,
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0
+        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
     def get_historical(
         self,
@@ -1140,20 +1095,18 @@ class Shoonya(BrokerBase):
             if scripCode:
                 symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
             else:
-                trading_logger.log_error("Did not get ScripCode for symbols", {
-                    "symbols": symbols,
-                    "symbol_type": "string"
-                })
+                trading_logger.log_error(
+                    "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "string"}
+                )
                 return {}
         elif isinstance(symbols, dict):
             scripCode = symbols.get("scrip_code")
             if scripCode:
                 symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
             else:
-                trading_logger.log_error("Did not get ScripCode for symbols", {
-                    "symbols": symbols,
-                    "symbol_type": "dict"
-                })
+                trading_logger.log_error(
+                    "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "dict"}
+                )
                 return {}
         else:
             symbols_pd = symbols
@@ -1161,11 +1114,10 @@ class Shoonya(BrokerBase):
         out = {}  # Initialize the output dictionary
 
         for index, row_outer in symbols_pd.iterrows():
-            trading_logger.log_debug("Processing historical data", {
-                "index": str(index),
-                "total_symbols": str(len(symbols)),
-                "long_symbol": row_outer['long_symbol']
-            })
+            trading_logger.log_debug(
+                "Processing historical data",
+                {"index": str(index), "total_symbols": str(len(symbols)), "long_symbol": row_outer["long_symbol"]},
+            )
             exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
             historical_data_list = []
             exch = exchange
@@ -1217,10 +1169,11 @@ class Shoonya(BrokerBase):
                             # If call succeeds, break out of loop
                             break
                         except Exception as e:
-                            trading_logger.log_error("Error in get_daily_price_series", e, {
-                                "long_symbol": row_outer['long_symbol'],
-                                "attempt": attempt + 1
-                            })
+                            trading_logger.log_error(
+                                "Error in get_daily_price_series",
+                                e,
+                                {"long_symbol": row_outer["long_symbol"], "attempt": attempt + 1},
+                            )
                             data = None
 
                         finally:
@@ -1228,15 +1181,16 @@ class Shoonya(BrokerBase):
 
                         elapsed = time.time() - start_time
                         if elapsed < wait_seconds:
-                            trading_logger.log_info("Reattempting to get daily data", {
-                                "long_symbol": row_outer['long_symbol']
-                            })
+                            trading_logger.log_info(
+                                "Reattempting to get daily data", {"long_symbol": row_outer["long_symbol"]}
+                            )
                             time.sleep(wait_seconds - elapsed)
             except Exception as e:
-                trading_logger.log_error("Error in get_time_price_series or get_daily_price_series", e, {
-                    "long_symbol": row_outer['long_symbol'],
-                    "periodicity": periodicity
-                })
+                trading_logger.log_error(
+                    "Error in get_time_price_series or get_daily_price_series",
+                    e,
+                    {"long_symbol": row_outer["long_symbol"], "periodicity": periodicity},
+                )
                 data = None
 
             if not (data is None or len(data) == 0):
@@ -1259,9 +1213,7 @@ class Shoonya(BrokerBase):
                     )
                     historical_data_list.append(historical_data)
             else:
-                trading_logger.log_debug("No data found for symbol", {
-                    "long_symbol": row_outer['long_symbol']
-                })
+                trading_logger.log_debug("No data found for symbol", {"long_symbol": row_outer["long_symbol"]})
                 historical_data_list.append(
                     HistoricalData(
                         date=dt.datetime(1970, 1, 1),
@@ -1293,9 +1245,9 @@ class Shoonya(BrokerBase):
                         interval=1,  # Request 1-minute data
                     )
                 except Exception as e:
-                    trading_logger.log_error("Error in get_time_price_series for intraday data", e, {
-                        "long_symbol": row_outer['long_symbol']
-                    })
+                    trading_logger.log_error(
+                        "Error in get_time_price_series for intraday data", e, {"long_symbol": row_outer["long_symbol"]}
+                    )
                     intraday_data = None
 
                 if intraday_data:
@@ -1394,7 +1346,7 @@ class Shoonya(BrokerBase):
     @log_execution_time
     @validate_inputs(
         long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
     def get_quote(self, long_symbol: str, exchange="NSE") -> Price:
         """Get Quote details of a symbol.
@@ -1414,31 +1366,29 @@ class Shoonya(BrokerBase):
 
             # Validate exchange mapping exists
             if mapped_exchange not in self.exchange_mappings:
-                trading_logger.log_error("Exchange mapping not found", {
-                    "mapped_exchange": mapped_exchange,
-                    "available_exchanges": list(self.exchange_mappings.keys())
-                })
+                trading_logger.log_error(
+                    "Exchange mapping not found",
+                    {"mapped_exchange": mapped_exchange, "available_exchanges": list(self.exchange_mappings.keys())},
+                )
                 return market_feed
 
             token = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
             if token is None:
-                trading_logger.log_error("No token found for symbol", {
-                    "long_symbol": long_symbol,
-                    "mapped_exchange": mapped_exchange
-                })
+                trading_logger.log_error(
+                    "No token found for symbol", {"long_symbol": long_symbol, "mapped_exchange": mapped_exchange}
+                )
                 return market_feed  # Return default Price object if no token is found
 
             try:
                 tick_data = self.api.get_quotes(exchange=mapped_exchange, token=str(token))
-                
+
                 if not tick_data:
-                    trading_logger.log_warning("Empty tick data received", {
-                        "long_symbol": long_symbol,
-                        "exchange": mapped_exchange,
-                        "token": token
-                    })
+                    trading_logger.log_warning(
+                        "Empty tick data received",
+                        {"long_symbol": long_symbol, "exchange": mapped_exchange, "token": token},
+                    )
                     return market_feed
-                
+
                 # Safely extract and convert values with validation
                 def safe_float(value, default=float("nan")):
                     """Safely convert value to float with validation."""
@@ -1448,7 +1398,7 @@ class Shoonya(BrokerBase):
                         return float(value)
                     except (ValueError, TypeError):
                         return default
-                
+
                 def safe_int(value, default=0):
                     """Safely convert value to int with validation."""
                     if value in [None, 0, "0", float("nan"), ""]:
@@ -1457,7 +1407,7 @@ class Shoonya(BrokerBase):
                         return int(float(value))
                     except (ValueError, TypeError):
                         return default
-                
+
                 market_feed.bid = safe_float(tick_data.get("bp1"))
                 market_feed.ask = safe_float(tick_data.get("sp1"))
                 market_feed.bid_volume = safe_int(tick_data.get("bq1"))
@@ -1467,17 +1417,16 @@ class Shoonya(BrokerBase):
                 market_feed.high = safe_float(tick_data.get("h"))
                 market_feed.low = safe_float(tick_data.get("l"))
                 market_feed.volume = safe_int(tick_data.get("v"))
-                
+
                 # Handle exchange mapping
                 try:
                     market_feed.exchange = self.map_exchange_for_db(long_symbol, tick_data.get("exch"))
                 except Exception as e:
-                    trading_logger.log_warning("Failed to map exchange for DB", e, {
-                        "long_symbol": long_symbol,
-                        "exch": tick_data.get("exch")
-                    })
+                    trading_logger.log_warning(
+                        "Failed to map exchange for DB", e, {"long_symbol": long_symbol, "exch": tick_data.get("exch")}
+                    )
                     market_feed.exchange = mapped_exchange
-                
+
                 # Handle timestamp conversion
                 try:
                     lut_value = tick_data.get("lut", 0)
@@ -1486,41 +1435,42 @@ class Shoonya(BrokerBase):
                     else:
                         market_feed.timestamp = dt.datetime.now()
                 except Exception as e:
-                    trading_logger.log_warning("Failed to convert timestamp", e, {
-                        "long_symbol": long_symbol,
-                        "lut": tick_data.get("lut")
-                    })
+                    trading_logger.log_warning(
+                        "Failed to convert timestamp", e, {"long_symbol": long_symbol, "lut": tick_data.get("lut")}
+                    )
                     market_feed.timestamp = dt.datetime.now()
-                
-                trading_logger.log_debug("Quote retrieved successfully", {
-                    "long_symbol": long_symbol,
-                    "exchange": mapped_exchange,
-                    "last_price": market_feed.last,
-                    "bid": market_feed.bid,
-                    "ask": market_feed.ask
-                })
-                
+
+                trading_logger.log_debug(
+                    "Quote retrieved successfully",
+                    {
+                        "long_symbol": long_symbol,
+                        "exchange": mapped_exchange,
+                        "last_price": market_feed.last,
+                        "bid": market_feed.bid,
+                        "ask": market_feed.ask,
+                    },
+                )
+
             except Exception as e:
-                trading_logger.log_error("Error fetching quote for symbol", e, {
-                    "long_symbol": long_symbol,
-                    "exchange": mapped_exchange,
-                    "token": token
-                })
+                trading_logger.log_error(
+                    "Error fetching quote for symbol",
+                    e,
+                    {"long_symbol": long_symbol, "exchange": mapped_exchange, "token": token},
+                )
 
         except Exception as e:
-            trading_logger.log_error("Unexpected error in get_quote", e, {
-                "long_symbol": long_symbol,
-                "exchange": exchange
-            })
+            trading_logger.log_error(
+                "Unexpected error in get_quote", e, {"long_symbol": long_symbol, "exchange": exchange}
+            )
 
         return market_feed
 
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     @log_execution_time
     @validate_inputs(
-        operation=lambda x: isinstance(x, str) and x in ['s', 'u'],
+        operation=lambda x: isinstance(x, str) and x in ["s", "u"],
         symbols=lambda x: isinstance(x, list) and len(x) > 0,
-        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
     def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE"):
         """
@@ -1617,17 +1567,13 @@ class Shoonya(BrokerBase):
         # Function to handle WebSocket errors
         def handle_socket_error(error=None):
             if error:
-                trading_logger.log_error("WebSocket error", {
-                    "error": str(error)
-                })
+                trading_logger.log_error("WebSocket error", {"error": str(error)})
             else:
                 trading_logger.log_error("WebSocket error. Connection to remote host was lost.")
 
         def handle_socket_close(close_code=None, close_msg=None):
             if close_msg:
-                trading_logger.log_error("WebSocket closed", {
-                    "close_msg": str(close_msg)
-                })
+                trading_logger.log_error("WebSocket closed", {"close_msg": str(close_msg)})
                 initiate_reconnect()
 
         def initiate_reconnect(max_retries=5, retry_delay=5):
@@ -1636,13 +1582,10 @@ class Shoonya(BrokerBase):
             """
             for attempt in range(max_retries):
                 try:
-                    trading_logger.log_info("Reconnect attempt", {
-                        "attempt": attempt + 1,
-                        "max_retries": max_retries
-                    })
+                    trading_logger.log_info("Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries})
 
                     # Close the existing WebSocket connection if open
-                    if hasattr(self, 'api') and self.api and hasattr(self, 'socket_opened') and self.socket_opened:
+                    if hasattr(self, "api") and self.api and hasattr(self, "socket_opened") and self.socket_opened:
                         try:
                             self.api.close_websocket()
                             self.socket_opened = False
@@ -1669,23 +1612,18 @@ class Shoonya(BrokerBase):
                             trading_logger.log_error("Failed to resubscribe after reconnection", e)
                     else:
                         trading_logger.log_warning("WebSocket did not open within the expected time.")
-                        
+
                 except Exception as e:
-                    trading_logger.log_error("Reconnect attempt failed", e, {
-                        "attempt": attempt + 1
-                    })
+                    trading_logger.log_error("Reconnect attempt failed", e, {"attempt": attempt + 1})
 
                 # Wait before the next retry with exponential backoff
-                wait_time = retry_delay * (2 ** attempt)
-                trading_logger.log_info("Waiting before next retry", {
-                    "wait_time": wait_time,
-                    "attempt": attempt + 1
-                })
+                wait_time = retry_delay * (2**attempt)
+                trading_logger.log_info("Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1})
                 time.sleep(wait_time)
 
             trading_logger.log_error("Max reconnect attempts reached. Unable to reconnect the WebSocket.")
             # Set a flag to indicate connection failure
-            if hasattr(self, 'socket_opened'):
+            if hasattr(self, "socket_opened"):
                 self.socket_opened = False
 
         # Function to handle WebSocket connection opening
@@ -1712,9 +1650,7 @@ class Shoonya(BrokerBase):
                 if scrip_code:
                     req_list.append(f"{mapped_exchange}|{scrip_code}")
                 else:
-                    trading_logger.log_error("Did not find scrip_code for symbol", {
-                        "symbol": symbol
-                    })
+                    trading_logger.log_error("Did not find scrip_code for symbol", {"symbol": symbol})
             return req_list
 
         # Function to update the subscription list
@@ -1740,20 +1676,14 @@ class Shoonya(BrokerBase):
         # Manage subscription based on operation
         if req_list:
             if operation == "s":
-                trading_logger.log_info("Requesting streaming", {
-                    "req_list": req_list
-                })
+                trading_logger.log_info("Requesting streaming", {"req_list": req_list})
                 self.api.subscribe(req_list)
             elif operation == "u":
-                trading_logger.log_info("Unsubscribing streaming", {
-                    "req_list": req_list
-                })
+                trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
                 self.api.unsubscribe(req_list)
 
     @log_execution_time
-    @validate_inputs(
-        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0
-    )
+    @validate_inputs(long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0)
     def get_position(self, long_symbol: str):
         pos = pd.DataFrame(self.api.get_positions())
         if len(pos) > 0:
@@ -1792,117 +1722,120 @@ class Shoonya(BrokerBase):
             if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
                 # Extract symbol
                 symbol = "SENSEX"
-                
+
                 # Extract option type (last 2 characters)
                 option_type = fno_symbol[-2:]  # CE or PE
                 part3 = "C" if option_type == "CE" else "P"
-                
+
                 # Extract the part after SENSEX and before CE/PE
                 middle_part = fno_symbol[6:-2]  # e.g., "25SEP91600", "25DEC89000", "2580591600"
-                
+
                 # Try to parse different SENSEX formats
                 try:
                     # Extract year (first 2 digits)
                     year = "20" + middle_part[:2]
-                    
+
                     # Extract the remaining part after year
                     remaining = middle_part[2:]
-                    
+
                     # Check if next 3 characters are letters (month abbreviation) - check this FIRST
                     if len(remaining) >= 3 and remaining[:3].isalpha():
                         # Month abbreviation format (3 letters)
                         month_abbr = remaining[:3]
-                        
+
                         # Convert month abbreviation to number
                         month_map = {
-                            'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04',
-                            'MAY': '05', 'JUN': '06', 'JUL': '07', 'AUG': '08',
-                            'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'
+                            "JAN": "01",
+                            "FEB": "02",
+                            "MAR": "03",
+                            "APR": "04",
+                            "MAY": "05",
+                            "JUN": "06",
+                            "JUL": "07",
+                            "AUG": "08",
+                            "SEP": "09",
+                            "OCT": "10",
+                            "NOV": "11",
+                            "DEC": "12",
                         }
-                        
+
                         if month_abbr in month_map:
                             month = month_map[month_abbr]
-                            
+
                             # For 3-letter month format, no day is given
                             # We need to find the last working Tuesday of the month
                             # For now, we'll use a placeholder day (25th)
                             day = "25"  # Placeholder - should be calculated as last working Tuesday
                             first_dom = f"01-{month}-{year}"
-                            expiry = get_expiry(first_dom,weekly=0,day_of_week=2,exchange="BSE")
+                            expiry = get_expiry(first_dom, weekly=0, day_of_week=2, exchange="BSE")
                             day = expiry[:2]
                             # Extract strike (remaining digits after month abbreviation)
                             strike = remaining[3:]
-                            
+
                             # Construct date string
                             part2 = f"{year}{month}{day}"
                             part4 = strike
-                            
+
                             return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-                    
+
                     # Check if next character is a digit (single digit month)
                     elif remaining[0].isdigit():
                         # Single digit month format
                         month_digit = remaining[0]
                         month = month_digit.zfill(2)  # 8 -> 08 (August)
-                        
+
                         # Extract day (next 2 digits)
                         day = remaining[1:3]
-                        
+
                         # Extract strike (remaining digits before CE/PE)
                         strike = remaining[3:]
-                        
+
                         # Construct date string
                         part2 = f"{year}{month}{day}"
                         part4 = strike
-                        
+
                         return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-                    
+
                     # Check if next character is O, N, or D (single letter month)
-                    elif remaining[0] in ['O', 'N', 'D']:
+                    elif remaining[0] in ["O", "N", "D"]:
                         # Single letter month format
                         month_letter = remaining[0]
-                        
+
                         # Map single letters to months: O=October, N=November, D=December
-                        month_map = {
-                            'O': '10',  # October
-                            'N': '11',  # November  
-                            'D': '12'   # December
-                        }
-                        
+                        month_map = {"O": "10", "N": "11", "D": "12"}  # October  # November  # December
+
                         month = month_map[month_letter]
-                        
+
                         # Extract day (next 2 digits)
                         day = remaining[1:3]
-                        
+
                         # Extract strike (remaining digits before CE/PE)
                         strike = remaining[3:]
-                        
+
                         # Construct date string
                         part2 = f"{year}{month}{day}"
                         part4 = strike
-                        
+
                         return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-                    
+
                     # Fallback for unexpected formats
                     else:
-                        trading_logger.log_warning("Unexpected SENSEX format", {
-                            "fno_symbol": fno_symbol,
-                            "middle_part": middle_part,
-                            "remaining": remaining
-                        })
+                        trading_logger.log_warning(
+                            "Unexpected SENSEX format",
+                            {"fno_symbol": fno_symbol, "middle_part": middle_part, "remaining": remaining},
+                        )
                         part2 = "20250101"
                         part4 = middle_part[2:]  # Use remaining part as strike
                         return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-                        
+
                 except Exception as e:
-                    trading_logger.log_error("Error parsing SENSEX symbol", e, {
-                        "fno_symbol": fno_symbol,
-                        "middle_part": middle_part
-                    })
+                    trading_logger.log_error(
+                        "Error parsing SENSEX symbol", e, {"fno_symbol": fno_symbol, "middle_part": middle_part}
+                    )
                     part2 = "20250101"
                     part4 = middle_part
                     return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-            
+
             else:
                 # Original NIFTY format: NIFTY07AUG25C25050
                 part1 = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol).group()
@@ -1925,7 +1858,7 @@ class Shoonya(BrokerBase):
     @log_execution_time
     @validate_inputs(
         long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
     def get_min_lot_size(self, long_symbol, exchange="NSE"):
         exchange = self.map_exchange_for_api(long_symbol, exchange)

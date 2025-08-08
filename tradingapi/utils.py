@@ -25,18 +25,21 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .broker_base import (BrokerBase, HistoricalData, Order, OrderInfo,
-                          OrderStatus, Position, Price)
+from .broker_base import BrokerBase, HistoricalData, Order, OrderInfo, OrderStatus, Position, Price
 from .config import get_config
 from .exceptions import (
-    SymbolError, TradingAPIError, ValidationError, DataError, RedisError, 
-    MarketDataError, OrderError, PnLError, CommissionError,
-    create_error_context
+    SymbolError,
+    TradingAPIError,
+    ValidationError,
+    DataError,
+    RedisError,
+    MarketDataError,
+    OrderError,
+    PnLError,
+    CommissionError,
+    create_error_context,
 )
-from .error_handling import (
-    retry_on_error, safe_execute, log_execution_time, 
-    handle_broker_errors, validate_inputs
-)
+from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from . import trading_logger
 
 logger = logging.getLogger(__name__)
@@ -46,15 +49,9 @@ r = redis.Redis(db=0, charset="utf-8", decode_responses=True)
 # Enhanced exception handler with structured logging
 def my_handler(typ, value, trace):
     context = create_error_context(
-        exception_type=typ.__name__,
-        exception_value=str(value),
-        traceback="".join(traceback.format_tb(trace))
+        exception_type=typ.__name__, exception_value=str(value), traceback="".join(traceback.format_tb(trace))
     )
-    trading_logger.log_error(
-        f"Uncaught exception: {typ.__name__}",
-        value,
-        context
-    )
+    trading_logger.log_error(f"Uncaught exception: {typ.__name__}", value, context)
 
 
 sys.excepthook = my_handler
@@ -130,19 +127,19 @@ def set_starting_internal_ids_int(redis_db) -> dict:
 def _safe_parse_json_or_dict(json_str):
     """
     Safely parse a string that could be either JSON or Python dict string.
-    
+
     Args:
         json_str (str): String that could be JSON or Python dict
-        
+
     Returns:
         dict: Parsed dictionary
-        
+
     Raises:
         DataError: If the string cannot be parsed as either JSON or dict
     """
     if not json_str or not json_str.strip():
         return {}
-    
+
     try:
         # First try to parse as JSON
         return json.loads(json_str)
@@ -151,42 +148,51 @@ def _safe_parse_json_or_dict(json_str):
             # If JSON fails, try to parse as Python dict string
             import ast
             import math
-            
+
             # Handle common problematic values before parsing
             # Replace bare 'nan' with 'float("nan")' for ast.literal_eval
             processed_str = json_str.replace("'nan'", "float('nan')")
             processed_str = processed_str.replace("nan", "float('nan')")
-            
+
             # Also handle other common problematic values
             processed_str = processed_str.replace("'inf'", "float('inf')")
             processed_str = processed_str.replace("'-inf'", "float('-inf')")
             processed_str = processed_str.replace("inf", "float('inf')")
             processed_str = processed_str.replace("-inf", "float('-inf')")
-            
+
             # Handle bare identifiers that should be floats
             import re
-            processed_str = re.sub(r'\bnan\b', "float('nan')", processed_str)
-            processed_str = re.sub(r'\binf\b', "float('inf')", processed_str)
-            processed_str = re.sub(r'\b-inf\b', "float('-inf')", processed_str)
-            
+
+            processed_str = re.sub(r"\bnan\b", "float('nan')", processed_str)
+            processed_str = re.sub(r"\binf\b", "float('inf')", processed_str)
+            processed_str = re.sub(r"\b-inf\b", "float('-inf')", processed_str)
+
             return ast.literal_eval(processed_str)
         except (ValueError, SyntaxError) as e:
             # If ast.literal_eval still fails, try a more robust approach
             try:
                 # Use eval with restricted globals for safety
                 safe_globals = {
-                    'True': True, 'False': False, 'None': None,
-                    'float': float, 'int': int, 'str': str,
-                    'nan': float('nan'), 'inf': float('inf')
+                    "True": True,
+                    "False": False,
+                    "None": None,
+                    "float": float,
+                    "int": int,
+                    "str": str,
+                    "nan": float("nan"),
+                    "inf": float("inf"),
                 }
                 return eval(json_str, safe_globals, {})
             except Exception as eval_error:
-                raise DataError(f"Cannot parse as JSON or Python dict: {str(e)}", {
-                    "input_preview": str(json_str)[:200],
-                    "input_length": len(str(json_str)),
-                    "ast_error": str(e),
-                    "eval_error": str(eval_error)
-                })
+                raise DataError(
+                    f"Cannot parse as JSON or Python dict: {str(e)}",
+                    {
+                        "input_preview": str(json_str)[:200],
+                        "input_length": len(str(json_str)),
+                        "ast_error": str(e),
+                        "eval_error": str(eval_error),
+                    },
+                )
 
 
 @log_execution_time
@@ -211,12 +217,15 @@ def _merge_additional_info(old_info, new_info):
         new_dict = _safe_parse_json_or_dict(new_info)
 
         if not isinstance(old_dict, dict) or not isinstance(new_dict, dict):
-            raise DataError("Both inputs must be JSON objects (dictionaries).", {
-                "old_info_type": type(old_info).__name__,
-                "new_info_type": type(new_info).__name__,
-                "old_info": str(old_info)[:100],
-                "new_info": str(new_info)[:100]
-            })
+            raise DataError(
+                "Both inputs must be JSON objects (dictionaries).",
+                {
+                    "old_info_type": type(old_info).__name__,
+                    "new_info_type": type(new_info).__name__,
+                    "old_info": str(old_info)[:100],
+                    "new_info": str(new_info)[:100],
+                },
+            )
 
         # Create a merged dictionary
         merged_dict = old_dict.copy()
@@ -244,14 +253,12 @@ def _merge_additional_info(old_info, new_info):
             new_info_preview=str(new_info)[:200] if new_info else None,
             old_info_length=len(str(old_info)) if old_info else 0,
             new_info_length=len(str(new_info)) if new_info else 0,
-            original_error=str(e)
+            original_error=str(e),
         )
         raise DataError(f"Error parsing additional info: {str(e)}", context)
     except Exception as e:
         context = create_error_context(
-            old_info_type=type(old_info).__name__,
-            new_info_type=type(new_info).__name__,
-            error_type=type(e).__name__
+            old_info_type=type(old_info).__name__, new_info_type=type(new_info).__name__, error_type=type(e).__name__
         )
         raise DataError(f"Error merging additional info: {str(e)}", context)
 
@@ -280,7 +287,7 @@ def needs_refresh_status_from_redis(broker: BrokerBase, pnl_df: pd.DataFrame) ->
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     start_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     end_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_pnl_table(
     broker: BrokerBase,
@@ -301,10 +308,10 @@ def get_pnl_table(
         refresh_status (bool, optional): Whether to refresh order status. Defaults to False.
         market_close_time (str, optional): closing time for option expiry, defaults to "15:30:00"
         eod (bool, optional): Whether this is end-of-day processing. Defaults to False.
-    
+
     Returns:
         pd.DataFrame: strategy pnl
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         RedisError: If there are issues with Redis operations
@@ -313,47 +320,46 @@ def get_pnl_table(
     try:
         int_order_ids = []
         trades = []
-        
+
         # Get all internal order IDs for the strategy
         for int_order_id in broker.redis_o.scan_iter(strategy + "_" + "*"):
             int_order_ids.append(int_order_id)
-        
+
         if not int_order_ids:
-            trading_logger.log_info(f"No internal order IDs found for strategy: {strategy}", {
-                "strategy": strategy,
-                "start_time": start_time,
-                "end_time": end_time
-            })
+            trading_logger.log_info(
+                f"No internal order IDs found for strategy: {strategy}",
+                {"strategy": strategy, "start_time": start_time, "end_time": end_time},
+            )
             return empty_trades
-        
+
         int_order_ids.sort()
-        
+
         for int_order_id in int_order_ids:
             try:
                 if is_not_int_order_id(int_order_id):
                     continue
-                    
+
                 symbol = broker.redis_o.hget(int_order_id, "long_symbol")
                 if not symbol:
-                    trading_logger.log_warning(f"No symbol found for internal order ID: {int_order_id}", {
-                        "int_order_id": int_order_id,
-                        "strategy": strategy
-                    })
+                    trading_logger.log_warning(
+                        f"No symbol found for internal order ID: {int_order_id}",
+                        {"int_order_id": int_order_id, "strategy": strategy},
+                    )
                     continue
-                
+
                 entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
                 exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
                 additional_info_entry = ""
                 additional_info_exit = ""
-                
+
                 if len(entry_keys) == 0:
-                    trading_logger.log_error(f"No entry key found for int_order_id: {int_order_id}", None, {
-                        "int_order_id": int_order_id,
-                        "strategy": strategy,
-                        "symbol": symbol
-                    })
+                    trading_logger.log_error(
+                        f"No entry key found for int_order_id: {int_order_id}",
+                        None,
+                        {"int_order_id": int_order_id, "strategy": strategy, "symbol": symbol},
+                    )
                     continue
-                
+
                 # Process entry keys
                 if len(entry_keys) > 0:
                     try:
@@ -365,13 +371,13 @@ def get_pnl_table(
                                 additional_info_entry, hget_with_default(broker, ek, "additional_info", "")
                             )
                     except Exception as e:
-                        trading_logger.log_error(f"Error processing entry keys for {int_order_id}", e, {
-                            "int_order_id": int_order_id,
-                            "symbol": symbol,
-                            "entry_keys": entry_keys
-                        })
+                        trading_logger.log_error(
+                            f"Error processing entry keys for {int_order_id}",
+                            e,
+                            {"int_order_id": int_order_id, "symbol": symbol, "entry_keys": entry_keys},
+                        )
                         continue
-                
+
                 # Process exit keys
                 if len(exit_keys) > 0:
                     try:
@@ -382,22 +388,22 @@ def get_pnl_table(
                                 additional_info_exit, hget_with_default(broker, ek, "additional_info", "")
                             )
                     except Exception as e:
-                        trading_logger.log_error(f"Error processing exit keys for {int_order_id}", e, {
-                            "int_order_id": int_order_id,
-                            "symbol": symbol,
-                            "exit_keys": exit_keys
-                        })
+                        trading_logger.log_error(
+                            f"Error processing exit keys for {int_order_id}",
+                            e,
+                            {"int_order_id": int_order_id, "symbol": symbol, "exit_keys": exit_keys},
+                        )
                         exit_time = ""
                 else:
                     exit_time = ""
-                
+
                 additional_info = _merge_additional_info(additional_info_entry, additional_info_exit)
                 entry_quantity = 0
                 entry_price: float = 0.0
                 exit_quantity = 0
                 exit_price: float = 0.0
                 commission = 0
-                
+
                 # Refresh status if requested
                 if refresh_status:
                     try:
@@ -406,11 +412,12 @@ def get_pnl_table(
                             broker_order_id = order.broker_order_id
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:
-                        trading_logger.log_error(f"Error refreshing entry status for {int_order_id}", e, {
-                            "int_order_id": int_order_id,
-                            "entry_keys": entry_keys
-                        })
-                
+                        trading_logger.log_error(
+                            f"Error refreshing entry status for {int_order_id}",
+                            e,
+                            {"int_order_id": int_order_id, "entry_keys": entry_keys},
+                        )
+
                 # Calculate entry position
                 try:
                     entry_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["entry"])
@@ -418,13 +425,16 @@ def get_pnl_table(
                     position_combo_info = calculate_extra_combo_positions(entry_position, base_position)
                     entry_quantity = position_combo_info.get("total_in_progress", 0)
                     entry_price = (
-                        sum(position.value for position in entry_position.values()) / entry_quantity if entry_quantity != 0 else 0.0
+                        sum(position.value for position in entry_position.values()) / entry_quantity
+                        if entry_quantity != 0
+                        else 0.0
                     )
                 except Exception as e:
-                    trading_logger.log_error(f"Error calculating entry position for {int_order_id}", e, {
-                        "int_order_id": int_order_id,
-                        "symbol": symbol
-                    })
+                    trading_logger.log_error(
+                        f"Error calculating entry position for {int_order_id}",
+                        e,
+                        {"int_order_id": int_order_id, "symbol": symbol},
+                    )
                     continue
 
                 # Refresh exit status if requested
@@ -435,11 +445,12 @@ def get_pnl_table(
                             broker_order_id = order.broker_order_id
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:
-                        trading_logger.log_error(f"Error refreshing exit status for {int_order_id}", e, {
-                            "int_order_id": int_order_id,
-                            "exit_keys": exit_keys
-                        })
-                
+                        trading_logger.log_error(
+                            f"Error refreshing exit status for {int_order_id}",
+                            e,
+                            {"int_order_id": int_order_id, "exit_keys": exit_keys},
+                        )
+
                 # Calculate exit position
                 try:
                     exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
@@ -447,47 +458,65 @@ def get_pnl_table(
                     position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
                     exit_quantity = position_combo_info.get("total_in_progress", 0)
                     exit_price = (
-                        sum(position.value for position in exit_position.values()) / exit_quantity if exit_quantity != 0 else 0
+                        sum(position.value for position in exit_position.values()) / exit_quantity
+                        if exit_quantity != 0
+                        else 0
                     )
                 except Exception as e:
-                    trading_logger.log_error(f"Error calculating exit position for {int_order_id}", e, {
-                        "int_order_id": int_order_id,
-                        "symbol": symbol
-                    })
+                    trading_logger.log_error(
+                        f"Error calculating exit position for {int_order_id}",
+                        e,
+                        {"int_order_id": int_order_id, "symbol": symbol},
+                    )
                     continue
-                
+
                 # Validate quantity consistency
                 if abs(exit_quantity) > abs(entry_quantity):
-                    trading_logger.log_error(f"Exit Quantity > Entry Quantity!! for internal order id: {int_order_id}", None, {
-                        "int_order_id": int_order_id,
-                        "entry_quantity": entry_quantity,
-                        "exit_quantity": exit_quantity,
-                        "symbol": symbol
-                    })
-                    # raise ValueError("exit quantity greater than entry quantity")
-                
-                # Handle option expiration
-                if exit_quantity + entry_quantity != 0 and contains_earlier_date(
-                    symbol, dt.datetime.today().strftime("%Y%m%d"), market_close_time
-                ):
-                    try:
-                        # are options expiration needed?
-                        get_open_position_by_order(broker=broker, int_order_id=int_order_id, market_close_time=market_close_time)
-                        exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
-                        exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
-                        base_position = parse_combo_symbol(symbol)
-                        position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
-                        exit_quantity = position_combo_info.get("total_in_progress", 0)
-                        exit_price = (
-                            sum(position.value for position in exit_position.values()) / exit_quantity if exit_quantity != 0 else 0
-                        )
-                        exit_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception as e:
-                        trading_logger.log_error(f"Error handling option expiration for {int_order_id}", e, {
+                    trading_logger.log_error(
+                        f"Exit Quantity > Entry Quantity!! for internal order id: {int_order_id}",
+                        None,
+                        {
                             "int_order_id": int_order_id,
+                            "entry_quantity": entry_quantity,
+                            "exit_quantity": exit_quantity,
                             "symbol": symbol,
-                            "market_close_time": market_close_time
-                        })
+                        },
+                    )
+                    # raise ValueError("exit quantity greater than entry quantity")
+
+                if eod:
+                    # Handle option expiration
+                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(
+                        symbol, dt.datetime.today().strftime("%Y%m%d"), market_close_time
+                    ):
+                        try:
+                            # are options expiration needed?
+                            get_open_position_by_order(
+                                broker=broker, int_order_id=int_order_id, market_close_time=market_close_time
+                            )
+                            exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+                            exit_position = get_open_position_by_order(
+                                broker, int_order_id, exclude_zero=True, side=["exit"]
+                            )
+                            base_position = parse_combo_symbol(symbol)
+                            position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
+                            exit_quantity = position_combo_info.get("total_in_progress", 0)
+                            exit_price = (
+                                sum(position.value for position in exit_position.values()) / exit_quantity
+                                if exit_quantity != 0
+                                else 0
+                            )
+                            exit_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception as e:
+                            trading_logger.log_error(
+                                f"Error handling option expiration for {int_order_id}",
+                                e,
+                                {
+                                    "int_order_id": int_order_id,
+                                    "symbol": symbol,
+                                    "market_close_time": market_close_time,
+                                },
+                            )
 
                 # create trade row for internal order id
                 row = {
@@ -506,14 +535,15 @@ def get_pnl_table(
                     "additional_info": additional_info,
                 }
                 trades.append(row)
-                
+
             except Exception as e:
-                trading_logger.log_error(f"Error processing internal order ID: {int_order_id}", e, {
-                    "int_order_id": int_order_id,
-                    "strategy": strategy
-                })
+                trading_logger.log_error(
+                    f"Error processing internal order ID: {int_order_id}",
+                    e,
+                    {"int_order_id": int_order_id, "strategy": strategy},
+                )
                 continue
-        
+
         # Process results
         try:
             out = pd.DataFrame(trades)
@@ -536,47 +566,49 @@ def get_pnl_table(
             else:
                 out = empty_trades
         except Exception as e:
-            trading_logger.log_error("Error processing P&L table results", e, {
-                "strategy": strategy,
-                "trades_count": len(trades),
-                "start_time": start_time,
-                "end_time": end_time
-            })
+            trading_logger.log_error(
+                "Error processing P&L table results",
+                e,
+                {"strategy": strategy, "trades_count": len(trades), "start_time": start_time, "end_time": end_time},
+            )
             out = empty_trades
-        
+
         return out
     except Exception as e:
-        trading_logger.log_error("Error in get_pnl_table", e, {
-            "strategy": strategy,
-            "start_time": start_time,
-            "end_time": end_time,
-            "refresh_status": refresh_status,
-            "market_close_time": market_close_time,
-            "eod": eod
-        })
-        raise PnLError(f"Failed to get P&L table for strategy {strategy}: {str(e)}", {
-            "strategy": strategy,
-            "error": str(e)
-        })
+        trading_logger.log_error(
+            "Error in get_pnl_table",
+            e,
+            {
+                "strategy": strategy,
+                "start_time": start_time,
+                "end_time": end_time,
+                "refresh_status": refresh_status,
+                "market_close_time": market_close_time,
+                "eod": eod,
+            },
+        )
+        raise PnLError(
+            f"Failed to get P&L table for strategy {strategy}: {str(e)}", {"strategy": strategy, "error": str(e)}
+        )
 
 
 @log_execution_time
 @validate_inputs(
     input_string=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     comparison_date=lambda x: isinstance(x, str) and len(x.strip()) == 8,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def contains_earlier_date(input_string: str, comparison_date: str, market_close_time: str) -> bool:
     """Check if input string contains dates earlier than comparison date.
-    
+
     Args:
         input_string: String to search for dates
         comparison_date: Date to compare against (YYYYMMDD format)
         market_close_time: Market close time (HH:MM:SS format)
-        
+
     Returns:
         bool: True if earlier date found, False otherwise
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         DataError: If date parsing fails
@@ -617,29 +649,31 @@ def contains_earlier_date(input_string: str, comparison_date: str, market_close_
                         date_obj = dt.datetime.strptime(date_str, "%m/%d/%Y")
 
                     if comparison_operator(date_obj):
-                        trading_logger.log_debug("Earlier date found", {
-                            "input_string": input_string[:100],
-                            "comparison_date": comparison_date,
-                            "found_date": date_str,
-                            "market_close_time": market_close_time
-                        })
+                        trading_logger.log_debug(
+                            "Earlier date found",
+                            {
+                                "input_string": input_string[:100],
+                                "comparison_date": comparison_date,
+                                "found_date": date_str,
+                                "market_close_time": market_close_time,
+                            },
+                        )
                         return True
                 except ValueError as e:
-                    trading_logger.log_debug("Invalid date format skipped", {
-                        "date_string": date_str,
-                        "pattern": str(pattern),
-                        "error": str(e)
-                    })
+                    trading_logger.log_debug(
+                        "Invalid date format skipped",
+                        {"date_string": date_str, "pattern": str(pattern), "error": str(e)},
+                    )
                     continue
 
         return False
-        
+
     except ValueError as e:
         context = create_error_context(
             input_string=input_string[:100],
             comparison_date=comparison_date,
             market_close_time=market_close_time,
-            error=str(e)
+            error=str(e),
         )
         raise DataError(f"Date parsing error: {str(e)}", context)
     except Exception as e:
@@ -647,7 +681,7 @@ def contains_earlier_date(input_string: str, comparison_date: str, market_close_
             input_string=input_string[:100],
             comparison_date=comparison_date,
             market_close_time=market_close_time,
-            error_type=type(e).__name__
+            error_type=type(e).__name__,
         )
         raise DataError(f"Error in date comparison: {str(e)}", context)
 
@@ -656,7 +690,7 @@ def contains_earlier_date(input_string: str, comparison_date: str, market_close_
 @validate_inputs(
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    broker_entry_side=lambda x: x is None or (isinstance(x, str) and x in ['BUY', 'SHORT'])
+    broker_entry_side=lambda x: x is None or (isinstance(x, str) and x in ["BUY", "SHORT"]),
 )
 def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_side: str) -> list[str]:
     """Get a list of internal order IDs for a specified symbol, strategy and entry side combination.
@@ -665,38 +699,33 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
         broker: Broker instance
         strategy (str): strategy name
         long_symbol (str): long symbol name
-        broker_entry_side (str): side of the entry trade. 'B' or 'S'. 
+        broker_entry_side (str): side of the entry trade. 'B' or 'S'.
                                 So if entry was "SHORT", broker_entry_side will be 'S'
 
     Returns:
         list[str]: list of internal order ids that meet entry combination
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         RedisError: If Redis operations fail
     """
     try:
         int_order_ids = []
-        
+
         # Scan for internal order IDs
         try:
             for int_order_id in broker.redis_o.scan_iter(strategy + "_" + "*"):
                 int_order_ids.append(int_order_id)
         except Exception as e:
-            context = create_error_context(
-                strategy=strategy,
-                scan_pattern=f"{strategy}_*",
-                error=str(e)
-            )
+            context = create_error_context(strategy=strategy, scan_pattern=f"{strategy}_*", error=str(e))
             raise RedisError(f"Failed to scan Redis for strategy {strategy}: {str(e)}", context)
-        
+
         if not int_order_ids:
-            trading_logger.log_info("No internal order IDs found for strategy", {
-                "strategy": strategy,
-                "long_symbol": long_symbol
-            })
+            trading_logger.log_info(
+                "No internal order IDs found for strategy", {"strategy": strategy, "long_symbol": long_symbol}
+            )
             return []
-        
+
         # Filter by long_symbol
         try:
             int_order_ids = [
@@ -708,64 +737,66 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
             ]
         except Exception as e:
             context = create_error_context(
-                strategy=strategy,
-                long_symbol=long_symbol,
-                int_order_ids_count=len(int_order_ids),
-                error=str(e)
+                strategy=strategy, long_symbol=long_symbol, int_order_ids_count=len(int_order_ids), error=str(e)
             )
             raise RedisError(f"Failed to filter orders by symbol {long_symbol}: {str(e)}", context)
-        
+
         # Filter by broker entry side if specified
+        combo = False
         if broker_entry_side is not None:
             try:
                 entry_keys = []
                 for int_order_id in int_order_ids:
+                    symbol = broker.redis_o.hget(int_order_id, "long_symbol")
+                    combo = True if ":" in symbol else False
                     entry_keys_str = broker.redis_o.hget(int_order_id, "entry_keys")
                     if entry_keys_str:
                         entry_keys.append(entry_keys_str.split()[0])
                     else:
-                        trading_logger.log_warning("No entry keys found for internal order ID", {
-                            "int_order_id": int_order_id,
-                            "strategy": strategy
-                        })
-                
+                        trading_logger.log_warning(
+                            "No entry keys found for internal order ID",
+                            {"int_order_id": int_order_id, "strategy": strategy},
+                        )
+
                 jsons = []
                 for entry_key in entry_keys:
                     if entry_key:
                         jsons.append(broker.redis_o.hgetall(entry_key))
                     else:
                         jsons.append({})
-                
-                indices = [i for i in range(len(jsons)) if jsons[i].get("order_type") == broker_entry_side]
+                if combo:
+                    indices = [i for i in range(len(jsons)) if "BUY" == broker_entry_side]
+                else:
+                    indices = [i for i in range(len(jsons)) if jsons[i].get("order_type") == broker_entry_side]
                 int_order_ids = [int_order_ids[index] for index in indices]
-                
+
             except Exception as e:
                 context = create_error_context(
                     strategy=strategy,
                     long_symbol=long_symbol,
                     broker_entry_side=broker_entry_side,
                     int_order_ids_count=len(int_order_ids),
-                    error=str(e)
+                    error=str(e),
                 )
                 raise RedisError(f"Failed to filter orders by entry side {broker_entry_side}: {str(e)}", context)
-        
-        trading_logger.log_debug("Orders by symbol retrieved", {
-            "strategy": strategy,
-            "long_symbol": long_symbol,
-            "broker_entry_side": broker_entry_side,
-            "order_count": len(int_order_ids)
-        })
-        
+
+        trading_logger.log_debug(
+            "Orders by symbol retrieved",
+            {
+                "strategy": strategy,
+                "long_symbol": long_symbol,
+                "broker_entry_side": broker_entry_side,
+                "order_count": len(int_order_ids),
+            },
+        )
+
         return int_order_ids
-        
+
     except (ValidationError, RedisError):
         raise
     except Exception as e:
         context = create_error_context(
-            strategy=strategy,
-            long_symbol=long_symbol,
-            broker_entry_side=broker_entry_side,
-            error_type=type(e).__name__
+            strategy=strategy, long_symbol=long_symbol, broker_entry_side=broker_entry_side, error_type=type(e).__name__
         )
         raise RedisError(f"Unexpected error in get_orders_by_symbol: {str(e)}", context)
 
@@ -773,7 +804,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
 @log_execution_time
 @validate_inputs(
     int_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_open_position_by_order(
     broker: BrokerBase,
@@ -783,49 +814,50 @@ def get_open_position_by_order(
     market_close_time: str = "15:30:00",
 ) -> Dict[str, Position]:
     """Get open positions for a specific internal order ID.
-    
+
     Args:
         broker: Broker instance
         int_order_id: Internal order ID
         exclude_zero: Whether to exclude zero positions
         side: List of sides to include ("entry", "exit")
         market_close_time: Market close time for expiry calculations
-        
+
     Returns:
         Dict[str, Position]: Dictionary of symbol to position mapping
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         RedisError: If Redis operations fail
         OrderError: If order processing fails
     """
-    trading_logger.log_debug(f"Getting open position for {int_order_id}", {
-        "int_order_id": int_order_id,
-        "exclude_zero": exclude_zero,
-        "side": side,
-        "market_close_time": market_close_time
-    })
+    trading_logger.log_debug(
+        f"Getting open position for {int_order_id}",
+        {
+            "int_order_id": int_order_id,
+            "exclude_zero": exclude_zero,
+            "side": side,
+            "market_close_time": market_close_time,
+        },
+    )
 
     def _get_position_by_broker_order_ids(keys, positions: Dict[str, Position]) -> Dict[str, Position]:
         """Helper function to get positions from broker order IDs."""
         try:
             for key in keys:
                 if not key:
-                    trading_logger.log_warning("Empty key found in broker order IDs", {
-                        "int_order_id": int_order_id,
-                        "keys": keys
-                    })
+                    trading_logger.log_warning(
+                        "Empty key found in broker order IDs", {"int_order_id": int_order_id, "keys": keys}
+                    )
                     continue
-                    
+
                 try:
                     order_data = broker.redis_o.hgetall(key)
                     if not order_data:
-                        trading_logger.log_warning("No order data found for key", {
-                            "key": key,
-                            "int_order_id": int_order_id
-                        })
+                        trading_logger.log_warning(
+                            "No order data found for key", {"key": key, "int_order_id": int_order_id}
+                        )
                         continue
-                        
+
                     order = Order(**order_data)
                     symbol = order.long_symbol
                     position = positions.get(symbol, Position())
@@ -838,23 +870,19 @@ def get_open_position_by_order(
                     else:
                         position.price = 0
                     positions[symbol] = position
-                    
+
                 except Exception as e:
-                    trading_logger.log_error(f"Error processing order key {key}", e, {
-                        "key": key,
-                        "int_order_id": int_order_id,
-                        "error": str(e)
-                    })
+                    trading_logger.log_error(
+                        f"Error processing order key {key}",
+                        e,
+                        {"key": key, "int_order_id": int_order_id, "error": str(e)},
+                    )
                     continue
-                    
+
             return positions
-            
+
         except Exception as e:
-            context = create_error_context(
-                int_order_id=int_order_id,
-                keys_count=len(keys),
-                error=str(e)
-            )
+            context = create_error_context(int_order_id=int_order_id, keys_count=len(keys), error=str(e))
             raise OrderError(f"Failed to get positions from broker order IDs: {str(e)}", context)
 
     def _expire_derivative(
@@ -929,101 +957,72 @@ def get_open_position_by_order(
 
 
 @log_execution_time
-@validate_inputs(
-    combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0
-)
+@validate_inputs(combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0)
 def parse_combo_symbol(combo_symbol):
     """Parse a combo symbol string into individual symbols and quantities.
-    
+
     Args:
         combo_symbol: Symbol string that may contain combo notation
-        
+
     Returns:
         OrderedDict: Dictionary mapping symbol names to quantities
-        
+
     Raises:
         ValidationError: If input parameter is invalid
         SymbolError: If combo symbol parsing fails
     """
     try:
         result = OrderedDict()
-        
+
         if "?" not in combo_symbol:
             result[combo_symbol] = 1
-            trading_logger.log_debug("Parsed simple symbol", {
-                "combo_symbol": combo_symbol,
-                "result": dict(result)
-            })
+            trading_logger.log_debug("Parsed simple symbol", {"combo_symbol": combo_symbol, "result": dict(result)})
             return result
 
         symbols = combo_symbol.split(":")
-        
+
         if len(symbols) == 0:
-            context = create_error_context(
-                combo_symbol=combo_symbol,
-                split_result=symbols
-            )
+            context = create_error_context(combo_symbol=combo_symbol, split_result=symbols)
             raise SymbolError("Empty combo symbol after splitting", context)
 
         for i, symbol in enumerate(symbols):
             try:
                 if "?" not in symbol:
-                    context = create_error_context(
-                        combo_symbol=combo_symbol,
-                        symbol=symbol,
-                        index=i
-                    )
+                    context = create_error_context(combo_symbol=combo_symbol, symbol=symbol, index=i)
                     raise SymbolError(f"Symbol {symbol} does not contain quantity separator '?'", context)
-                    
+
                 name, quantity_str = symbol.split("?", 1)
-                
+
                 if not name.strip():
-                    context = create_error_context(
-                        combo_symbol=combo_symbol,
-                        symbol=symbol,
-                        index=i
-                    )
+                    context = create_error_context(combo_symbol=combo_symbol, symbol=symbol, index=i)
                     raise SymbolError(f"Empty symbol name in combo {combo_symbol}", context)
-                
+
                 try:
                     quantity = int(quantity_str)
                 except ValueError as e:
                     context = create_error_context(
-                        combo_symbol=combo_symbol,
-                        symbol=symbol,
-                        quantity_str=quantity_str,
-                        index=i
+                        combo_symbol=combo_symbol, symbol=symbol, quantity_str=quantity_str, index=i
                     )
                     raise SymbolError(f"Invalid quantity '{quantity_str}' in combo symbol", context)
-                
+
                 result[name.strip()] = quantity
-                
+
             except SymbolError:
                 raise
             except Exception as e:
-                context = create_error_context(
-                    combo_symbol=combo_symbol,
-                    symbol=symbol,
-                    index=i,
-                    error=str(e)
-                )
+                context = create_error_context(combo_symbol=combo_symbol, symbol=symbol, index=i, error=str(e))
                 raise SymbolError(f"Error parsing symbol '{symbol}' in combo: {str(e)}", context)
 
-        trading_logger.log_debug("Parsed combo symbol", {
-            "combo_symbol": combo_symbol,
-            "symbols_count": len(result),
-            "result": dict(result)
-        })
-        
+        trading_logger.log_debug(
+            "Parsed combo symbol", {"combo_symbol": combo_symbol, "symbols_count": len(result), "result": dict(result)}
+        )
+
         return result
-        
+
     except (ValidationError, SymbolError):
         raise
     except Exception as e:
-        context = create_error_context(
-            combo_symbol=combo_symbol,
-            error_type=type(e).__name__
-        )
+        context = create_error_context(combo_symbol=combo_symbol, error_type=type(e).__name__)
         raise SymbolError(f"Unexpected error parsing combo symbol: {str(e)}", context)
 
 
@@ -1063,7 +1062,7 @@ def get_exit_candidates(broker: BrokerBase, strategy: str, long_symbol: str, sid
 @log_execution_time
 @validate_inputs(
     symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_limit_price(
     broker: BrokerBase,
@@ -1075,7 +1074,7 @@ def get_limit_price(
     mds=False,
 ):
     """Get limit price based on price type and market data.
-    
+
     Args:
         broker: Broker instance
         price_type: Type of price calculation (LMT, BID, ASK, MKT, etc.)
@@ -1084,10 +1083,10 @@ def get_limit_price(
         price_broker: Optional list of brokers for price data
         exchange: Exchange name
         mds: Whether to use market data service
-        
+
     Returns:
         float: Calculated limit price
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         MarketDataError: If price calculation fails
@@ -1184,25 +1183,22 @@ def get_combo_sub_order_type(order: Order, sub_order_qty: int) -> str:
 
 
 @log_execution_time
-@validate_inputs(
-    strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    paper=lambda x: isinstance(x, bool)
-)
+@validate_inputs(strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0, paper=lambda x: isinstance(x, bool))
 def transmit_entry_order(
     broker: BrokerBase, strategy: str, order: Order, paper: bool = True, price_broker: Optional[List[BrokerBase]] = None
 ) -> str:
     """Transmit entry order to broker with enhanced error handling.
-    
+
     Args:
         broker: Broker instance
         strategy: Strategy name
         order: Order object to transmit
         paper: Whether this is a paper trade
         price_broker: Optional list of brokers for price data
-        
+
     Returns:
         str: Internal order ID
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         OrderError: If order transmission fails
@@ -1218,6 +1214,10 @@ def transmit_entry_order(
     Returns:
         str: internal order id
     """
+    # Enforce: combo orders (with ":") must have order_type "BUY"
+    if ":" in order.long_symbol and order.order_type != "BUY":
+        logger.error(f"Combo order {order.long_symbol} must have order_type 'BUY'. Got '{order.order_type}' instead.")
+        return None
 
     if order.price is None:
         logger.error(f"Order not placed. Price was set as None for symbol: {order.long_symbol}")
@@ -1633,7 +1633,7 @@ def update_order_status(
 @log_execution_time
 @validate_inputs(
     symbol_name=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = "", exchange: str = "NSE") -> list[str]:
     """Get option chain with enhanced error handling.
@@ -1646,7 +1646,7 @@ def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = "", e
 
     Returns:
         list[str]: List containing longnames of available option symbols
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         SymbolError: If symbol mapping fails
@@ -1778,7 +1778,7 @@ def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str =
 @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
 @validate_inputs(
     long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = "", exchange="NSE") -> int:
     """Get margin from Zerodha for option contracts with enhanced error handling.
@@ -1791,7 +1791,7 @@ def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = "", ex
 
     Returns:
         int: Margin for contract
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         MarginError: If margin calculation fails
@@ -2084,7 +2084,7 @@ def get_free_proxy(driver_path: str = "") -> str:
 @log_execution_time
 @validate_inputs(
     long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_yield(broker: BrokerBase, long_symbol: str, proxy=None, exchange="NSE") -> list[float]:
     """Get yield to expiry of an option contract with enhanced error handling.
@@ -2097,7 +2097,7 @@ def get_yield(broker: BrokerBase, long_symbol: str, proxy=None, exchange="NSE") 
 
     Returns:
         list[float]: [midprice, bid, ask, yield, margin]
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         MarketDataError: If price retrieval fails
@@ -2208,21 +2208,27 @@ def get_price(
                         price = broker.get_quote(long_symbol, mapped_exchange)
                     out.update(price)
                     if all(not math.isnan(getattr(out, check)) for check in checks):
-                        trading_logger.log_debug(f"Successfully retrieved price for {long_symbol}", {
+                        trading_logger.log_debug(
+                            f"Successfully retrieved price for {long_symbol}",
+                            {
+                                "symbol": long_symbol,
+                                "exchange": exchange,
+                                "attempt": attempt + 1,
+                                "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
+                            },
+                        )
+                        return out
+                except Exception as e:
+                    trading_logger.log_warning(
+                        f"Failed to get price for {long_symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
+                        {
                             "symbol": long_symbol,
                             "exchange": exchange,
                             "attempt": attempt + 1,
-                            "broker": broker.broker.name if hasattr(broker, 'broker') else 'unknown'
-                        })
-                        return out
-                except Exception as e:
-                    trading_logger.log_warning(f"Failed to get price for {long_symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}", {
-                        "symbol": long_symbol,
-                        "exchange": exchange,
-                        "attempt": attempt + 1,
-                        "broker": broker.broker.name if hasattr(broker, 'broker') else 'unknown',
-                        "error": str(e)
-                    })
+                            "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
+                            "error": str(e),
+                        },
+                    )
                     continue
     else:
         out_list = []
@@ -2239,25 +2245,26 @@ def get_price(
                             valid_price_found = True
                             break  # Stop attempts for this symbol if a valid price is found
                     except Exception as e:
-                        trading_logger.log_warning(f"Failed to get price for {symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}", {
-                            "symbol": symbol,
-                            "exchange": exchange,
-                            "attempt": attempt + 1,
-                            "broker": broker.broker.name if hasattr(broker, 'broker') else 'unknown',
-                            "error": str(e)
-                        })
+                        trading_logger.log_warning(
+                            f"Failed to get price for {symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
+                            {
+                                "symbol": symbol,
+                                "exchange": exchange,
+                                "attempt": attempt + 1,
+                                "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
+                                "error": str(e),
+                            },
+                        )
                         continue
                 if valid_price_found:
                     break  # Stop attempts for other brokers for this symbol
             out_list.append(out)
         out = sum_prices(out_list)
         out.symbol = long_symbol
-    
-    trading_logger.log_debug(f"Retrieved price for {long_symbol}", {
-        "symbol": long_symbol,
-        "exchange": exchange,
-        "final_price": str(out)
-    })
+
+    trading_logger.log_debug(
+        f"Retrieved price for {long_symbol}", {"symbol": long_symbol, "exchange": exchange, "final_price": str(out)}
+    )
     return out
 
 
@@ -2280,7 +2287,6 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
     if last and math.isnan(mid):
         return quote.last
     return mid
-     
 
 
 def get_option_underlying_price(
@@ -2297,7 +2303,11 @@ def get_option_underlying_price(
         float: price of underlying
     """
     if not fut_expiry:
-        underlying = symbol.split("_")[0] + "_IND___" if "NIFTY" in symbol or "SENSEX" in symbol else symbol.split("_")[0] + "_STK___"
+        underlying = (
+            symbol.split("_")[0] + "_IND___"
+            if "NIFTY" in symbol or "SENSEX" in symbol
+            else symbol.split("_")[0] + "_STK___"
+        )
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
     else:
         underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
@@ -2450,7 +2460,7 @@ def find_option_with_delta(
     opt_expiry=lambda x: isinstance(x, str) and len(x.strip()) == 8,
     option_type=lambda x: isinstance(x, str) and x in ["CALL", "PUT"],
     exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0
+    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_delta_strike(
     brokers: list[BrokerBase],
@@ -2468,7 +2478,7 @@ def get_delta_strike(
     mds=False,
 ) -> Union[str, None]:
     """Get option strike price for a given delta with enhanced error handling.
-    
+
     Args:
         brokers: List of broker instances
         underlying_symbol: Underlying symbol name
@@ -2483,10 +2493,10 @@ def get_delta_strike(
         market_close_time: Market close time
         exchange: Exchange name
         mds: Whether to use market data service
-        
+
     Returns:
         Union[str, None]: Option symbol or None if not found
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         MarketDataError: If price retrieval fails
@@ -2605,7 +2615,7 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     entry=lambda x: isinstance(x, bool),
     validate_db_position=lambda x: isinstance(x, bool),
-    paper=lambda x: isinstance(x, bool)
+    paper=lambda x: isinstance(x, bool),
 )
 def place_combo_order(
     execution_broker: BrokerBase,
@@ -2619,9 +2629,10 @@ def place_combo_order(
     price_types: list = [],
     validate_db_position: bool = True,
     paper: bool = True,
+    trade_ts: str = None,
 ) -> dict:
     """Place a combo order with broker with enhanced error handling.
-    
+
     Args:
         execution_broker: Broker instance for order execution
         strategy: Strategy name
@@ -2634,10 +2645,10 @@ def place_combo_order(
         price_types: List of price types for each symbol
         validate_db_position: Whether to validate database position
         paper: Whether this is a paper trade
-        
+
     Returns:
         dict: Dictionary with symbol to internal order ID mapping
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         OrderError: If order placement fails
@@ -2705,6 +2716,8 @@ def place_combo_order(
             price_type=price_type,
             additional_info=additional_info,
         )
+        if trade_ts:
+            temp_order.remote_order_id = valid_datetime(trade_ts)[0].strftime("%Y%m%d%H%M%S%f")[:-4]
         logger.info(f"{symbol} {exch} {size} {side}")
         if entry:
             temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper)
@@ -2715,9 +2728,7 @@ def place_combo_order(
 
 
 @log_execution_time
-@validate_inputs(
-    pnl=lambda x: isinstance(x, pd.DataFrame) and len(x) >= 0
-)
+@validate_inputs(pnl=lambda x: isinstance(x, pd.DataFrame) and len(x) >= 0)
 def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds=False) -> pd.DataFrame:
     """Calculates MTM for a profit DataFrame which has open trades.
 
@@ -2728,7 +2739,7 @@ def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds=False) -> pd
 
     Returns:
         pd.DataFrame: Profit DataFrame with mark-to-market prices
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         MarketDataError: If price retrieval fails
@@ -2982,9 +2993,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
 
 
 @log_execution_time
-@validate_inputs(
-    trades=lambda x: isinstance(x, pd.DataFrame) and len(x) >= 0
-)
+@validate_inputs(trades=lambda x: isinstance(x, pd.DataFrame) and len(x) >= 0)
 def calc_pnl(trades: pd.DataFrame, brok: Optional[BrokerBase] = None):
     """Calculates absolute profit/loss arising from a trade object.
     This function adds/amends pnl column to input dataframe.
@@ -2995,7 +3004,7 @@ def calc_pnl(trades: pd.DataFrame, brok: Optional[BrokerBase] = None):
 
     Returns:
         pd.DataFrame: Trades dataframe with calculated P&L
-        
+
     Raises:
         ValidationError: If input parameters are invalid
         PnLError: If P&L calculation fails
