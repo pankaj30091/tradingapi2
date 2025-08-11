@@ -13,7 +13,7 @@ from .config import is_config_loaded, load_config
 
 class StructuredFormatter(logging.Formatter):
     """Custom formatter that includes extra fields in the log output."""
-    
+
     def format(self, record):
         # Create a copy of the record to avoid modifying the original
         record_copy = logging.LogRecord(
@@ -24,32 +24,51 @@ class StructuredFormatter(logging.Formatter):
             msg=record.msg,
             args=record.args,
             exc_info=record.exc_info,
-            func=record.funcName
+            func=record.funcName,
         )
-        
+
         # Copy all attributes from the original record
         for key, value in record.__dict__.items():
             if key not in record_copy.__dict__:
                 setattr(record_copy, key, value)
-        
+
         # Add extra fields to the message if they exist
         extra_parts = []
-        
+
         # Check for extra fields in the record (excluding standard logging fields)
         standard_fields = {
-            'name', 'msg', 'args', 'levelname', 'levelno', 'pathname', 'filename', 
-            'module', 'lineno', 'funcName', 'created', 'msecs', 'relativeCreated', 
-            'thread', 'threadName', 'processName', 'process', 'getMessage', 
-            'exc_info', 'exc_text', 'stack_info', 'asctime', 'message'
+            "name",
+            "msg",
+            "args",
+            "levelname",
+            "levelno",
+            "pathname",
+            "filename",
+            "module",
+            "lineno",
+            "funcName",
+            "created",
+            "msecs",
+            "relativeCreated",
+            "thread",
+            "threadName",
+            "processName",
+            "process",
+            "getMessage",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "asctime",
+            "message",
         }
-        
+
         for key, value in record_copy.__dict__.items():
-            if key not in standard_fields and not key.startswith('_'):
+            if key not in standard_fields and not key.startswith("_"):
                 extra_parts.append(f"{key}={value}")
-        
+
         if extra_parts:
             record_copy.msg = f"{record_copy.msg} | {' | '.join(extra_parts)}"
-        
+
         return super().format(record_copy)
 
 
@@ -60,11 +79,11 @@ def get_default_config_path():
 
 class TradingAPILogger:
     """Centralized logger for the tradingAPI package with structured logging capabilities."""
-    
+
     def __init__(self, name: str = "tradingapi"):
         self.logger = logging.getLogger(name)
         self._configured = False
-    
+
     def configure(
         self,
         level: int = logging.WARNING,
@@ -77,7 +96,7 @@ class TradingAPILogger:
     ):
         """
         Configure logging for the tradingAPI package with enhanced features.
-        
+
         Args:
             level: Logging level (e.g., logging.DEBUG, logging.INFO).
             log_file: Path to the log file. If None, logs will go to the console.
@@ -89,7 +108,7 @@ class TradingAPILogger:
         """
         if self._configured and not clear_existing_handlers:
             return
-        
+
         if clear_existing_handlers:
             for handler in logging.root.handlers[:]:
                 logging.root.removeHandler(handler)
@@ -100,13 +119,13 @@ class TradingAPILogger:
         handlers = []
         # Use StructuredFormatter for better extra field handling
         formatter = StructuredFormatter(format_string)
-        
+
         if log_file:
             # Ensure log directory exists
             log_dir = os.path.dirname(log_file)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
-                
+
             file_handler = TimedRotatingFileHandler(log_file, when="midnight", backupCount=backup_count)
             file_handler.suffix = "%Y%m%d"
             file_handler.setLevel(level)
@@ -123,23 +142,26 @@ class TradingAPILogger:
         self.logger.setLevel(level)
         for handler in handlers:
             self.logger.addHandler(handler)
-        
+
         self._configured = True
-        
+
         # Log configuration
-        self.logger.info("TradingAPI logging configured", extra={
-            "log_file": log_file,
-            "level": logging.getLevelName(level),
-            "console_enabled": enable_console,
-            "structured_logging": enable_structured_logging
-        })
-    
+        self.logger.info(
+            "TradingAPI logging configured",
+            extra={
+                "log_file": log_file,
+                "level": logging.getLevelName(level),
+                "console_enabled": enable_console,
+                "structured_logging": enable_structured_logging,
+            },
+        )
+
     def get_logger(self, name: str = None) -> logging.Logger:
         """Get a logger instance with the specified name."""
         if name:
             return logging.getLogger(f"tradingapi.{name}")
         return self.logger
-    
+
     def _get_caller_info(self):
         """Get information about the calling function."""
         try:
@@ -150,53 +172,53 @@ class TradingAPILogger:
                 return {
                     "caller_filename": info.filename,
                     "caller_lineno": info.lineno,
-                    "caller_function": info.function
+                    "caller_function": info.function,
                 }
-        except:
+        except Exception:
             pass
         return {}
-    
+
     def log_error(self, message: str, error: Exception = None, context: dict = None, exc_info: bool = True):
         """Log an error with structured context."""
         extra = context or {}
         if error:
             extra["error_type"] = type(error).__name__
             extra["error_message"] = str(error)
-        
+
         # Add caller information
         caller_info = self._get_caller_info()
         extra.update(caller_info)
-        
+
         self.logger.error(message, extra=extra, exc_info=exc_info)
-    
+
     def log_warning(self, message: str, context: dict = None):
         """Log a warning with structured context."""
         extra = context or {}
-        
+
         # Add caller information
         caller_info = self._get_caller_info()
         extra.update(caller_info)
-        
+
         self.logger.warning(message, extra=extra)
-    
+
     def log_info(self, message: str, context: dict = None):
         """Log an info message with structured context."""
         extra = context or {}
-        
+
         # Add caller information
         caller_info = self._get_caller_info()
         extra.update(caller_info)
-        
+
         self.logger.info(message, extra=extra)
-    
+
     def log_debug(self, message: str, context: dict = None):
         """Log a debug message with structured context."""
         extra = context or {}
-        
+
         # Add caller information
         caller_info = self._get_caller_info()
         extra.update(caller_info)
-        
+
         self.logger.debug(message, extra=extra)
 
 
@@ -244,23 +266,23 @@ def configure_logging(
         # Configure root logger to capture all errors
         root_logger = logging.getLogger()
         root_logger.setLevel(level)
-        
+
         # Clear existing handlers if requested
         if clear_existing_handlers:
             for handler in root_logger.handlers[:]:
                 root_logger.removeHandler(handler)
-        
+
         # Create handlers for root logger
         handlers = []
         # Use StructuredFormatter for better extra field handling
         formatter = StructuredFormatter(format_string)
-        
+
         if log_file:
             # Ensure log directory exists
             log_dir = os.path.dirname(log_file)
             if log_dir and not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
-                
+
             file_handler = TimedRotatingFileHandler(log_file, when="midnight", backupCount=backup_count)
             file_handler.suffix = "%Y%m%d"
             file_handler.setLevel(level)
@@ -272,7 +294,7 @@ def configure_logging(
             console_handler.setLevel(level)
             console_handler.setFormatter(formatter)
             handlers.append(console_handler)
-        
+
         # Add handlers to root logger
         for handler in handlers:
             root_logger.addHandler(handler)
@@ -283,6 +305,7 @@ def configure_logging(
             logger = logging.getLogger(module_name)
             logger.setLevel(level)
             # Don't add handlers to avoid duplication
+
 
 # Set default logging level to WARNING and log to console by default
 # Don't configure root logger by default to avoid duplicate logs
@@ -296,15 +319,14 @@ def initialize_config(config_file_path: str, force_reload: bool = True):
             raise RuntimeError("Configuration is already loaded.")
         else:
             load_config(config_file_path)
-            trading_logger.log_info("Configuration initialized successfully", {
-                "config_file": config_file_path,
-                "force_reload": force_reload
-            })
+            trading_logger.log_info(
+                "Configuration initialized successfully",
+                {"config_file": config_file_path, "force_reload": force_reload},
+            )
     except Exception as e:
-        trading_logger.log_error("Failed to initialize configuration", e, {
-            "config_file": config_file_path,
-            "force_reload": force_reload
-        })
+        trading_logger.log_error(
+            "Failed to initialize configuration", e, {"config_file": config_file_path, "force_reload": force_reload}
+        )
         raise
 
 

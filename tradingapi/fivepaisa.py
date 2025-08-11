@@ -39,6 +39,7 @@ from .exceptions import (
 )
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from . import trading_logger
+from .globals import get_tradingapi_now
 
 logger = logging.getLogger(__name__)
 config = get_config()
@@ -329,7 +330,7 @@ class FivePaisa(BrokerBase):
             trading_logger.log_info("Updating symbology", {"broker_name": self.broker.name})
 
             try:
-                dt_today = dt.datetime.today().strftime("%Y%m%d")
+                dt_today = get_tradingapi_now().strftime("%Y%m%d")
                 symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
 
                 if not symbol_codes_path:
@@ -837,9 +838,7 @@ class FivePaisa(BrokerBase):
                     )
                     raise ValidationError(f"Invalid order type: {order.order_type}", context)
 
-                # Generate remote order ID
-                if order.remote_order_id is None or order.remote_order_id == "":
-                    order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
+                order.remote_order_id = get_tradingapi_now().strftime("%Y%m%d%H%M%S%f")[:-4]
 
                 if not order.paper:
                     # Real order placement
@@ -1913,9 +1912,10 @@ class FivePaisa(BrokerBase):
         self,
         symbols: Union[str, pd.DataFrame, dict],
         date_start: Union[str, dt.datetime, dt.date],
-        date_end: Union[str, dt.datetime, dt.date] = dt.datetime.today().strftime("%Y-%m-%d"),
+        date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
+        market_open_time: str = "09:15:00",
         market_close_time: str = "15:30:00",
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -2030,8 +2030,9 @@ class FivePaisa(BrokerBase):
                             data.columns = ["date", "open", "high", "low", "close", "volume"]
                             data["date"] = pd.to_datetime(data["date"])
                             data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
-                            data = data[data["date"].dt.time < pd.to_datetime(market_close_time).time()]
-
+                            market_open = pd.to_datetime(market_open_time).time()
+                            market_close = pd.to_datetime(market_close_time).time()
+                            data = data[(data["date"].dt.time >= market_open) & (data["date"].dt.time < market_close)]
                             # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
                             if any(period in periodicity for period in ["d"]):
                                 data["date"] = data["date"].dt.floor("D")
@@ -2386,7 +2387,7 @@ class FivePaisa(BrokerBase):
                 trading_logger.log_warning(
                     "Invalid date format", {"date_string": date_string, "expected_format": "/Date(milliseconds)/"}
                 )
-                return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
 
             try:
                 # Convert the timestamp from milliseconds to seconds
@@ -2394,7 +2395,7 @@ class FivePaisa(BrokerBase):
                 timestamp_s = timestamp_ms / 1000
 
                 # Convert to UTC datetime
-                utc_time = dt.datetime.utcfromtimestamp(timestamp_s)
+                utc_time = dt.datetime.fromtimestamp(timestamp_s, tz=dt.timezone.utc)
 
                 # Convert to IST by adding 5 hours and 30 minutes
                 ist_time = utc_time + dt.timedelta(hours=5, minutes=30)

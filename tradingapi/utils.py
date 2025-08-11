@@ -41,6 +41,7 @@ from .exceptions import (
 )
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from . import trading_logger
+from .globals import get_tradingapi_now
 
 logger = logging.getLogger(__name__)
 r = redis.Redis(db=0, charset="utf-8", decode_responses=True)
@@ -293,7 +294,7 @@ def get_pnl_table(
     broker: BrokerBase,
     strategy: str,
     start_time: str = "1970-01-01 00:00:00",
-    end_time: str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    end_time: str = get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S"),
     refresh_status=False,
     market_close_time="15:30:00",
     eod=False,
@@ -487,7 +488,7 @@ def get_pnl_table(
                 if eod:
                     # Handle option expiration
                     if exit_quantity + entry_quantity != 0 and contains_earlier_date(
-                        symbol, dt.datetime.today().strftime("%Y%m%d"), market_close_time
+                        symbol, get_tradingapi_now().strftime("%Y%m%d"), market_close_time
                     ):
                         try:
                             # are options expiration needed?
@@ -506,7 +507,7 @@ def get_pnl_table(
                                 if exit_quantity != 0
                                 else 0
                             )
-                            exit_time = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            exit_time = get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
                         except Exception as e:
                             trading_logger.log_error(
                                 f"Error handling option expiration for {int_order_id}",
@@ -625,7 +626,7 @@ def contains_earlier_date(input_string: str, comparison_date: str, market_close_
         comparison_date_obj = dt.datetime.strptime(comparison_date, "%Y%m%d")
 
         # Get the current datetime and convert market close time to datetime object
-        current_datetime = dt.datetime.now()
+        current_datetime = get_tradingapi_now()
         market_close_time_obj = dt.datetime.strptime(market_close_time, "%H:%M:%S").time()
 
         # Define the comparison operator function based on market close time
@@ -894,10 +895,10 @@ def get_open_position_by_order(
             expiry is not None
             and len(expiry) > 0
             and (
-                expiry < dt.datetime.today().strftime("%Y%m%d")
+                expiry < get_tradingapi_now().strftime("%Y%m%d")
                 or (
-                    expiry == dt.datetime.today().strftime("%Y%m%d")
-                    and dt.datetime.now().strftime("%H:%M:%S") > market_close_time
+                    expiry == get_tradingapi_now().strftime("%Y%m%d")
+                    and get_tradingapi_now().strftime("%H:%M:%S") > market_close_time
                 )
             )
         ):
@@ -919,7 +920,7 @@ def get_open_position_by_order(
             sq_off_order.exch_order_id = (
                 str(secrets.randbelow(9000000000000000 - 1000000000000000) + 1000000000000000) + "P"
             )
-            sq_off_order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
+            sq_off_order.remote_order_id = get_tradingapi_now().strftime("%Y%m%d%H%M%S%f")[:-4]
             sq_off_order.broker_order_id = str(secrets.randbelow(90000000) + 10000000) + "P"
             sq_off_order.orderRef = internal_order_id
             sq_off_order.internal_order_id = internal_order_id
@@ -2341,7 +2342,7 @@ def calculate_delta(
     price = (ticker.bid + ticker.ask) / 2 if ticker.bid > 0 and ticker.ask > 0 else ticker.prior_close
     t = (
         calc_fractional_business_days(
-            dt.datetime.now(),
+            get_tradingapi_now(),
             dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
         )
         / 252
@@ -2629,7 +2630,6 @@ def place_combo_order(
     price_types: list = [],
     validate_db_position: bool = True,
     paper: bool = True,
-    trade_ts: str = None,
 ) -> dict:
     """Place a combo order with broker with enhanced error handling.
 
@@ -2716,8 +2716,6 @@ def place_combo_order(
             price_type=price_type,
             additional_info=additional_info,
         )
-        if trade_ts:
-            temp_order.remote_order_id = valid_datetime(trade_ts)[0].strftime("%Y%m%d%H%M%S%f")[:-4]
         logger.info(f"{symbol} {exch} {size} {side}")
         if entry:
             temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper)
@@ -2794,7 +2792,7 @@ def get_expiry_from_FormattedExpiryTime(timestamp_str) -> str:
     timestamp_with_offset = timestamp_seconds + offset_timedelta.total_seconds()
 
     # Convert the timestamp to a datetime object
-    date_object = dt.datetime.utcfromtimestamp(timestamp_with_offset)
+    date_object = dt.datetime.fromtimestamp(timestamp_with_offset, tz=dt.timezone.utc)
 
     # Format the datetime object as a string
     formatted_date = date_object.strftime("%Y-%m-%d")

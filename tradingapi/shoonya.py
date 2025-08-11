@@ -29,6 +29,7 @@ from .config import get_config
 from .utils import set_starting_internal_ids_int, update_order_status
 from . import trading_logger
 from .error_handling import validate_inputs, log_execution_time, retry_on_error
+from .globals import get_tradingapi_now
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -655,7 +656,7 @@ class Shoonya(BrokerBase):
         return super().disconnect()
 
     def update_symbology(self, **kwargs):
-        dt_today = dt.datetime.today().strftime("%Y%m%d")
+        dt_today = get_tradingapi_now().strftime("%Y%m%d")
         symbols_path = os.path.join(config.get(f"{self.broker.name}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
         if not os.path.exists(symbols_path):
             codes = save_symbol_data(saveToFolder=False)
@@ -741,8 +742,7 @@ class Shoonya(BrokerBase):
                         "Invalid order type", {"order_type": order.order_type, "long_symbol": order.long_symbol}
                     )
                     return order
-                if order.remote_order_id is None or order.remote_order_id == "":
-                    order.remote_order_id = dt.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-4]
+                order.remote_order_id = get_tradingapi_now().strftime("%Y%m%d%H%M%S%f")[:-4]
 
                 if not order.paper:
                     try:
@@ -1060,9 +1060,10 @@ class Shoonya(BrokerBase):
         self,
         symbols: Union[str, pd.DataFrame, dict],
         date_start: Union[str, dt.datetime, dt.date],
-        date_end: Union[str, dt.datetime, dt.date] = dt.datetime.today().strftime("%Y-%m-%d"),
+        date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange="NSE",
         periodicity="1m",
+        market_open_time="09:15:00",
         market_close_time="15:30:00",
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -1194,11 +1195,16 @@ class Shoonya(BrokerBase):
                 data = None
 
             if not (data is None or len(data) == 0):
+                market_open = pd.to_datetime(market_open_time).time()
+                market_close = pd.to_datetime(market_close_time).time()
                 for d in data:
                     if isinstance(d, str):
                         d = json.loads(d)
                     if periodicity.endswith("m"):
                         date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
+                        # Filter by market open/close time for intraday
+                        if not (market_open <= date.time() < market_close):
+                            continue
                     elif periodicity == "1d":
                         date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
                     historical_data = HistoricalData(
@@ -1226,14 +1232,14 @@ class Shoonya(BrokerBase):
                         oi=0,
                     )
                 )
-            if periodicity == "1d" and date_end_dt.date() == dt.datetime.today().date():
+            if periodicity == "1d" and date_end_dt.date() == get_tradingapi_now().date():
                 # make a call to permin data for start date and end date of today
                 if historical_data_list:
                     last_date = historical_data_list[0].date
                     if last_date is not None:
                         today_start = last_date + dt.timedelta(days=1)
                     else:
-                        today_start = dt.datetime.today()
+                        today_start = get_tradingapi_now().date()
                     today_start = dt.datetime.combine(today_start, dt.datetime.min.time())
                 else:
                     today_start = dt.datetime.combine(dt.datetime.today(), dt.datetime.min.time())
@@ -1333,8 +1339,8 @@ class Shoonya(BrokerBase):
 
     def convert_ft_to_ist(self, ft: int):
         if ft == 0:
-            return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        utc_time = dt.datetime.utcfromtimestamp(ft)
+            return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
+        utc_time = dt.datetime.fromtimestamp(ft, tz=dt.timezone.utc)
         # Add 5 hours and 30 minutes to get IST
         ist_time = utc_time + dt.timedelta(hours=5, minutes=30)
 
