@@ -1483,8 +1483,8 @@ class FlatTrade(BrokerBase):
                         )
                         .dropna()
                     )
-                    date_start = timezone.localize(date_start)
-                    date_end = timezone.localize(date_end)
+                    date_start = timezone.localize(date_start_dt)
+                    date_end = timezone.localize(date_end_dt)
                     for _, row in df_intraday.iterrows():
                         date = pd.Timestamp(row.name).tz_localize(timezone)
                         if date_start <= date <= date_end:

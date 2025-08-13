@@ -2030,9 +2030,12 @@ class FivePaisa(BrokerBase):
                             data.columns = ["date", "open", "high", "low", "close", "volume"]
                             data["date"] = pd.to_datetime(data["date"])
                             data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
-                            market_open = pd.to_datetime(market_open_time).time()
-                            market_close = pd.to_datetime(market_close_time).time()
-                            data = data[(data["date"].dt.time >= market_open) & (data["date"].dt.time < market_close)]
+                            if "m" in periodicity:
+                                market_open = pd.to_datetime(market_open_time).time()
+                                market_close = pd.to_datetime(market_close_time).time()
+                                data = data[
+                                    (data["date"].dt.time >= market_open) & (data["date"].dt.time < market_close)
+                                ]
                             # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
                             if any(period in periodicity for period in ["d"]):
                                 data["date"] = data["date"].dt.floor("D")
