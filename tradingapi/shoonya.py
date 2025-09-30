@@ -263,7 +263,7 @@ def save_symbol_data(saveToFolder: bool = True):
                     codes_fno["Expiry"], format="%d-%b-%Y", errors="coerce"
                 ).dt.strftime("%Y%m%d")
                 codes_fno["Symbol"] = codes_fno["TradingSymbol"].str.extract(
-                    r"^([A-Z]+(?:50)?)(?=\d{2}[A-Z]{3}|\d{2}\d{6})"
+                    r"^([A-Z]+(?:50)?)(?=\d{2}(?:[A-Z]\d+|\d+)[A-Z]{2})"
                 )
 
                 def process_row(row):
