@@ -215,6 +215,15 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes_fno["Expiry"] = pd.to_datetime(
                     codes_fno["Expiry"], format="%d-%b-%Y", errors="coerce"
                 ).dt.strftime("%Y%m%d")
+                # Split TradingSymbol into Symbol and the residual part.
+                # - If it starts with SENSEX50, keep SENSEX50 in Symbol.
+                # - Otherwise, capture leading token that ends with a letter (digits allowed inside, not trailing).
+                codes_fno[["Symbol", "ts_rest"]] = codes_fno["TradingSymbol"].str.extract(
+                    r"^(SENSEX50|[A-Z0-9&-]*?[A-Z&-])(?=(?:\d{2}|FUT))(.*)$",
+                    expand=True,
+                )
+                # Fallback: if no match, keep entire TradingSymbol as Symbol
+                codes_fno["Symbol"] = codes_fno["Symbol"].fillna(codes_fno["TradingSymbol"])
 
                 def process_row(row):
                     symbol = row["Symbol"]
@@ -262,8 +271,9 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes_fno["Expiry"] = pd.to_datetime(
                     codes_fno["Expiry"], format="%d-%b-%Y", errors="coerce"
                 ).dt.strftime("%Y%m%d")
-                codes_fno["Symbol"] = codes_fno["TradingSymbol"].str.extract(
-                    r"^([A-Z]+(?:50)?)(?=\d{2}(?:[A-Z]\d+|\d+)[A-Z]{2})"
+                codes_fno[["Symbol", "ts_rest"]] = codes_fno["TradingSymbol"].str.extract(
+                    r"^(SENSEX50|[A-Z0-9&-]*?[A-Z&-])(?=(?:\d{2}|FUT))(.*)$",
+                    expand=True,
                 )
 
                 def process_row(row):
@@ -1727,7 +1737,10 @@ class Shoonya(BrokerBase):
             # Check if it's SENSEX format (ends with CE/PE)
             if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
                 # Extract symbol
-                symbol = "SENSEX"
+                if fno_symbol.startswith("SENSEX50"):
+                    symbol = "SENSEX50"
+                else:
+                    symbol = "SENSEX"
 
                 # Extract option type (last 2 characters)
                 option_type = fno_symbol[-2:]  # CE or PE
