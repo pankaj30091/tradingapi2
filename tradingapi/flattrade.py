@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -938,6 +939,10 @@ class FlatTrade(BrokerBase):
             orig_order_type = order.order_type
 
             if order.scrip_code is not None or order.paper:  # if paper, we dont check for valid scrip_code
+                has_trigger = not math.isnan(order.trigger_price)
+                if has_trigger:
+                    order.is_stoploss_order = True
+                    order.stoploss_price = order.trigger_price
                 if order.order_type == "BUY" or order.order_type == "COVER":
                     order.order_type = "B"
                 elif order.order_type == "SHORT" or order.order_type == "SELL":
@@ -954,6 +959,8 @@ class FlatTrade(BrokerBase):
                         quantity = order.quantity
                         product_type = "C" if "_STK_" in order.long_symbol else "M"  # M is NRML , 'I' is MIS
                         price_type = "LMT" if order.price > 0 else "MKT"
+                        if has_trigger:
+                            price_type = "SL-LMT" if order.price > 0 else "SL-MKT"
                         trading_symbol = self._get_tradingsymbol_from_longname(order.long_symbol, order.exchange)
 
                         if not trading_symbol:
@@ -972,7 +979,7 @@ class FlatTrade(BrokerBase):
                             discloseqty=0,
                             price_type=price_type,
                             price=order.price,
-                            trigger_price=None,
+                            trigger_price=order.trigger_price if has_trigger else None,
                             retention="DAY",
                             remarks=order.internal_order_id,
                         )

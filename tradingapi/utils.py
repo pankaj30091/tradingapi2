@@ -1245,18 +1245,26 @@ def transmit_entry_order(
             price_types = [order.price_type] * len(symbols)
         # price_types = [0] * len(symbols) if paper is False else ["MKT"] * len(symbols)
         additional_infos = [""] * len(combo_symbols)
+        trigger_prices = [order.trigger_price] * len(symbols)
     else:
         symbols = [order.long_symbol]
         quantities = [order.quantity if order.order_type == "BUY" else -1 * order.quantity]
         price_types = [order.price_type]
         additional_infos = [order.additional_info]
-    symbols, quantities, price_types, additional_infos = _sort_list(symbols, quantities, price_types, additional_infos)
+        trigger_prices = [order.trigger_price]
+    symbols, quantities, price_types, additional_infos, trigger_prices = _sort_list(
+        symbols, quantities, price_types, additional_infos, trigger_prices=trigger_prices
+    )
     int_order_id = ""
-    for symbol, quantity, price_type, additional_info in zip(symbols, quantities, price_types, additional_infos):
+    for symbol, quantity, price_type, additional_info, trigger_price in zip(
+        symbols, quantities, price_types, additional_infos, trigger_prices
+    ):
         temp_order = deepcopy(order)
         temp_order.order_type = get_combo_sub_order_type(order, quantity)
         temp_order.quantity = abs(quantity)
         temp_order.long_symbol = symbol
+        temp_order.trigger_price = temp_order._convert_to_float(trigger_price, "trigger_price")
+        temp_order.is_stoploss_order = temp_order.is_stoploss_order or not math.isnan(temp_order.trigger_price)
         lmt_price = get_limit_price(
             broker,
             price_type=price_type,
@@ -1327,19 +1335,24 @@ def transmit_exit_order(
             price_types = order.price_type
         else:
             price_types = [order.price_type] * len(exit_symbols)
-
+        trigger_prices = [order.trigger_price] * len(exit_symbols)
         # price_types = [0] * len(exit_symbols) if paper is False else ["MKT"] * len(exit_symbols)
 
     else:
         exit_symbols = [order.long_symbol]
         exit_quantities_required = [order.quantity if order.order_type == "COVER" else -1 * order.quantity]
         price_types = order.price_type if isinstance(order.price_type, list) else [order.price_type]
+        trigger_prices = [order.trigger_price] if not isinstance(order.trigger_price, list) else order.trigger_price
     quantities_remaining = exit_quantities_required
     additional_infos = order.additional_info if isinstance(order.additional_info, list) else [order.additional_info]
 
-    exit_symbols, quantities_remaining, price_types, additional_infos = _sort_list(
-        exit_symbols, quantities_remaining, price_types, additional_infos
-    )
+    (
+        exit_symbols,
+        quantities_remaining,
+        price_types,
+        additional_infos,
+        trigger_prices,
+    ) = _sort_list(exit_symbols, quantities_remaining, price_types, additional_infos, trigger_prices=trigger_prices)
 
     if len(exit_candidates) > 0 and validate_db_position:
         for internal_order_id in exit_candidates:
@@ -1347,8 +1360,8 @@ def transmit_exit_order(
                 cancel_internal_order_id(broker, internal_order_id)
                 actual_positions = get_open_position_by_order(broker, internal_order_id)
                 loop_quantities_remaining = deepcopy(quantities_remaining)
-                for exit_symbol, quantity, price_type, additional_info in zip(
-                    exit_symbols, loop_quantities_remaining, price_types, additional_infos
+                for exit_symbol, quantity, price_type, additional_info, trigger_price in zip(
+                    exit_symbols, loop_quantities_remaining, price_types, additional_infos, trigger_prices
                 ):
                     actual_position = actual_positions.get(exit_symbol, Position())
                     if quantity != 0 and quantity * actual_position.size < 0:
@@ -1359,6 +1372,9 @@ def transmit_exit_order(
                         order_new.order_type = get_combo_sub_order_type(order, quantity)
                         order_new.internal_order_id = internal_order_id
                         order_new.orderRef = internal_order_id
+                        order_new.trigger_price = order_new._convert_to_float(trigger_price, "trigger_price")
+                        if not math.isnan(order_new.trigger_price):
+                            order_new.is_stoploss_order = True
                         lmt_price = get_limit_price(
                             broker,
                             price_type=price_type,
@@ -2555,7 +2571,7 @@ def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds=
     return {"ticker": ticker, "impact_cost": impact_cost}
 
 
-def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None):
+def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None, trigger_prices=None):
     # Handle cases where price_types is None or partially filled
     if not price_types or price_types == [None]:
         price_types = ["LMT"] * len(symbols)
@@ -2571,14 +2587,27 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
         quantities = [quantities[0]] * n if quantities else [1] * n
     if not additional_info or len(additional_info) < n:
         additional_info = (additional_info + [""] * n)[:n]
+    include_triggers = trigger_prices is not None
+    if include_triggers:
+        if not isinstance(trigger_prices, list):
+            trigger_prices = [trigger_prices]
+        if len(trigger_prices) < n:
+            trigger_prices = (trigger_prices + [trigger_prices[0] if trigger_prices else float("nan")] * n)[:n]
+        trigger_prices = trigger_prices[:n]
     if exchanges is not None and (not exchanges or len(exchanges) < n):
         exchanges = (exchanges + [exchanges[0]] * n)[:n]
 
     # Zip the relevant pairs based on whether exchanges are provided
     if exchanges is not None:
-        zipped_pairs = list(zip(quantities, symbols, exchanges, price_types, additional_info))
+        if include_triggers:
+            zipped_pairs = list(zip(quantities, symbols, exchanges, price_types, additional_info, trigger_prices))
+        else:
+            zipped_pairs = list(zip(quantities, symbols, exchanges, price_types, additional_info))
     else:
-        zipped_pairs = list(zip(quantities, symbols, price_types, additional_info))
+        if include_triggers:
+            zipped_pairs = list(zip(quantities, symbols, price_types, additional_info, trigger_prices))
+        else:
+            zipped_pairs = list(zip(quantities, symbols, price_types, additional_info))
 
     # Sort zipped pairs by quantities in descending order
     sorted_pairs = sorted(zipped_pairs, reverse=True)
@@ -2586,28 +2615,61 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
     # Unpack the sorted pairs into lists
     if exchanges is not None:
         if not sorted_pairs:
-            sorted_quantities, sorted_symbols, sorted_exchanges, sorted_order_types, sorted_additional_info = (
-                [],
-                [],
-                [],
-                [],
-                [],
-            )
+            sorted_quantities = []
+            sorted_symbols = []
+            sorted_exchanges = []
+            sorted_order_types = []
+            sorted_additional_info = []
+            sorted_triggers = [] if include_triggers else None
         else:
-            sorted_quantities, sorted_symbols, sorted_exchanges, sorted_order_types, sorted_additional_info = zip(
-                *sorted_pairs
-            )
+            if include_triggers:
+                (
+                    sorted_quantities,
+                    sorted_symbols,
+                    sorted_exchanges,
+                    sorted_order_types,
+                    sorted_additional_info,
+                    sorted_triggers,
+                ) = zip(*sorted_pairs)
+            else:
+                (
+                    sorted_quantities,
+                    sorted_symbols,
+                    sorted_exchanges,
+                    sorted_order_types,
+                    sorted_additional_info,
+                ) = zip(*sorted_pairs)
         return (
             list(sorted_symbols),
             list(sorted_quantities),
             list(sorted_order_types),
             list(sorted_exchanges),
             list(sorted_additional_info),
+            list(sorted_triggers) if include_triggers else None,
         )
     else:
         if not sorted_pairs:
+            if include_triggers:
+                return [], [], [], [], []
             return [], [], [], []
-        sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
+        if include_triggers:
+            (
+                sorted_quantities,
+                sorted_symbols,
+                sorted_order_types,
+                sorted_additional_info,
+                sorted_triggers,
+            ) = zip(*sorted_pairs)
+        else:
+            sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
+        if include_triggers:
+            return (
+                list(sorted_symbols),
+                list(sorted_quantities),
+                list(sorted_order_types),
+                list(sorted_additional_info),
+                list(sorted_triggers),
+            )
         return list(sorted_symbols), list(sorted_quantities), list(sorted_order_types), list(sorted_additional_info)
 
 
@@ -2628,6 +2690,7 @@ def place_combo_order(
     exchanges: list[str] = ["NSE"],
     price_broker: Optional[List[BrokerBase]] = None,
     price_types: list = [],
+    trigger_prices: Union[List[float], float, None] = None,
     validate_db_position: bool = True,
     paper: bool = True,
 ) -> dict:
@@ -2663,6 +2726,7 @@ def place_combo_order(
         entry (bool): True if entry else False
         additional_infos (list): list of json formatted string,
         price_types (list, optional): list of order types. Should be same length as symbols. Defaults to None which reflects in limit orders at midprice
+        trigger_prices (list | float | None): trigger price(s) for conditional orders. Scalar applied to all legs.
         validate_db_position(bool): if set to false, exit orders are generated without updating redis
         paper: if set to True (default), simulated orders are generated
 
@@ -2686,15 +2750,28 @@ def place_combo_order(
         additional_infos = [additional_infos]
     if len(additional_infos) < len(symbols):
         additional_infos = additional_infos + [""] * (len(symbols) - len(additional_infos))
+    if trigger_prices is None:
+        trigger_prices = [float("nan")] * len(symbols)
+    elif isinstance(trigger_prices, list):
+        trigger_prices = (trigger_prices + [trigger_prices[-1]] * len(symbols))[: len(symbols)] if trigger_prices else [
+            float("nan")
+        ] * len(symbols)
+    else:
+        trigger_prices = [trigger_prices] * len(symbols)
     exchanges = [
         execution_broker.map_exchange_for_api(symbol, exchange) for symbol, exchange in zip(symbols, exchanges)
     ]
-    symbols, quantities, price_types, exchanges, additional_infos = _sort_list(
-        symbols, quantities, price_types, additional_infos, exchanges
-    )
+    (
+        symbols,
+        quantities,
+        price_types,
+        exchanges,
+        additional_infos,
+        trigger_prices,
+    ) = _sort_list(symbols, quantities, price_types, additional_infos, exchanges, trigger_prices)
     out = {}
-    for symbol, exchange, quantity, price_type, additional_info in zip(
-        symbols, exchanges, quantities, price_types, additional_infos
+    for symbol, exchange, quantity, price_type, additional_info, trigger_price in zip(
+        symbols, exchanges, quantities, price_types, additional_infos, trigger_prices
     ):
         size = quantity
         if entry:
@@ -2715,7 +2792,10 @@ def place_combo_order(
             long_symbol=symbol,
             price_type=price_type,
             additional_info=additional_info,
+            trigger_price=trigger_price,
         )
+        if not math.isnan(temp_order.trigger_price):
+            temp_order.is_stoploss_order = True
         logger.info(f"{symbol} {exch} {size} {side}")
         if entry:
             temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper)

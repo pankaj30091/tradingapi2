@@ -131,6 +131,7 @@ class Order:
         exch_order_id: str = "0",
         broker_order_id: str = "0",
         stoploss_price: float = 0.0,
+        trigger_price: float = float("nan"),
         is_stoploss_order: bool = False,
         ioc_order: bool = False,
         scripdata: str = "",
@@ -167,6 +168,7 @@ class Order:
             exch_order_id: Exchange order ID
             broker_order_id: Broker order ID
             stoploss_price: Stop loss price
+            trigger_price: Trigger price for stop/conditional orders
             is_stoploss_order: Whether it's a stop loss order
             ioc_order: Whether it's an IOC order
             scripdata: Scrip data
@@ -201,6 +203,7 @@ class Order:
         self.broker_order_id = broker_order_id
         self.stoploss_price = self._convert_to_float(stoploss_price, "stoploss_price")
         self.is_stoploss_order = self._convert_to_bool(is_stoploss_order, "is_stoploss_order")
+        self.trigger_price = self._convert_to_float(trigger_price, "trigger_price")
         self.ioc_order = self._convert_to_bool(ioc_order, "ioc_order")
         self.scripdata = scripdata
         self.orderRef = orderRef

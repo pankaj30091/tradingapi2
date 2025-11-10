@@ -3,6 +3,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets  # Replace `random` with `secrets` for cryptographic randomness
@@ -827,6 +828,10 @@ class FivePaisa(BrokerBase):
 
             # Check if we can place the order
             if order.scrip_code is not None or order.paper:
+                has_trigger = not math.isnan(order.trigger_price)
+                if has_trigger:
+                    order.is_stoploss_order = True
+                    order.stoploss_price = order.trigger_price
                 # Map order type
                 if order.order_type in ["BUY", "COVER"]:
                     order.order_type = "B"
@@ -863,15 +868,25 @@ class FivePaisa(BrokerBase):
                             quantity = order.quantity
 
                         # Place order with API
-                        out = self.api.place_order(
-                            OrderType=order.order_type,
-                            Exchange=order.exchange,
-                            ExchangeType=order.exchange_segment,
-                            ScripCode=order.scrip_code,
-                            Qty=quantity,
-                            Price=order.price,
-                            RemoteOrderID=order.remote_order_id,
-                        )
+                        payload = {
+                            "OrderType": order.order_type,
+                            "Exchange": order.exchange,
+                            "ExchangeType": order.exchange_segment,
+                            "ScripCode": order.scrip_code,
+                            "Qty": quantity,
+                            "Price": order.price,
+                            "RemoteOrderID": order.remote_order_id,
+                            "IsStopLossOrder": bool(order.is_stoploss_order),
+                            "StopLossPrice": order.stoploss_price if has_trigger else order.stoploss_price,
+                            "DisQty": getattr(order, "disqty", quantity),
+                            "IsIntraday": bool(order.is_intraday),
+                            "AHPlaced": order.ahplaced,
+                            "IOCOrder": bool(order.ioc_order),
+                        }
+                        if has_trigger:
+                            payload["TriggerPrice"] = order.trigger_price
+
+                        out = self.api.place_order(**payload)
 
                         if out is not None:
                             # Update order with response
@@ -1383,7 +1398,7 @@ class FivePaisa(BrokerBase):
     @validate_inputs(
         internal_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         old_broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        new_broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        new_broker_order_id=lambda x: ((isinstance(x, str) and len(x.strip()) > 0) or isinstance(x, int)),
     )
     def _update_broker_order_id(self, internal_order_id: str, old_broker_order_id: str, new_broker_order_id: str):
         """

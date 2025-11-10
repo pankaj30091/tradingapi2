@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -758,7 +759,10 @@ class Shoonya(BrokerBase):
                     try:
                         quantity = order.quantity
                         product_type = "C" if "_STK_" in order.long_symbol else "M"  # M is NRML , 'I' is MIS
+                        has_trigger = not math.isnan(order.trigger_price)
                         price_type = "LMT" if order.price > 0 else "MKT"
+                        if has_trigger:
+                            price_type = "SL-LMT" if order.price > 0 else "SL-MKT"
                         trading_symbol = self._get_tradingsymbol_from_longname(order.long_symbol, order.exchange)
 
                         if not trading_symbol:
@@ -777,7 +781,7 @@ class Shoonya(BrokerBase):
                             discloseqty=0,
                             price_type=price_type,
                             price=order.price,
-                            trigger_price=None,
+                            trigger_price=order.trigger_price if has_trigger else None,
                             retention="DAY",
                             remarks=order.internal_order_id,
                         )
