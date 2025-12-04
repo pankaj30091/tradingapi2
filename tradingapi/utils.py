@@ -2423,13 +2423,13 @@ def find_option_with_delta(
     # if delta is nan, we need to decide if the search range is to the left or right of the present strike
     # and use delta_2's position vis_a-vis target_delta to determine the direction of move to identity next best delta.
     move_right_on_nan_delta = True
-    if delta_2 > target_delta and increasing:
+    if abs(delta_2) > target_delta and increasing:
         move_right_on_nan_delta = False
-    elif delta_2 > target_delta and not increasing:
+    elif abs(delta_2) > target_delta and not increasing:
         move_right_on_nan_delta = True
-    elif delta_2 < target_delta and increasing:
+    elif abs(delta_2) < target_delta and increasing:
         move_right_on_nan_delta = True
-    elif delta_2 < target_delta and not increasing:
+    elif abs(delta_2) < target_delta and not increasing:
         move_right_on_nan_delta = False
 
     while left <= right:
@@ -2551,8 +2551,8 @@ def get_delta_strike(
         opt for opt in option_chain if search_range[0] * price_f < float(opt.split("_")[4]) < search_range[1] * price_f
     ]
     option_chain = sorted(option_chain, key=lambda x: float(x.split("_")[-1]))  # sort ascending
-    if rounding is not None:
-        option_chain = [t for t in option_chain if float(t.split("_")[4]) % rounding == 0]
+    if rounding is not None and rounding > 0:
+        option_chain = [t for t in option_chain if abs(float(t.split("_")[4]) % rounding) < 1e-6]
     if len(option_chain) == 0:
         logger.info(f"Option Chain not found for symbol: {underlying_symbol}")
         return None
