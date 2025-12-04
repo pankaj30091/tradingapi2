@@ -886,12 +886,59 @@ class FivePaisa(BrokerBase):
                         if has_trigger:
                             payload["TriggerPrice"] = order.trigger_price
 
-                        out = self.api.place_order(**payload)
+                        # Verify API is connected before making call
+                        if not self.api:
+                            context = create_error_context(
+                                order_data=order.to_dict(),
+                                payload=payload,
+                            )
+                            raise BrokerConnectionError(
+                                "FivePaisa API client is not initialized. Please call connect() first.", context
+                            )
+
+                        # Log the payload being sent to API
+                        trading_logger.log_info(
+                            "Calling FivePaisa API place_order",
+                            {
+                                "payload": payload,
+                                "internal_order_id": order.internal_order_id,
+                                "long_symbol": order.long_symbol,
+                            },
+                        )
+
+                        # Make API call with error handling
+                        try:
+                            out = self.api.place_order(**payload)
+                        except Exception as api_error:
+                            context = create_error_context(
+                                order_data=order.to_dict(),
+                                payload=payload,
+                                api_error=str(api_error),
+                                api_error_type=type(api_error).__name__,
+                            )
+                            trading_logger.log_error(
+                                "Exception during FivePaisa API place_order call",
+                                api_error,
+                                context,
+                            )
+                            raise OrderError(f"FivePaisa API call failed: {str(api_error)}", context)
+
+                        # Log the API response
+                        trading_logger.log_debug(
+                            "FivePaisa API place_order response",
+                            {
+                                "response": out,
+                                "response_type": type(out).__name__,
+                                "internal_order_id": order.internal_order_id,
+                            },
+                        )
 
                         if out is not None:
                             # Update order with response
                             order.exch_order_id = out.get("ExchOrderID")
-                            order.broker_order_id = out.get("BrokerOrderID")
+                            # Convert broker_order_id to string as API returns integer but validation expects string
+                            broker_order_id_raw = out.get("BrokerOrderID")
+                            order.broker_order_id = str(broker_order_id_raw) if broker_order_id_raw is not None else ""
                             order.local_order_id = out.get("LocalOrderID")
                             order.order_type = orig_order_type
                             order.orderRef = order.internal_order_id
@@ -939,8 +986,161 @@ class FivePaisa(BrokerBase):
                             self.log_and_return(order)
                             return order
                         else:
-                            context = create_error_context(order_data=order.to_dict(), api_response=out)
-                            raise OrderError("API returned None for order placement", context)
+                            # API returned None - check if order was actually placed (idempotency check)
+                            trading_logger.log_warning(
+                                "FivePaisa API returned None, checking if order already exists by remote_order_id",
+                                {
+                                    "remote_order_id": order.remote_order_id,
+                                    "internal_order_id": order.internal_order_id,
+                                    "long_symbol": order.long_symbol,
+                                },
+                            )
+
+                            # Check if order with same remote_order_id already exists
+                            existing_order = self._check_order_exists_by_remote_id(
+                                order.remote_order_id, order.exchange, order.scrip_code
+                            )
+
+                            if existing_order:
+                                # Order already exists! Skip placing new order and update Redis with existing details
+                                trading_logger.log_info(
+                                    "Order already exists with same remote_order_id, retrieving details to avoid duplicate",
+                                    {
+                                        "remote_order_id": order.remote_order_id,
+                                        "existing_broker_order_id": existing_order.get("BrokerOrderID"),
+                                    },
+                                )
+
+                                # Update order with existing order details
+                                broker_order_id_raw = existing_order.get("BrokerOrderID")
+                                order.broker_order_id = str(broker_order_id_raw) if broker_order_id_raw is not None else ""
+                                order.exch_order_id = existing_order.get("ExchOrderID") or "0"
+                                order.local_order_id = existing_order.get("LocalOrderID") or 0
+                                order.order_type = orig_order_type
+                                order.orderRef = order.internal_order_id
+                                order.message = existing_order.get("Message") or ""
+
+                                # Get full order info to get accurate status and fill price
+                                if order.broker_order_id and order.broker_order_id != "0":
+                                    try:
+                                        fills = self.get_order_info(broker_order_id=order.broker_order_id, order=order)
+                                        order.status = fills.status
+                                        order.exch_order_id = fills.exchange_order_id
+                                        if fills.fill_price > 0:
+                                            order.price = fills.fill_price
+                                    except Exception as e:
+                                        trading_logger.log_warning(
+                                            "Failed to get full order info for existing order, using basic status",
+                                            {"broker_order_id": order.broker_order_id, "error": str(e)},
+                                        )
+                                        # Fallback to basic status from API response - convert string to enum if needed
+                                        api_status = existing_order.get("Status")
+                                        if api_status:
+                                            try:
+                                                # Try to convert string status to enum
+                                                if isinstance(api_status, str):
+                                                    order.status = OrderStatus[api_status.upper()]
+                                                elif isinstance(api_status, OrderStatus):
+                                                    order.status = api_status
+                                                else:
+                                                    order.status = OrderStatus.UNDEFINED
+                                            except (KeyError, AttributeError):
+                                                order.status = OrderStatus.UNDEFINED
+                                        else:
+                                            order.status = OrderStatus.UNDEFINED
+                                else:
+                                    # No broker_order_id available, set status to UNDEFINED
+                                    trading_logger.log_warning(
+                                        "No broker_order_id available for existing order",
+                                        {"remote_order_id": order.remote_order_id},
+                                    )
+                                    order.status = OrderStatus.UNDEFINED
+
+                                # Update Redis with the existing order details (same as successful order placement)
+                                # Only update Redis if we have a valid broker_order_id
+                                if order.broker_order_id and order.broker_order_id != "0":
+                                    try:
+                                        # Store full order dict in Redis keyed by broker_order_id
+                                        self.redis_o.hmset(
+                                            str(order.broker_order_id),
+                                            {key: str(val) for key, val in order.to_dict().items()},
+                                        )
+
+                                        # Update entry_keys or exit_keys based on order type
+                                        if order.order_type in ["BUY", "SHORT"]:
+                                            current_entry_keys = self.redis_o.hget(order.internal_order_id, "entry_keys")
+                                            if current_entry_keys is None or str(order.broker_order_id) not in current_entry_keys:
+                                                new_entry_keys = (
+                                                    str(order.broker_order_id)
+                                                    if current_entry_keys is None
+                                                    else current_entry_keys + " " + str(order.broker_order_id)
+                                                )
+                                                self.redis_o.hset(order.orderRef, "entry_keys", new_entry_keys)
+                                                self.redis_o.hset(order.internal_order_id, "long_symbol", order.long_symbol)
+
+                                        elif order.order_type in ["SELL", "COVER"]:
+                                            current_exit_keys = self.redis_o.hget(order.internal_order_id, "exit_keys")
+                                            if current_exit_keys is None or str(order.broker_order_id) not in current_exit_keys:
+                                                new_exit_keys = (
+                                                    str(order.broker_order_id)
+                                                    if current_exit_keys is None
+                                                    else current_exit_keys + " " + str(order.broker_order_id)
+                                                )
+                                                self.redis_o.hset(order.orderRef, "exit_keys", new_exit_keys)
+
+                                        trading_logger.log_info(
+                                            "Updated Redis with existing order details",
+                                            {
+                                                "broker_order_id": order.broker_order_id,
+                                                "internal_order_id": order.internal_order_id,
+                                                "order_type": order.order_type,
+                                            },
+                                        )
+                                    except Exception as e:
+                                        trading_logger.log_error(
+                                            "Failed to update Redis with existing order details",
+                                            e,
+                                            {
+                                                "broker_order_id": order.broker_order_id,
+                                                "internal_order_id": order.internal_order_id,
+                                            },
+                                        )
+                                else:
+                                    trading_logger.log_warning(
+                                        "Skipping Redis update - broker_order_id is empty or '0'",
+                                        {
+                                            "broker_order_id": order.broker_order_id,
+                                            "internal_order_id": order.internal_order_id,
+                                        },
+                                    )
+
+                                trading_logger.log_info(
+                                    "Retrieved and synced existing order to prevent duplicate placement",
+                                    {"order": str(order), "broker_order_id": order.broker_order_id},
+                                )
+                                self.log_and_return(order)
+                                return order
+
+                            else:
+                                # Order doesn't exist - this is a real failure
+                                context = create_error_context(
+                                    order_data=order.to_dict(),
+                                    api_response=out,
+                                    payload_sent=payload,
+                                    api_connected=bool(self.api),
+                                    remote_order_id=order.remote_order_id,
+                                )
+                                trading_logger.log_error(
+                                    "FivePaisa API returned None and order does not exist on broker",
+                                    None,
+                                    context,
+                                )
+                                raise OrderError(
+                                    "FivePaisa API returned None for order placement and order not found on broker. "
+                                    "This may indicate: 1) API connection issue, 2) Invalid order parameters, "
+                                    "3) Broker rejection, 4) Network timeout. Check logs for details.",
+                                    context,
+                                )
 
                     except Exception as e:
                         context = create_error_context(order_data=order.to_dict(), error=str(e))
@@ -1289,7 +1489,8 @@ class FivePaisa(BrokerBase):
                                 self.log_and_return(out)
 
                                 if out and "BrokerOrderID" in out:
-                                    order.broker_order_id = out["BrokerOrderID"]
+                                    # Convert broker_order_id to string for consistency
+                                    order.broker_order_id = str(out["BrokerOrderID"])
 
                                     # Update broker order ID
                                     try:
@@ -3094,6 +3295,48 @@ class FivePaisa(BrokerBase):
         except Exception as e:
             context = create_error_context(kwargs=kwargs, error=str(e))
             raise DataError(f"Unexpected error generating long name: {str(e)}", context)
+
+    @log_execution_time
+    def _check_order_exists_by_remote_id(self, remote_order_id: str, exchange: str, scrip_code: int) -> Optional[Dict]:
+        """
+        Check if an order with the given remote_order_id already exists on the broker.
+        This is used for idempotency checks to prevent duplicate orders.
+
+        Args:
+            remote_order_id: The remote order ID to check
+            exchange: Exchange code
+            scrip_code: Scrip code for the order
+
+        Returns:
+            Dict with order details if found, None otherwise
+        """
+        try:
+            if exchange == "M":
+                # For MCX, remote_order_id check may not work reliably, skip
+                return None
+
+            req_list = [{"Exch": exchange, "RemoteOrderID": remote_order_id}]
+            status = self.api.fetch_order_status(req_list)
+
+            if status is not None and len(status.get("OrdStatusResLst", [])) > 0:
+                for sub_status in status["OrdStatusResLst"]:
+                    if str(sub_status.get("ScripCode")) == str(scrip_code):
+                        trading_logger.log_info(
+                            "Found existing order with same remote_order_id",
+                            {
+                                "remote_order_id": remote_order_id,
+                                "exchange": exchange,
+                                "scrip_code": scrip_code,
+                                "broker_order_id": sub_status.get("BrokerOrderID"),
+                            },
+                        )
+                        return sub_status
+        except Exception as e:
+            trading_logger.log_warning(
+                "Error checking for existing order by remote_order_id",
+                {"remote_order_id": remote_order_id, "exchange": exchange, "error": str(e)},
+            )
+        return None
 
     @log_execution_time
     @validate_inputs(
