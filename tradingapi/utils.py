@@ -1151,6 +1151,17 @@ def get_limit_price(
             )
     elif isinstance(price_type, float) or isinstance(price_type, int):
         ref_price = price_type
+    elif isinstance(price_type, list):
+        # Handle list inputs (e.g., from scalping.py which returns [mid_price])
+        # Extract first element if it's a single-element list, or first element of first sublist
+        if price_type and isinstance(price_type[0], list):
+            # Nested list: [[price1], [price2]] -> extract first price from first sublist
+            ref_price = price_type[0][0] if price_type[0] else 0
+        elif price_type:
+            # Simple list: [price] -> extract first price
+            ref_price = price_type[0]
+        else:
+            ref_price = 0
     else:
         ref_price = 0
     return ref_price
