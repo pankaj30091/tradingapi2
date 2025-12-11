@@ -148,7 +148,6 @@ def _safe_parse_json_or_dict(json_str):
         try:
             # If JSON fails, try to parse as Python dict string
             import ast
-            import math
 
             # Handle common problematic values before parsing
             # Replace bare 'nan' with 'float("nan")' for ast.literal_eval
@@ -1072,7 +1071,7 @@ def get_limit_price(
     symbol=None,
     price_broker: Optional[List[BrokerBase]] = None,
     exchange="NSE",
-    mds=False,
+    mds: Optional[str] = None,
 ):
     """Get limit price based on price type and market data.
 
@@ -1083,7 +1082,8 @@ def get_limit_price(
         symbol: Trading symbol
         price_broker: Optional list of brokers for price data
         exchange: Exchange name
-        mds: Whether to use market data service
+        mds: Market data service channel name (str). If None or empty, uses broker quotes. 
+             If provided (e.g., "mds"), uses market data service with that channel.
 
     Returns:
         float: Calculated limit price
@@ -1228,12 +1228,14 @@ def transmit_entry_order(
     """
     # Enforce: combo orders (with ":") must have order_type "BUY"
     if ":" in order.long_symbol and order.order_type != "BUY":
-        logger.error(f"Combo order {order.long_symbol} must have order_type 'BUY'. Got '{order.order_type}' instead.")
-        return None
+        error_msg = f"Combo order {order.long_symbol} must have order_type 'BUY'. Got '{order.order_type}' instead."
+        logger.error(error_msg)
+        raise OrderError(error_msg, {"symbol": order.long_symbol, "order_type": order.order_type})
 
     if order.price is None:
-        logger.error(f"Order not placed. Price was set as None for symbol: {order.long_symbol}")
-        return None
+        error_msg = f"Order not placed. Price was set as None for symbol: {order.long_symbol}"
+        logger.error(error_msg)
+        raise OrderError(error_msg, {"symbol": order.long_symbol})
     if price_broker is None:
         price_broker = [broker]
     if not order.internal_order_id:
@@ -1513,7 +1515,8 @@ def exit_is_expiration(broker: BrokerBase, internal_order_id: str) -> bool:
         return False
     out = True
     for ek in exit_keys:
-        if "expir" not in broker.redis_o.hget(ek, "message").lower():
+        message = broker.redis_o.hget(ek, "message")
+        if message and "expir" not in message.lower():
             out = out and False
     return out
 
@@ -1549,7 +1552,7 @@ def delete_broker_order_id(
     else:
         order_mapping = broker.redis_o.hgetall(internal_order_id)
         if len(order_mapping) == 0:
-            logger.info("Internal Order ID: {internal_order_id} not found")
+            logger.info(f"Internal Order ID: {internal_order_id} not found")
             return
         # check if removal is from entry
         if str(broker_order_id) in order_mapping.get("entry_keys"):
@@ -1885,6 +1888,7 @@ def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: str = "") -
     expiry = long_symbol.split("_")[2]
     symbol = long_symbol.split("_")[0]
 
+    driver = None
     try:
         margin_url = "https://www.samco.in/span"
         op = webdriver.FirefoxOptions()
@@ -1961,10 +1965,12 @@ def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: str = "") -
         except Exception:
             output = 100000000
         logger.info(f"margin for {long_symbol}:{output}")
-        driver.close()
+        if driver:
+            driver.close()
     except Exception:
         logger.exception("Error")
-        driver.close()
+        if driver:
+            driver.close()
         if proxy is not None:
             proxy = get_free_proxy(driver_path)
     return output
@@ -1977,6 +1983,7 @@ def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = ""
     expiry = long_symbol.split("_")[2]
     symbol = long_symbol.split("_")[0]
 
+    driver = None
     try:
         margin_url = "https://zerodha.com/margin-calculator/SPAN"
         op = webdriver.FirefoxOptions()
@@ -2049,9 +2056,11 @@ def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = ""
         except Exception:
             output = 100000000
         logger.info(f"margin for {long_symbol}:{output}")
-        driver.close()
+        if driver:
+            driver.close()
     except Exception:
-        driver.close()
+        if driver:
+            driver.close()
         if proxy is not None:
             proxy = get_free_proxy(driver_path)
     return output
@@ -2089,6 +2098,7 @@ def get_free_proxy(driver_path: str = "") -> str:
         proxies.append(proxy_data)
     driver.close()
 
+    selected_proxy_index = None
     for i in range(0, len(proxies)):
         try:
             if proxies[i]["Country"] in ["India", "Singapore"]:
@@ -2101,12 +2111,18 @@ def get_free_proxy(driver_path: str = "") -> str:
                 dr.get(login_url)
                 if WebDriverWait(dr, 5).until(EC.visibility_of_element_located((By.ID, "loginUser"))):
                     dr.close()
+                    selected_proxy_index = i
                     break
         except Exception:
             logger.exception("Error")
             continue
-    logger.info(f"Proxy selected: {proxies[i]}")
-    return proxies[i].get("IP Address", "127.0.0.1") + ":" + proxies[i].get("Port", "0")
+    
+    if selected_proxy_index is None:
+        logger.warning("No working proxy found, returning default")
+        return None
+    
+    logger.info(f"Proxy selected: {proxies[selected_proxy_index]}")
+    return proxies[selected_proxy_index].get("IP Address", "127.0.0.1") + ":" + proxies[selected_proxy_index].get("Port", "0")
 
 
 @log_execution_time
@@ -2204,7 +2220,7 @@ def get_price(
     checks: List[str] = ["bid", "ask", "last", "prior_close"],
     attempts: int = 3,
     exchange="NSE",
-    mds=False,
+    mds: Optional[str] = None,
 ) -> Price:
     def sum_prices(prices: List[Price]) -> Price:
         if not prices:
@@ -2231,7 +2247,7 @@ def get_price(
                 try:
                     mapped_exchange = broker.map_exchange_for_db(long_symbol, exchange)
                     if mds:
-                        price = _get_price_mds(broker, long_symbol, mapped_exchange)
+                        price = _get_price_mds(broker, long_symbol, mapped_exchange, channel=mds)
                     else:
                         price = broker.get_quote(long_symbol, mapped_exchange)
                     out.update(price)
@@ -2267,7 +2283,11 @@ def get_price(
             for attempt in range(attempts):
                 for broker in brokers:
                     try:
-                        price = broker.get_quote(symbol, exchange)
+                        mapped_exchange = broker.map_exchange_for_db(symbol, exchange)
+                        if mds:
+                            price = _get_price_mds(broker, symbol, mapped_exchange, channel=mds)
+                        else:
+                            price = broker.get_quote(symbol, mapped_exchange)
                         out.update(price, size)
                         if all(not math.isnan(getattr(out, check)) for check in checks):
                             valid_price_found = True
@@ -2296,7 +2316,7 @@ def get_price(
     return out
 
 
-def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds=False, last=False):
+def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds: Optional[str] = None, last=False):
     if isinstance(brokers, BrokerBase):
         brokers = [brokers]
     try:
@@ -2318,7 +2338,7 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
 
 
 def get_option_underlying_price(
-    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = "", exchange="NSE", mds=False, last=False
+    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = "", exchange="NSE", mds: Optional[str] = None, last=False
 ) -> float:
     """Retrieve underlying price for a symbol and interpolates, if if needed
 
@@ -2362,7 +2382,7 @@ def get_option_underlying_price(
 
 
 def calculate_delta(
-    brokers: list[BrokerBase], long_symbol, price_f, market_close_time="15:30:00", exchange="NSE", mds=False
+    brokers: list[BrokerBase], long_symbol, price_f, market_close_time="15:30:00", exchange="NSE", mds: Optional[str] = None
 ):
     delta = float("nan")
     ticker = get_price(brokers, long_symbol, checks=["bid", "ask", "prior_close"], exchange=exchange, mds=mds)
@@ -2401,7 +2421,7 @@ def find_option_with_delta(
     return_lower_delta,
     market_close_time="15:30:00",
     exchange="NSE",
-    mds="mds",
+    mds: Optional[str] = "mds",
 ):
     # Determine the correct option exchange
     opt_exchange = "NFO" if exchange == "NSE" else "BFO" if exchange == "BSE" else exchange
@@ -2503,7 +2523,7 @@ def get_delta_strike(
     search_range=[0.8, 1.2],
     market_close_time="15:30:00",
     exchange="NSE",
-    mds=False,
+    mds: Optional[str] = None,
 ) -> Union[str, None]:
     """Get option strike price for a given delta with enhanced error handling.
 
@@ -2520,7 +2540,8 @@ def get_delta_strike(
         search_range: Range around underlying price to search
         market_close_time: Market close time
         exchange: Exchange name
-        mds: Whether to use market data service
+        mds: Market data service channel name (str). If None or empty, uses broker quotes. 
+             If provided (e.g., "mds"), uses market data service with that channel.
 
     Returns:
         Union[str, None]: Option symbol or None if not found
@@ -2576,9 +2597,13 @@ def get_delta_strike(
         return None
 
 
-def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds=False) -> dict:
+def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds: Optional[str] = None) -> dict:
     ticker = get_price(brokers, symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
-    impact_cost = (ticker.ask - ticker.bid) / ((ticker.ask + ticker.bid) / 2)
+    mid_price = (ticker.ask + ticker.bid) / 2
+    if mid_price == 0 or math.isnan(mid_price):
+        impact_cost = float("nan")
+    else:
+        impact_cost = (ticker.ask - ticker.bid) / mid_price
     return {"ticker": ticker, "impact_cost": impact_cost}
 
 
@@ -2671,9 +2696,6 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
                 sorted_additional_info,
                 sorted_triggers,
             ) = zip(*sorted_pairs)
-        else:
-            sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
-        if include_triggers:
             return (
                 list(sorted_symbols),
                 list(sorted_quantities),
@@ -2681,7 +2703,9 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
                 list(sorted_additional_info),
                 list(sorted_triggers),
             )
-        return list(sorted_symbols), list(sorted_quantities), list(sorted_order_types), list(sorted_additional_info)
+        else:
+            sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
+            return list(sorted_symbols), list(sorted_quantities), list(sorted_order_types), list(sorted_additional_info)
 
 
 @log_execution_time
@@ -2818,13 +2842,14 @@ def place_combo_order(
 
 @log_execution_time
 @validate_inputs(pnl=lambda x: isinstance(x, pd.DataFrame) and len(x) >= 0)
-def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds=False) -> pd.DataFrame:
+def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds: Optional[str] = None) -> pd.DataFrame:
     """Calculates MTM for a profit DataFrame which has open trades.
 
     Args:
         brokers: List of broker instances
         pnl: Profit DataFrame with open trades
-        mds: Whether to use market data service
+        mds: Market data service channel name (str). If None or empty, uses broker quotes. 
+             If provided (e.g., "mds"), uses market data service with that channel.
 
     Returns:
         pd.DataFrame: Profit DataFrame with mark-to-market prices
@@ -3011,7 +3036,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
 
             # Fallback to row's entry_price and exitPrice if not found in Redis
             entry_price = entry_price if entry_price is not None else row["entry_price"]
-            # exit_price is set to 0 for combo orders irresepctive of mtm.
+            # exit_price is set to 0 for combo orders irrespective of mtm.
             exit_price = exit_price if exit_price is not None else row["exit_price"] if len(legs) == 1 else 0
 
             # Fetch commission rates for the entry trade
