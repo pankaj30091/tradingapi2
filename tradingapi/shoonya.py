@@ -351,7 +351,7 @@ class Shoonya(BrokerBase):
                 parts = long_name.split("_")
                 part1 = parts[0]
                 part2 = dt.datetime.strptime(parts[2], "%Y%m%d").strftime("%d%b%y")
-                part3 = parts[3][0] if parts[1].startswith("OPT") else "FUT"  # Check if it's an option or future
+                part3 = parts[3][0] if parts[1].startswith("OPT") else "F"  # Check if it's an option or future
                 part4 = parts[4]
                 return f"{part1}{part2}{part3}{part4}"
             elif exchange in ["BSE", "BFO"]:
