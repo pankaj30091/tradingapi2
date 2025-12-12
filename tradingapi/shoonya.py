@@ -910,7 +910,17 @@ class Shoonya(BrokerBase):
                     newprice=new_price,
                 )
                 if out is None:
-                    trading_logger.log_error("Error modifying order", {"broker_order_id": broker_order_id})
+                    trading_logger.log_error(
+                        "Error modifying order - API returned None",
+                        None,
+                        {
+                            "broker_order_id": broker_order_id,
+                            "old_price": order.price,
+                            "new_price": new_price,
+                            "old_quantity": order.quantity,
+                            "new_quantity": new_quantity,
+                        },
+                    )
                 elif out["stat"].upper() == "OK":
                     self.log_and_return(out)
                     order.quantity = new_quantity
@@ -921,6 +931,20 @@ class Shoonya(BrokerBase):
                     order.exch_order_id = order_info.exchange_order_id
                     self.redis_o.hmset(broker_order_id, {key: str(val) for key, val in order.to_dict().items()})
                 else:
+                    # Log the failure with full details
+                    trading_logger.log_error(
+                        "Order modification failed - broker returned non-OK status",
+                        None,
+                        {
+                            "broker_order_id": broker_order_id,
+                            "old_price": order.price,
+                            "new_price": new_price,
+                            "old_quantity": order.quantity,
+                            "new_quantity": new_quantity,
+                            "api_response": out,
+                            "api_status": out.get("stat") if out else None,
+                        },
+                    )
                     self.log_and_return(out)
                 self.log_and_return(order)
                 return order
