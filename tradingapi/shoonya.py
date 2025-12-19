@@ -792,10 +792,14 @@ class Shoonya(BrokerBase):
 
                         if not out:
                             trading_logger.log_error("Empty response from broker", {"order": str(order)})
+                            order.status = OrderStatus.REJECTED
+                            order.message = "Empty response from broker"
                             return order
 
                         if out.get("stat") is None:
                             trading_logger.log_error("Error placing order", {"order": str(order), "response": str(out)})
+                            order.status = OrderStatus.REJECTED
+                            order.message = "Invalid response from broker"
                             return order
 
                         if out["stat"].upper() == "OK":
@@ -808,6 +812,8 @@ class Shoonya(BrokerBase):
                                 trading_logger.log_error(
                                     "No broker order ID in response", {"order": str(order), "response": str(out)}
                                 )
+                                order.status = OrderStatus.REJECTED
+                                order.message = "No broker order ID in response"
                                 return order
 
                             try:
@@ -836,10 +842,14 @@ class Shoonya(BrokerBase):
                             trading_logger.log_error(
                                 "Order placement failed", {"order": str(order), "response": str(out)}
                             )
+                            order.status = OrderStatus.REJECTED
+                            order.message = out.get("emsg", "Order placement failed")
                             return order
 
                     except Exception as e:
                         trading_logger.log_error("Exception during order placement", e, {"order": str(order)})
+                        order.status = OrderStatus.REJECTED
+                        order.message = f"Exception during order placement: {str(e)}"
                         return order
                 else:
                     order.order_type = orig_order_type

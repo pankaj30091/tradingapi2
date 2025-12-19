@@ -1474,7 +1474,7 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
     if order is None:
         logger.error(f"Order Not placed as None was received. Mother symbol: {long_symbol}. Are you logged in??")
         return ""
-    if order.status in [OrderStatus.REJECTED]:
+    if order.status in [OrderStatus.REJECTED, OrderStatus.UNDEFINED]:
         logger.error(
             f"Order not placed for {order.long_symbol}. Status was {order.status}. Message was {order.message}. Mother symbol was: {long_symbol}"
         )
