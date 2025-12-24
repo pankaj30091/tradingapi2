@@ -139,6 +139,11 @@ cd tradingapi2
 pip install -e .
 ```
 
+### From pypi
+```bash
+pip install tradingapi
+```
+
 ### Dependencies
 
 The package requires:
