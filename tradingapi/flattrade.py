@@ -465,7 +465,7 @@ class FlatTrade(BrokerBase):
         def _fresh_login(susertoken_path):
             """Perform fresh login with enhanced error handling."""
             try:
-                trading_logger.log_info("Performing fresh login", {"broker_name": self.broker.name})
+                trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
 
                 credentials = extract_credentials()
                 user = credentials["user"]
@@ -792,16 +792,16 @@ class FlatTrade(BrokerBase):
         Raises:
             BrokerConnectionError: If connection check fails
         """
-        trading_logger.log_debug("Checking FlatTrade connection", {"broker_type": "FlatTrade"})
+        trading_logger.log_debug("Checking FlatTrade connection", {"broker_type": self.broker.name})
 
         if not self.api:
-            trading_logger.log_warning("API not initialized", {"broker_type": "FlatTrade"})
+            trading_logger.log_warning("API not initialized", {"broker_type": self.broker.name})
             return False
 
         # Check margin balance
         limits_data = self.api.get_limits()
         if not limits_data:
-            trading_logger.log_warning("No limits data available", {"broker_type": "FlatTrade"})
+            trading_logger.log_warning("No limits data available", {"broker_type": self.broker.name})
             return False
 
         cash_balance = float(limits_data.get("cash", 0))
@@ -816,7 +816,7 @@ class FlatTrade(BrokerBase):
         quote = self.get_quote("NIFTY_IND___")
         if not quote or quote.last <= 0:
             trading_logger.log_warning(
-                "Quote check failed", {"broker_type": "FlatTrade", "quote_last": quote.last if quote else None}
+                "Quote check failed", {"broker_type": self.broker.name, "quote_last": quote.last if quote else None}
             )
             return False
 
@@ -824,7 +824,7 @@ class FlatTrade(BrokerBase):
 
         trading_logger.log_info(
             "Connection check successful",
-            {"broker_type": "FlatTrade", "cash_balance": cash_balance, "quote_last": quote.last if quote else None},
+            {"broker_type": self.broker.name, "cash_balance": cash_balance, "quote_last": quote.last if quote else None},
         )
         return True
 
@@ -841,12 +841,12 @@ class FlatTrade(BrokerBase):
             BrokerConnectionError: If disconnection fails
         """
         try:
-            trading_logger.log_info("Disconnecting from FlatTrade", {"broker_type": "FlatTrade"})
+            trading_logger.log_info("Disconnecting from FlatTrade", {"broker_type": self.broker.name})
 
             # Stop streaming if active
             try:
                 if hasattr(self, "subscribe_thread") and self.subscribe_thread and self.subscribe_thread.is_alive():
-                    trading_logger.log_info("Stopping streaming thread", {"broker_type": "FlatTrade"})
+                    trading_logger.log_info("Stopping streaming thread", {"broker_type": self.broker.name})
                     # Note: The actual streaming stop logic would be in the streaming method
             except Exception as e:
                 trading_logger.log_warning("Failed to stop streaming during disconnect", {"error": str(e)})
@@ -854,17 +854,17 @@ class FlatTrade(BrokerBase):
             # Clear API reference
             if self.api:
                 self.api = None
-                trading_logger.log_info("API reference cleared", {"broker_type": "FlatTrade"})
+                trading_logger.log_info("API reference cleared", {"broker_type": self.broker.name})
 
             # Clear other references
             self.subscribed_symbols = []
             self.socket_opened = False
 
-            trading_logger.log_info("Successfully disconnected from FlatTrade", {"broker_type": "FlatTrade"})
+            trading_logger.log_info("Successfully disconnected from FlatTrade", {"broker_type": self.broker.name})
             return True
 
         except Exception as e:
-            context = create_error_context(broker_type="FlatTrade", error=str(e))
+            context = create_error_context(broker_type=self.broker.name, error=str(e))
             raise BrokerConnectionError(f"Failed to disconnect from FlatTrade: {str(e)}", context)
 
     @log_execution_time
@@ -896,23 +896,71 @@ class FlatTrade(BrokerBase):
         return codes
 
     def log_and_return(self, any_object):
-        caller_function = inspect.stack()[1].function
+        """
+        Log and return an object with enhanced error handling.
 
-        if hasattr(any_object, "to_dict"):
-            # Try to get the object's __dict__
+        Args:
+            any_object: Object to log and return
+
+        Returns:
+            The original object
+
+        Raises:
+            ValidationError: If any_object is None
+            RedisError: If Redis logging fails
+        """
+        try:
+            trading_logger.log_debug("Logging and returning object", {"object_type": type(any_object).__name__})
+
+            if any_object is None:
+                context = create_error_context(object_type=type(any_object))
+                raise ValidationError("Object cannot be None", context)
+
+            caller_function = inspect.stack()[1].function
+
             try:
-                log_object = any_object.to_dict()  # Use the object's attributes as a dictionary
+                if hasattr(any_object, "to_dict"):
+                    # Try to get the object's __dict__
+                    try:
+                        log_object = any_object.to_dict()  # Use the object's attributes as a dictionary
+                    except Exception as e:
+                        trading_logger.log_warning(
+                            "Error converting object to dict", {"error": str(e), "object_type": type(any_object).__name__}
+                        )
+                        log_object = {"error": f"Error accessing to_dict: {str(e)}"}
+                else:
+                    # If no __dict__, treat the object as a simple serializable object (e.g., a dict, list, etc.)
+                    log_object = any_object
+
+                # Add the calling function name to the log
+                log_entry = {"caller": caller_function, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "object": log_object}
+
+                # Log the entry to Redis
+                try:
+                    self.redis_o.zadd(f"{self.broker.name.upper()}:LOG", {json.dumps(log_entry): time.time()})
+                    trading_logger.log_debug(
+                        "Object logged to Redis successfully",
+                        {"caller_function": caller_function, "object_type": type(any_object).__name__},
+                    )
+                except Exception as e:
+                    context = create_error_context(
+                        caller_function=caller_function, object_type=type(any_object).__name__, error=str(e)
+                    )
+                    raise RedisError(f"Failed to log object to Redis: {str(e)}", context)
+
+                return any_object
+
             except Exception as e:
-                log_object = {"error": f"Error accessing __dict__: {str(e)}"}
-        else:
-            # If no __dict__, treat the object as a simple serializable object (e.g., a dict, list, etc.)
-            log_object = any_object
+                context = create_error_context(object_type=type(any_object).__name__, error=str(e))
+                trading_logger.log_warning("Error logging object to Redis", {"error": str(e), "object_type": type(any_object).__name__})
+                return any_object  # Return object even if logging fails
 
-        # Add the calling function name to the log
-        log_entry = {"caller": caller_function, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "object": log_object}
-
-        # Log the entry to Redis
-        self.redis_o.zadd("SHOONYA:LOG", {json.dumps(log_entry): time.time()})
+        except (ValidationError, RedisError):
+            raise
+        except Exception as e:
+            context = create_error_context(object_type=type(any_object).__name__ if any_object else None, error=str(e))
+            trading_logger.log_error("Unexpected error in log_and_return", e, context)
+            return any_object  # Return object even if there's an error
 
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     @log_execution_time
@@ -985,15 +1033,21 @@ class FlatTrade(BrokerBase):
                         )
 
                         trading_logger.log_info(
-                            "Shoonya order info", {"order_info": json.dumps(out, indent=4, default=str)}
+                            "Flattrade order info", {"order_info": json.dumps(out, indent=4, default=str), "long_symbol": order.long_symbol, "broker_order_id": order.broker_order_id if hasattr(order, 'broker_order_id') else None}
                         )
 
                         if not out:
-                            trading_logger.log_error("Empty response from broker", {"order": str(order)})
+                            trading_logger.log_error(
+                                "Empty response from broker",
+                                {"order": str(order), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                            )
                             return order
 
                         if out.get("stat") is None:
-                            trading_logger.log_error("Error placing order", {"order": str(order), "response": str(out)})
+                            trading_logger.log_error(
+                                "Error placing order",
+                                {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                            )
                             return order
 
                         if out["stat"].upper() == "OK":
@@ -1004,7 +1058,8 @@ class FlatTrade(BrokerBase):
 
                             if not order.broker_order_id:
                                 trading_logger.log_error(
-                                    "No broker order ID in response", {"order": str(order), "response": str(out)}
+                                    "No broker order ID in response",
+                                    {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
                                 )
                                 return order
 
@@ -1029,15 +1084,21 @@ class FlatTrade(BrokerBase):
                             if order.price == 0:
                                 if fills.fill_price > 0 and order.price == 0:
                                     order.price = fills.fill_price
-                                    trading_logger.log_info("Placed Order", {"order": str(order)})
+                            
+                            trading_logger.log_info("Placed Order", {"order": str(order)})
                         else:
                             trading_logger.log_error(
-                                "Order placement failed", {"order": str(order), "response": str(out)}
+                                "Order placement failed",
+                                {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
                             )
                             return order
 
                     except Exception as e:
-                        trading_logger.log_error("Exception during order placement", e, {"order": str(order)})
+                        trading_logger.log_error(
+                            "Exception during order placement",
+                            e,
+                            {"order": str(order), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                        )
                         return order
                 else:
                     order.order_type = orig_order_type
@@ -1084,8 +1145,11 @@ class FlatTrade(BrokerBase):
         if order.broker_order_id != "0":
             fills = self.get_order_info(broker_order_id=broker_order_id)
             if order.status in [OrderStatus.OPEN]:
+                # Determine if this is an entry or exit order based on order_type
+                # BUY/SHORT are entry orders, SELL/COVER are exit orders
+                order_side = "entry" if order.order_type in ["BUY", "SHORT"] else "exit"
                 trading_logger.log_info(
-                    "Modifying entry order",
+                    f"Modifying {order_side} order",
                     {
                         "broker_order_id": broker_order_id,
                         "old_price": order.price,
@@ -1108,7 +1172,18 @@ class FlatTrade(BrokerBase):
                     newprice=new_price,
                 )
                 if out is None:
-                    trading_logger.log_error("Error modifying order", {"broker_order_id": broker_order_id})
+                    trading_logger.log_error(
+                        "Error modifying order - API returned None",
+                        None,
+                        {
+                            "broker_order_id": broker_order_id,
+                            "old_price": order.price,
+                            "new_price": new_price,
+                            "old_quantity": order.quantity,
+                            "new_quantity": new_quantity,
+                            "long_symbol": order.long_symbol,
+                        },
+                    )
                 elif out["stat"].upper() == "OK":
                     self.log_and_return(out)
                     order.quantity = new_quantity
@@ -1118,7 +1193,30 @@ class FlatTrade(BrokerBase):
                     order.status = order_info.status
                     order.exch_order_id = order_info.exchange_order_id
                     self.redis_o.hmset(broker_order_id, {key: str(val) for key, val in order.to_dict().items()})
+                    trading_logger.log_info(
+                        "Order modified successfully",
+                        {
+                            "broker_order_id": broker_order_id,
+                            "new_price": new_price,
+                            "new_quantity": new_quantity,
+                        },
+                    )
                 else:
+                    # Log the failure with full details
+                    trading_logger.log_error(
+                        "Order modification failed - broker returned non-OK status",
+                        None,
+                        {
+                            "broker_order_id": broker_order_id,
+                            "old_price": order.price,
+                            "new_price": new_price,
+                            "old_quantity": order.quantity,
+                            "new_quantity": new_quantity,
+                            "long_symbol": order.long_symbol,
+                            "api_response": out,
+                            "api_status": out.get("stat") if out else None,
+                        },
+                    )
                     self.log_and_return(out)
                 self.log_and_return(order)
                 return order
@@ -1291,224 +1389,247 @@ class FlatTrade(BrokerBase):
         Returns:
             Dict[str, List[HistoricalData]]: Dictionary with historical data for each symbol.
         """
-        timezone = pytz.timezone("Asia/Kolkata")
-
-        def extract_number(s: str) -> int:
-            # Search for digits in the string
-            match = re.search(r"\d+", s)
-            # Convert to integer if match is found, else return None
-            return int(match.group()) if match else 1  # default return 1 if no number found
-
-        scripCode = None
-        # Determine the format of symbols and create a DataFrame
-        if isinstance(symbols, str):
-            exchange = self.map_exchange_for_api(symbols, exchange)
-            scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
-            if scripCode:
-                symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
-            else:
-                trading_logger.log_error(
-                    "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "string"}
-                )
-                return {}
-        elif isinstance(symbols, dict):
-            scripCode = symbols.get("scrip_code")
-            if scripCode:
-                symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
-            else:
-                trading_logger.log_error(
-                    "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "dict"}
-                )
-                return {}
-        else:
-            symbols_pd = symbols
-
-        out = {}  # Initialize the output dictionary
-
-        for index, row_outer in symbols_pd.iterrows():
+        try:
             trading_logger.log_debug(
-                "Processing historical data",
-                {"index": str(index), "total_symbols": str(len(symbols)), "long_symbol": row_outer["long_symbol"]},
+                "Getting historical data",
+                {
+                    "symbols": str(symbols) if isinstance(symbols, (str, dict)) else f"DataFrame({len(symbols)} rows)",
+                    "date_start": date_start,
+                    "date_end": date_end,
+                    "exchange": exchange,
+                    "periodicity": periodicity,
+                },
             )
-            exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
-            historical_data_list = []
-            exch = exchange
-            s = row_outer["long_symbol"].replace("/", "-")
-            row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
-            # we do the above remapping for downloading permin data to database for legacy reasons.
-            # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
+            timezone = pytz.timezone("Asia/Kolkata")
 
-            date_start_dt, _ = valid_datetime(date_start, None)
-            date_end, _ = valid_datetime(date_end, "%Y%m%d")
-            date_end_dt, _ = valid_datetime(date_end + " " + market_close_time, None)
-            if isinstance(date_start_dt, dt.date) and not isinstance(date_start_dt, dt.datetime):
-                date_start_dt = dt.datetime.combine(date_start_dt, dt.datetime.min.time())
-            if isinstance(date_end_dt, dt.date) and not isinstance(date_end_dt, dt.datetime):
-                date_end_dt = dt.datetime.combine(date_end_dt, dt.datetime.min.time())
-            try:
-                if periodicity.endswith("m"):
-                    data = self.api.get_time_price_series(
-                        exchange=exch,
-                        token=str(row_outer["Scripcode"]),
-                        starttime=date_start_dt.timestamp(),
-                        endtime=date_end_dt.timestamp(),
-                        interval=extract_number(periodicity),
-                    )
-                elif periodicity == "1d":
-                    if row_outer["long_symbol"] == "NSENIFTY_IND___":
-                        row_outer["long_symbol"] = "NIFTY_IND___"
-                    trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(row_outer["long_symbol"])
+            def extract_number(s: str) -> int:
+                # Search for digits in the string
+                match = re.search(r"\d+", s)
+                # Convert to integer if match is found, else return None
+                return int(match.group()) if match else 1  # default return 1 if no number found
 
-                    def _timeout_handler(signum, frame):
-                        raise TimeoutError("daily_price_series call timed out")
-
-                    signal.signal(signal.SIGALRM, _timeout_handler)  # Install the handler
-
-                    attempts = 3
-                    wait_seconds = 2
-                    data = None
-
-                    for attempt in range(attempts):
-                        start_time = time.time()
-                        signal.alarm(2)  # Trigger a timeout in 3 seconds
-                        try:
-                            data = self.api.get_daily_price_series(
-                                exchange=exch,
-                                tradingsymbol=trading_symbol,
-                                startdate=date_start_dt.timestamp(),
-                                enddate=date_end_dt.timestamp(),
-                            )
-                            # If call succeeds, break out of loop
-                            break
-                        except Exception as e:
-                            trading_logger.log_error(
-                                "Error in get_daily_price_series",
-                                e,
-                                {"long_symbol": row_outer["long_symbol"], "attempt": attempt + 1},
-                            )
-                            data = None
-
-                        finally:
-                            signal.alarm(0)  # Cancel the alarm
-
-                        elapsed = time.time() - start_time
-                        if elapsed < wait_seconds:
-                            trading_logger.log_info(
-                                "Reattempting to get daily data", {"long_symbol": row_outer["long_symbol"]}
-                            )
-                            time.sleep(wait_seconds - elapsed)
-            except Exception as e:
-                trading_logger.log_error(
-                    "Error in get_time_price_series or get_daily_price_series",
-                    e,
-                    {"long_symbol": row_outer["long_symbol"], "periodicity": periodicity},
-                )
-                data = None
-
-            if not (data is None or len(data) == 0):
-                market_open = pd.to_datetime(market_open_time).time()
-                market_close = pd.to_datetime(market_close_time).time()
-                for d in data:
-                    if isinstance(d, str):
-                        d = json.loads(d)
-                    if periodicity.endswith("m"):
-                        date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
-                        # Filter by market open/close time for intraday
-                        if not (market_open <= date.time() < market_close):
-                            continue
-                        date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
-                    elif periodicity == "1d":
-                        date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
-                    historical_data = HistoricalData(
-                        date=date,
-                        open=float(d.get("into", "nan")),
-                        high=float(d.get("inth", "nan")),
-                        low=float(d.get("intl", "nan")),
-                        close=float(d.get("intc", "nan")),
-                        volume=int(float((d.get("intv", 0)))),
-                        intoi=int(float(d.get("intoi", 0))),
-                        oi=int(float(d.get("oi", 0))),
-                    )
-                    historical_data_list.append(historical_data)
-            else:
-                trading_logger.log_debug("No data found for symbol", {"long_symbol": row_outer["long_symbol"]})
-                historical_data_list.append(
-                    HistoricalData(
-                        date=dt.datetime(1970, 1, 1),
-                        open=float("nan"),
-                        high=float("nan"),
-                        low=float("nan"),
-                        close=float("nan"),
-                        volume=0,
-                        intoi=0,
-                        oi=0,
-                    )
-                )
-            if periodicity == "1d" and date_end_dt.date() == get_tradingapi_now().date():
-                # make a call to permin data for start date and end date of today
-                if historical_data_list:
-                    last_date = historical_data_list[0].date
-                    if last_date is not None:
-                        today_start = last_date + dt.timedelta(days=1)
-                    else:
-                        today_start = get_tradingapi_now().date()
-                    today_start = dt.datetime.combine(today_start, dt.datetime.min.time())
+            scripCode = None
+            # Determine the format of symbols and create a DataFrame
+            if isinstance(symbols, str):
+                exchange = self.map_exchange_for_api(symbols, exchange)
+                scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
+                if scripCode:
+                    symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
                 else:
-                    today_start = dt.datetime.combine(get_tradingapi_now().date(), dt.datetime.min.time())
-                try:
-                    intraday_data = self.api.get_time_price_series(
-                        exchange=exch,
-                        token=str(row_outer["Scripcode"]),
-                        starttime=today_start.timestamp(),
-                        interval=1,  # Request 1-minute data
+                    trading_logger.log_error(
+                        "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "string"}
                     )
+                    return {}
+            elif isinstance(symbols, dict):
+                scripCode = symbols.get("scrip_code")
+                if scripCode:
+                    symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
+                else:
+                    trading_logger.log_error(
+                        "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "dict"}
+                    )
+                    return {}
+            else:
+                symbols_pd = symbols
+
+            out = {}  # Initialize the output dictionary
+
+            for index, row_outer in symbols_pd.iterrows():
+                trading_logger.log_debug(
+                    "Processing historical data",
+                    {"index": str(index), "total_symbols": str(len(symbols)), "long_symbol": row_outer["long_symbol"]},
+                )
+                exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
+                historical_data_list = []
+                exch = exchange
+                s = row_outer["long_symbol"].replace("/", "-")
+                row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
+                # we do the above remapping for downloading permin data to database for legacy reasons.
+                # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
+
+                date_start_dt, _ = valid_datetime(date_start, None)
+                date_end, _ = valid_datetime(date_end, "%Y%m%d")
+                date_end_dt, _ = valid_datetime(date_end + " " + market_close_time, None)
+                if isinstance(date_start_dt, dt.date) and not isinstance(date_start_dt, dt.datetime):
+                    date_start_dt = dt.datetime.combine(date_start_dt, dt.datetime.min.time())
+                if isinstance(date_end_dt, dt.date) and not isinstance(date_end_dt, dt.datetime):
+                    date_end_dt = dt.datetime.combine(date_end_dt, dt.datetime.min.time())
+                try:
+                    if periodicity.endswith("m"):
+                        data = self.api.get_time_price_series(
+                            exchange=exch,
+                            token=str(row_outer["Scripcode"]),
+                            starttime=date_start_dt.timestamp(),
+                            endtime=date_end_dt.timestamp(),
+                            interval=extract_number(periodicity),
+                        )
+                    elif periodicity == "1d":
+                        if row_outer["long_symbol"] == "NSENIFTY_IND___":
+                            row_outer["long_symbol"] = "NIFTY_IND___"
+                        trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(row_outer["long_symbol"])
+
+                        def _timeout_handler(signum, frame):
+                            raise TimeoutError("daily_price_series call timed out")
+
+                        signal.signal(signal.SIGALRM, _timeout_handler)  # Install the handler
+
+                        attempts = 3
+                        wait_seconds = 2
+                        data = None
+
+                        for attempt in range(attempts):
+                            start_time = time.time()
+                            signal.alarm(2)  # Trigger a timeout in 3 seconds
+                            try:
+                                data = self.api.get_daily_price_series(
+                                    exchange=exch,
+                                    tradingsymbol=trading_symbol,
+                                    startdate=date_start_dt.timestamp(),
+                                    enddate=date_end_dt.timestamp(),
+                                )
+                                # If call succeeds, break out of loop
+                                break
+                            except Exception as e:
+                                trading_logger.log_error(
+                                    "Error in get_daily_price_series",
+                                    e,
+                                    {"long_symbol": row_outer["long_symbol"], "attempt": attempt + 1},
+                                )
+                                data = None
+
+                            finally:
+                                signal.alarm(0)  # Cancel the alarm
+
+                            elapsed = time.time() - start_time
+                            if elapsed < wait_seconds:
+                                trading_logger.log_info(
+                                    "Reattempting to get daily data", {"long_symbol": row_outer["long_symbol"]}
+                                )
+                                time.sleep(wait_seconds - elapsed)
                 except Exception as e:
                     trading_logger.log_error(
-                        "Error in get_time_price_series for intraday data", e, {"long_symbol": row_outer["long_symbol"]}
+                        "Error in get_time_price_series or get_daily_price_series",
+                        e,
+                        {"long_symbol": row_outer["long_symbol"], "periodicity": periodicity},
                     )
-                    intraday_data = None
+                    data = None
 
-                if intraday_data:
-                    df_intraday = pd.DataFrame(intraday_data)
-                    df_intraday["time"] = pd.to_datetime(df_intraday["time"], format="%d-%m-%Y %H:%M:%S")
-                    df_intraday.set_index("time", inplace=True)
-                    df_intraday[["into", "inth", "intl", "intc", "intv", "intoi", "oi"]] = df_intraday[
-                        ["into", "inth", "intl", "intc", "intv", "intoi", "oi"]
-                    ].apply(pd.to_numeric, errors="coerce")
-                    df_intraday = (
-                        df_intraday.resample("D")
-                        .agg(
-                            {
-                                "into": "first",
-                                "inth": "max",
-                                "intl": "min",
-                                "intc": "last",
-                                "intv": "sum",
-                                "intoi": "sum",
-                                "oi": "sum",
-                            }
+                if not (data is None or len(data) == 0):
+                    market_open = pd.to_datetime(market_open_time).time()
+                    market_close = pd.to_datetime(market_close_time).time()
+                    for d in data:
+                        if isinstance(d, str):
+                            d = json.loads(d)
+                        if periodicity.endswith("m"):
+                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
+                            # Filter by market open/close time for intraday
+                            if not (market_open <= date.time() < market_close):
+                                continue
+                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
+                        elif periodicity == "1d":
+                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
+                        historical_data = HistoricalData(
+                            date=date,
+                            open=float(d.get("into", "nan")),
+                            high=float(d.get("inth", "nan")),
+                            low=float(d.get("intl", "nan")),
+                            close=float(d.get("intc", "nan")),
+                            volume=int(float((d.get("intv", 0)))),
+                            intoi=int(float(d.get("intoi", 0))),
+                            oi=int(float(d.get("oi", 0))),
                         )
-                        .dropna()
+                        historical_data_list.append(historical_data)
+                else:
+                    trading_logger.log_debug("No data found for symbol", {"long_symbol": row_outer["long_symbol"]})
+                    historical_data_list.append(
+                        HistoricalData(
+                            date=dt.datetime(1970, 1, 1),
+                            open=float("nan"),
+                            high=float("nan"),
+                            low=float("nan"),
+                            close=float("nan"),
+                            volume=0,
+                            intoi=0,
+                            oi=0,
+                        )
                     )
-                    date_start = timezone.localize(date_start_dt)
-                    date_end = timezone.localize(date_end_dt)
-                    for _, row in df_intraday.iterrows():
-                        date = pd.Timestamp(row.name).tz_localize(timezone)
-                        if date_start <= date <= date_end:
-                            historical_data = HistoricalData(
-                                date=pd.Timestamp(row.name).tz_localize(timezone),
-                                open=row["into"],
-                                high=row["inth"],
-                                low=row["intl"],
-                                close=row["intc"],
-                                volume=row["intv"],
-                                intoi=row["intoi"],
-                                oi=row["oi"],
-                            )
-                            historical_data_list.append(historical_data)
-            out[row_outer["long_symbol"]] = historical_data_list
+                if periodicity == "1d" and date_end_dt.date() == get_tradingapi_now().date():
+                    # make a call to permin data for start date and end date of today
+                    if historical_data_list:
+                        last_date = historical_data_list[0].date
+                        if last_date is not None:
+                            today_start = last_date + dt.timedelta(days=1)
+                        else:
+                            today_start = get_tradingapi_now().date()
+                        today_start = dt.datetime.combine(today_start, dt.datetime.min.time())
+                    else:
+                        today_start = dt.datetime.combine(get_tradingapi_now().date(), dt.datetime.min.time())
+                    try:
+                        intraday_data = self.api.get_time_price_series(
+                            exchange=exch,
+                            token=str(row_outer["Scripcode"]),
+                            starttime=today_start.timestamp(),
+                            interval=1,  # Request 1-minute data
+                        )
+                    except Exception as e:
+                        trading_logger.log_error(
+                            "Error in get_time_price_series for intraday data", e, {"long_symbol": row_outer["long_symbol"]}
+                        )
+                        intraday_data = None
 
-        return out
+                    if intraday_data:
+                        df_intraday = pd.DataFrame(intraday_data)
+                        df_intraday["time"] = pd.to_datetime(df_intraday["time"], format="%d-%m-%Y %H:%M:%S")
+                        df_intraday.set_index("time", inplace=True)
+                        df_intraday[["into", "inth", "intl", "intc", "intv", "intoi", "oi"]] = df_intraday[
+                            ["into", "inth", "intl", "intc", "intv", "intoi", "oi"]
+                        ].apply(pd.to_numeric, errors="coerce")
+                        df_intraday = (
+                            df_intraday.resample("D")
+                            .agg(
+                                {
+                                    "into": "first",
+                                    "inth": "max",
+                                    "intl": "min",
+                                    "intc": "last",
+                                    "intv": "sum",
+                                    "intoi": "sum",
+                                    "oi": "sum",
+                                }
+                            )
+                            .dropna()
+                        )
+                        date_start = timezone.localize(date_start_dt)
+                        date_end = timezone.localize(date_end_dt)
+                        for _, row in df_intraday.iterrows():
+                            date = pd.Timestamp(row.name).tz_localize(timezone)
+                            if date_start <= date <= date_end:
+                                historical_data = HistoricalData(
+                                    date=pd.Timestamp(row.name).tz_localize(timezone),
+                                    open=row["into"],
+                                    high=row["inth"],
+                                    low=row["intl"],
+                                    close=row["intc"],
+                                    volume=row["intv"],
+                                    intoi=row["intoi"],
+                                    oi=row["oi"],
+                                )
+                                historical_data_list.append(historical_data)
+                out[row_outer["long_symbol"]] = historical_data_list
+
+            return out
+        except Exception as e:
+            trading_logger.log_error(
+                "Unexpected error in get_historical",
+                e,
+                {
+                    "symbols": str(symbols) if isinstance(symbols, (str, dict)) else f"DataFrame({len(symbols)} rows)",
+                    "date_start": date_start,
+                    "date_end": date_end,
+                    "exchange": exchange,
+                },
+            )
+            return {}
 
     def map_exchange_for_api(self, long_symbol, exchange):
         """
@@ -1521,15 +1642,36 @@ class FlatTrade(BrokerBase):
         Returns:
             str: Mapped exchange for API.
         """
-        exchange_map = {
-            "N": "NFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "NSE",
-            "B": "BFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "BSE",
-            "NSE": "NFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "NSE",
-            "BSE": "BFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "BSE",
-        }
+        try:
+            trading_logger.log_debug("Mapping exchange for API", {"long_symbol": long_symbol, "exchange": exchange})
 
-        # Return mapped exchange if "N" or "B", otherwise default to the given exchange
-        return exchange_map.get(exchange, exchange)
+            if not exchange or len(exchange) == 0:
+                context = create_error_context(long_symbol=long_symbol, exchange=exchange)
+                raise ValidationError("Exchange cannot be empty", context)
+
+            exchange_map = {
+                "N": "NFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "NSE",
+                "B": "BFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "BSE",
+                "NSE": "NFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "NSE",
+                "BSE": "BFO" if any(sub in long_symbol for sub in ["_OPT_", "_FUT_"]) else "BSE",
+            }
+
+            # Return mapped exchange if "N" or "B", otherwise default to the given exchange
+            result = exchange_map.get(exchange, exchange)
+
+            trading_logger.log_debug(
+                "Exchange mapped for API",
+                {"long_symbol": long_symbol, "original_exchange": exchange, "mapped_exchange": result},
+            )
+
+            return result
+
+        except (ValidationError, IndexError) as e:
+            context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
+            raise ValidationError(f"Error mapping exchange for API: {str(e)}", context)
+        except Exception as e:
+            context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
+            raise ValidationError(f"Unexpected error mapping exchange for API: {str(e)}", context)
 
     def map_exchange_for_db(self, long_symbol, exchange):
         """
@@ -1542,23 +1684,63 @@ class FlatTrade(BrokerBase):
         Returns:
             str: Mapped exchange ("NSE", "BSE", or the original exchange).
         """
-        if exchange.startswith("N"):
-            return "NSE"
-        elif exchange.startswith("B"):
-            return "BSE"
-        else:
-            return exchange
+        try:
+            trading_logger.log_debug("Mapping exchange for DB", {"long_symbol": long_symbol, "exchange": exchange})
+
+            if not exchange or len(exchange) == 0:
+                context = create_error_context(long_symbol=long_symbol, exchange=exchange)
+                raise ValidationError("Exchange cannot be empty", context)
+
+            if exchange.startswith("N"):
+                result = "NSE"
+            elif exchange.startswith("B"):
+                result = "BSE"
+            else:
+                result = exchange
+
+            trading_logger.log_debug(
+                "Exchange mapped for DB",
+                {"long_symbol": long_symbol, "original_exchange": exchange, "mapped_exchange": result},
+            )
+
+            return result
+
+        except (ValidationError, IndexError) as e:
+            context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
+            raise ValidationError(f"Error mapping exchange for DB: {str(e)}", context)
+        except Exception as e:
+            context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
+            raise ValidationError(f"Unexpected error mapping exchange for DB: {str(e)}", context)
 
     def convert_ft_to_ist(self, ft: int):
-        if ft == 0:
-            return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
-        utc_time = dt.datetime.fromtimestamp(ft, tz=dt.timezone.utc)
-        # Add 5 hours and 30 minutes to get IST
-        ist_time = utc_time + dt.timedelta(hours=5, minutes=30)
+        """
+        Convert a timestamp to IST date and time.
 
-        # Format the datetime
-        formatted_time = ist_time.strftime("%Y-%m-%d %H:%M:%S")
-        return formatted_time
+        Args:
+            ft: Timestamp in seconds since epoch
+
+        Returns:
+            str: The corresponding date and time in IST (yyyy-mm-dd hh:mm:ss).
+        """
+        try:
+            trading_logger.log_debug("Converting timestamp to IST", {"timestamp": ft})
+
+            if ft == 0:
+                result = get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
+                trading_logger.log_debug("Using current time for zero timestamp")
+                return result
+
+            utc_time = dt.datetime.fromtimestamp(ft, tz=dt.timezone.utc)
+            # Add 5 hours and 30 minutes to get IST
+            ist_time = utc_time + dt.timedelta(hours=5, minutes=30)
+
+            # Format the datetime
+            formatted_time = ist_time.strftime("%Y-%m-%d %H:%M:%S")
+            return formatted_time
+
+        except Exception as e:
+            trading_logger.log_warning("Error converting timestamp to IST", {"timestamp": ft, "error": str(e)})
+            return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
 
     @retry_on_error(max_retries=3, delay=0.5, backoff_factor=2.0)
     @log_execution_time
@@ -1577,6 +1759,7 @@ class FlatTrade(BrokerBase):
             Price: Quote details.
         """
         try:
+            trading_logger.log_debug("Fetching quote", {"long_symbol": long_symbol, "exchange": exchange})
             mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
             market_feed = Price()  # Initialize with default values
             market_feed.src = "sh"
@@ -1659,13 +1842,14 @@ class FlatTrade(BrokerBase):
                     market_feed.timestamp = dt.datetime.now()
 
                 trading_logger.log_debug(
-                    "Quote retrieved successfully",
+                    "Quote fetched successfully",
                     {
                         "long_symbol": long_symbol,
                         "exchange": mapped_exchange,
-                        "last_price": market_feed.last,
                         "bid": market_feed.bid,
                         "ask": market_feed.ask,
+                        "last": market_feed.last,
+                        "volume": market_feed.volume,
                     },
                 )
 
@@ -1700,237 +1884,303 @@ class FlatTrade(BrokerBase):
             ext_callback (function): External callback function for processing price updates.
             exchange (str): Exchange name (default: 'NSE').
         """
-        prices = {}
-        mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
+        try:
+            trading_logger.log_info(
+                "Starting quotes streaming",
+                {"operation": operation, "symbols_count": len(symbols), "exchange": exchange},
+            )
 
-        # Function to map JSON data to a Price object
-        def map_to_price(json_data):
-            price = Price()
-            price.src = "sh"
-            price.bid = (
-                float("nan")
-                if json_data.get("bp1") in [None, 0, "0", "0.00", float("nan")]
-                else float(json_data.get("bp1"))
-            )
-            price.ask = (
-                float("nan")
-                if json_data.get("sp1") in [None, 0, "0", "0.00", float("nan")]
-                else float(json_data.get("sp1"))
-            )
-            price.bid_volume = (
-                float("nan") if json_data.get("bq1") in [None, 0, "0", float("nan")] else float(json_data.get("bq1"))
-            )
-            price.ask_volume = (
-                float("nan") if json_data.get("sq1") in [None, 0, "0", float("nan")] else float(json_data.get("sq1"))
-            )
-            price.prior_close = (
-                float("nan")
-                if json_data.get("c") in [None, 0, "0", "0,00", float("nan")]
-                else float(json_data.get("c"))
-            )
-            price.last = (
-                float("nan")
-                if json_data.get("lp") in [None, 0, "0", "0.00", float("nan")]
-                else float(json_data.get("lp"))
-            )
-            price.high = (
-                float("nan")
-                if json_data.get("h") in [None, 0, "0", "0.00", float("nan")]
-                else float(json_data.get("h"))
-            )
-            price.low = (
-                float("nan")
-                if json_data.get("l") in [None, 0, "0", "0.00", float("nan")]
-                else float(json_data.get("l"))
-            )
-            price.volume = float("nan") if json_data.get("v") in [None, float("nan")] else float(json_data.get("v"))
-            symbol = self.exchange_mappings[json_data.get("e")]["symbol_map_reversed"].get(int(json_data.get("tk")))
-            price.exchange = self.map_exchange_for_db(symbol, json_data.get("e"))
-            price.timestamp = self.convert_ft_to_ist(int(json_data.get("ft", 0)))
-            price.symbol = symbol
-            return price
+            if not symbols or len(symbols) == 0:
+                trading_logger.log_error("Symbols list cannot be empty", {"operation": operation, "exchange": exchange})
+                return
 
-        # Function to handle incoming WebSocket messages
-        def on_message(message):
-            if message.get("t") == "tk":
-                price = map_to_price(message)
-                prices[message.get("tk")] = price
-                ext_callback(price)
-            elif message.get("t") == "tf":
-                required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l"}
-                if required_keys & message.keys():
-                    price = prices.get(message.get("tk"))
-                    if message.get("bp1"):
-                        price.bid = float(message.get("bp1"))
-                    if message.get("sp1"):
-                        price.ask = float(message.get("sp1"))
-                    if message.get("bq1"):
-                        price.bid_volume = float(message.get("bq1"))
-                    if message.get("sq1"):
-                        price.ask_volume = float(message.get("sq1"))
-                    if message.get("c"):
-                        price.prior_close = float(message.get("c"))
-                    if message.get("lp"):
-                        price.last = float(message.get("lp"))
-                    if message.get("h"):
-                        price.high = float(message.get("h"))
-                    if message.get("l"):
-                        price.low = float(message.get("l"))
-                    if message.get("v"):
-                        price.volume = float(message.get("v"))
-                    price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
+            prices = {}
+            mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
+
+            # Function to map JSON data to a Price object
+            def map_to_price(json_data):
+                price = Price()
+                price.src = "sh"
+                price.bid = (
+                    float("nan")
+                    if json_data.get("bp1") in [None, 0, "0", "0.00", float("nan")]
+                    else float(json_data.get("bp1"))
+                )
+                price.ask = (
+                    float("nan")
+                    if json_data.get("sp1") in [None, 0, "0", "0.00", float("nan")]
+                    else float(json_data.get("sp1"))
+                )
+                price.bid_volume = (
+                    float("nan") if json_data.get("bq1") in [None, 0, "0", float("nan")] else float(json_data.get("bq1"))
+                )
+                price.ask_volume = (
+                    float("nan") if json_data.get("sq1") in [None, 0, "0", float("nan")] else float(json_data.get("sq1"))
+                )
+                price.prior_close = (
+                    float("nan")
+                    if json_data.get("c") in [None, 0, "0", "0,00", float("nan")]
+                    else float(json_data.get("c"))
+                )
+                price.last = (
+                    float("nan")
+                    if json_data.get("lp") in [None, 0, "0", "0.00", float("nan")]
+                    else float(json_data.get("lp"))
+                )
+                price.high = (
+                    float("nan")
+                    if json_data.get("h") in [None, 0, "0", "0.00", float("nan")]
+                    else float(json_data.get("h"))
+                )
+                price.low = (
+                    float("nan")
+                    if json_data.get("l") in [None, 0, "0", "0.00", float("nan")]
+                    else float(json_data.get("l"))
+                )
+                price.volume = float("nan") if json_data.get("v") in [None, float("nan")] else float(json_data.get("v"))
+                symbol = self.exchange_mappings[json_data.get("e")]["symbol_map_reversed"].get(int(json_data.get("tk")))
+                price.exchange = self.map_exchange_for_db(symbol, json_data.get("e"))
+                price.timestamp = self.convert_ft_to_ist(int(json_data.get("ft", 0)))
+                price.symbol = symbol
+                return price
+
+            # Function to handle incoming WebSocket messages
+            def on_message(message):
+                if message.get("t") == "tk":
+                    price = map_to_price(message)
                     prices[message.get("tk")] = price
                     ext_callback(price)
+                elif message.get("t") == "tf":
+                    required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l"}
+                    if required_keys & message.keys():
+                        price = prices.get(message.get("tk"))
+                        if message.get("bp1"):
+                            price.bid = float(message.get("bp1"))
+                        if message.get("sp1"):
+                            price.ask = float(message.get("sp1"))
+                        if message.get("bq1"):
+                            price.bid_volume = float(message.get("bq1"))
+                        if message.get("sq1"):
+                            price.ask_volume = float(message.get("sq1"))
+                        if message.get("c"):
+                            price.prior_close = float(message.get("c"))
+                        if message.get("lp"):
+                            price.last = float(message.get("lp"))
+                        if message.get("h"):
+                            price.high = float(message.get("h"))
+                        if message.get("l"):
+                            price.low = float(message.get("l"))
+                        if message.get("v"):
+                            price.volume = float(message.get("v"))
+                        price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
+                        prices[message.get("tk")] = price
+                        ext_callback(price)
 
-        # Function to handle WebSocket errors
-        def handle_socket_error(error=None):
-            if error:
-                trading_logger.log_error("WebSocket error", {"error": str(error)})
-            else:
-                trading_logger.log_error("WebSocket error. Connection to remote host was lost.")
+            # Function to handle WebSocket errors
+            def handle_socket_error(error=None):
+                if error:
+                    trading_logger.log_error("WebSocket error", {"error": str(error)})
+                else:
+                    trading_logger.log_error("WebSocket error. Connection to remote host was lost.")
 
-        def handle_socket_close(close_code=None, close_msg=None):
-            if close_msg:
-                trading_logger.log_error("WebSocket closed", {"close_msg": str(close_msg)})
-                initiate_reconnect()
+            def handle_socket_close(close_code=None, close_msg=None):
+                if close_msg:
+                    trading_logger.log_error("WebSocket closed", {"close_msg": str(close_msg)})
+                    initiate_reconnect()
 
-        def initiate_reconnect(max_retries=5, retry_delay=5):
-            """
-            Attempt to reconnect the WebSocket connection.
-            """
-            for attempt in range(max_retries):
-                try:
-                    trading_logger.log_info("Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries})
+            def initiate_reconnect(max_retries=5, retry_delay=5):
+                """
+                Attempt to reconnect the WebSocket connection.
+                """
+                for attempt in range(max_retries):
+                    try:
+                        trading_logger.log_info("Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries})
 
-                    # Close the existing WebSocket connection if open
-                    if hasattr(self, "api") and self.api and hasattr(self, "socket_opened") and self.socket_opened:
-                        try:
-                            self.api.close_websocket()
-                            self.socket_opened = False
-                            trading_logger.log_info("Closed existing WebSocket connection")
-                        except Exception as e:
-                            trading_logger.log_warning("Failed to close existing WebSocket", e)
+                        # Close the existing WebSocket connection if open
+                        if hasattr(self, "api") and self.api and hasattr(self, "socket_opened") and self.socket_opened:
+                            try:
+                                self.api.close_websocket()
+                                self.socket_opened = False
+                                trading_logger.log_info("Closed existing WebSocket connection")
+                            except Exception as e:
+                                trading_logger.log_warning("Failed to close existing WebSocket", e)
 
-                    # Reinitialize the WebSocket connection
-                    connect_and_subscribe()
+                        # Reinitialize the WebSocket connection
+                        connect_and_subscribe()
 
-                    # Wait for the WebSocket to open with timeout
-                    timeout = 10  # seconds
-                    start_time = time.time()
-                    while not self.socket_opened and (time.time() - start_time) < timeout:
-                        time.sleep(0.5)  # Check more frequently
+                        # Wait for the WebSocket to open with timeout
+                        timeout = 10  # seconds
+                        start_time = time.time()
+                        while not self.socket_opened and (time.time() - start_time) < timeout:
+                            time.sleep(0.5)  # Check more frequently
 
-                    if self.socket_opened:
-                        trading_logger.log_info("WebSocket reconnected successfully.")
-                        try:
-                            self.api.subscribe(req_list)
-                            trading_logger.log_info("Resubscribed to symbols after reconnection")
-                            return
-                        except Exception as e:
-                            trading_logger.log_error("Failed to resubscribe after reconnection", e)
+                        if self.socket_opened:
+                            trading_logger.log_info("WebSocket reconnected successfully.")
+                            try:
+                                self.api.subscribe(req_list)
+                                trading_logger.log_info("Resubscribed to symbols after reconnection")
+                                return
+                            except Exception as e:
+                                trading_logger.log_error("Failed to resubscribe after reconnection", e)
+                        else:
+                            trading_logger.log_warning("WebSocket did not open within the expected time.")
+
+                    except Exception as e:
+                        trading_logger.log_error("Reconnect attempt failed", e, {"attempt": attempt + 1})
+
+                        # Wait before the next retry with exponential backoff
+                        wait_time = retry_delay * (2**attempt)
+                        trading_logger.log_info("Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1})
+                        time.sleep(wait_time)
+
+                trading_logger.log_error("Max reconnect attempts reached. Unable to reconnect the WebSocket.")
+                # Set a flag to indicate connection failure
+                if hasattr(self, "socket_opened"):
+                    self.socket_opened = False
+
+            # Function to handle WebSocket connection opening
+            def on_socket_open():
+                trading_logger.log_info("WebSocket connection opened")
+                self.socket_opened = True
+
+            # Function to establish WebSocket connection and subscribe
+            def connect_and_subscribe():
+                self.api.start_websocket(
+                    subscribe_callback=on_message,
+                    socket_close_callback=handle_socket_close,
+                    socket_error_callback=handle_socket_error,
+                    socket_open_callback=on_socket_open,
+                )
+                while not self.socket_opened:
+                    time.sleep(1)
+
+            # Function to expand symbols into request format
+            def expand_symbols_to_request(symbol_list):
+                req_list = []
+                for symbol in symbol_list:
+                    scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(symbol)
+                    if scrip_code:
+                        req_list.append(f"{mapped_exchange}|{scrip_code}")
                     else:
-                        trading_logger.log_warning("WebSocket did not open within the expected time.")
+                        trading_logger.log_error("Did not find scrip_code for symbol", {"symbol": symbol})
+                return req_list
 
-                except Exception as e:
-                    trading_logger.log_error("Reconnect attempt failed", e, {"attempt": attempt + 1})
+            # Function to update the subscription list
+            def update_subscription_list(operation, symbols):
+                if operation == "s":
+                    self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
+                elif operation == "u":
+                    self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
 
-                # Wait before the next retry with exponential backoff
-                wait_time = retry_delay * (2**attempt)
-                trading_logger.log_info("Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1})
-                time.sleep(wait_time)
+            # Update subscriptions and request list
+            update_subscription_list(operation, symbols)
+            req_list = expand_symbols_to_request(symbols)
 
-            trading_logger.log_error("Max reconnect attempts reached. Unable to reconnect the WebSocket.")
-            # Set a flag to indicate connection failure
-            if hasattr(self, "socket_opened"):
-                self.socket_opened = False
+            # Start the WebSocket connection if not already started
+            if self.subscribe_thread is None:
+                self.subscribe_thread = threading.Thread(target=connect_and_subscribe, name="MarketDataStreamer")
+                self.subscribe_thread.start()
 
-        # Function to handle WebSocket connection opening
-        def on_socket_open():
-            trading_logger.log_info("WebSocket connection opened")
-            self.socket_opened = True
-
-        # Function to establish WebSocket connection and subscribe
-        def connect_and_subscribe():
-            self.api.start_websocket(
-                subscribe_callback=on_message,
-                socket_close_callback=handle_socket_close,
-                socket_error_callback=handle_socket_error,
-                socket_open_callback=on_socket_open,
-            )
+            # Wait until the socket is opened before subscribing/unsubscribing
             while not self.socket_opened:
                 time.sleep(1)
 
-        # Function to expand symbols into request format
-        def expand_symbols_to_request(symbol_list):
-            req_list = []
-            for symbol in symbol_list:
-                scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(symbol)
-                if scrip_code:
-                    req_list.append(f"{mapped_exchange}|{scrip_code}")
-                else:
-                    trading_logger.log_error("Did not find scrip_code for symbol", {"symbol": symbol})
-            return req_list
-
-        # Function to update the subscription list
-        def update_subscription_list(operation, symbols):
-            if operation == "s":
-                self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
-            elif operation == "u":
-                self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
-
-        # Update subscriptions and request list
-        update_subscription_list(operation, symbols)
-        req_list = expand_symbols_to_request(symbols)
-
-        # Start the WebSocket connection if not already started
-        if self.subscribe_thread is None:
-            self.subscribe_thread = threading.Thread(target=connect_and_subscribe, name="MarketDataStreamer")
-            self.subscribe_thread.start()
-
-        # Wait until the socket is opened before subscribing/unsubscribing
-        while not self.socket_opened:
-            time.sleep(1)
-
-        # Manage subscription based on operation
-        if req_list:
-            if operation == "s":
-                trading_logger.log_info("Requesting streaming", {"req_list": req_list})
-                self.api.subscribe(req_list)
-            elif operation == "u":
-                trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
-                self.api.unsubscribe(req_list)
+                # Manage subscription based on operation
+                if req_list:
+                    if operation == "s":
+                        trading_logger.log_info("Requesting streaming", {"req_list": req_list})
+                        self.api.subscribe(req_list)
+                    elif operation == "u":
+                        trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
+                        self.api.unsubscribe(req_list)
+        except Exception as e:
+            trading_logger.log_error(
+                "Unexpected error in start_quotes_streaming",
+                e,
+                {"operation": operation, "symbols_count": len(symbols) if symbols else 0, "exchange": exchange},
+            )
 
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0)
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_position(self, long_symbol: str):
-        pos = pd.DataFrame(self.api.get_positions())
-        if len(pos) > 0:
-            pos["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=pos.tsym)
-            if long_symbol is None:
-                return pos
-            else:
-                pos = pos.loc[pos.long_symbol == long_symbol, "netqty"]
-                if len(pos) == 0:
-                    return 0
-                elif len(pos) == 1:
-                    return pos.item()
+        try:
+            trading_logger.log_debug("Getting position", {"long_symbol": long_symbol if long_symbol else "all"})
+
+            pos = pd.DataFrame(self.api.get_positions())
+            if len(pos) > 0:
+                try:
+                    pos["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=pos.tsym)
+                except Exception as e:
+                    trading_logger.log_error("Error processing positions data", e, {"positions_count": len(pos)})
+                    return pd.DataFrame(columns=["long_symbol", "quantity"])
+
+                if long_symbol is None or long_symbol == "":
+                    trading_logger.log_debug("Returning all positions", {"position_count": len(pos)})
+                    return pos
                 else:
-                    return Exception
-        return pos
+                    pos_filtered = pos.loc[pos.long_symbol == long_symbol, "netqty"]
+                    if len(pos_filtered) == 0:
+                        trading_logger.log_debug("No position found for symbol", {"long_symbol": long_symbol})
+                        return 0
+                    elif len(pos_filtered) == 1:
+                        position_value = pos_filtered.item()
+                        trading_logger.log_debug(
+                            "Position retrieved for symbol", {"long_symbol": long_symbol, "quantity": position_value}
+                        )
+                        return position_value
+                    else:
+                        trading_logger.log_error(
+                            "Multiple positions found for symbol",
+                            {"long_symbol": long_symbol, "position_count": len(pos_filtered)},
+                        )
+                        raise MarketDataError(f"Multiple positions found for symbol: {long_symbol}")
+            else:
+                trading_logger.log_debug("No positions found")
+                return pos
+
+        except (ValidationError, MarketDataError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            context = create_error_context(long_symbol=long_symbol, error=str(e))
+            trading_logger.log_error("Unexpected error getting position", e, context)
+            raise MarketDataError(f"Unexpected error getting position: {str(e)}", context)
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_orders_today(self, **kwargs):
-        return super().get_orders_today(**kwargs)
+        try:
+            trading_logger.log_debug("Getting orders for today")
+            result = super().get_orders_today(**kwargs)
+            if result is not None and len(result) > 0:
+                trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(result)})
+            else:
+                trading_logger.log_debug("No orders found for today")
+            return result
+        except Exception as e:
+            context = create_error_context(error=str(e))
+            trading_logger.log_error("Unexpected error getting orders", e, context)
+            raise
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_trades_today(self, **kwargs):
-        return super().get_trades_today(**kwargs)
+        try:
+            trading_logger.log_debug("Getting trades for today")
+            result = super().get_trades_today(**kwargs)
+            if result is not None and len(result) > 0:
+                trading_logger.log_debug("Trades retrieved successfully", {"trade_count": len(result)})
+            else:
+                trading_logger.log_debug("No trades found for today")
+            return result
+        except Exception as e:
+            context = create_error_context(error=str(e))
+            trading_logger.log_error("Unexpected error getting trades", e, context)
+            raise
 
+    @log_execution_time
+    @validate_inputs(ScripName=lambda x: isinstance(x, pd.Series) and len(x) > 0)
     def get_long_name_from_broker_identifier(self, **kwargs):
-        #    def get_long_name_from_shoonya(ScripName: pd.Series) -> pd.Series:
         """Generates Long Name
 
         Args:
@@ -1939,60 +2189,95 @@ class FlatTrade(BrokerBase):
         Returns:
             pd.series: long name
         """
+        try:
+            trading_logger.log_debug(
+                "Generating long name from broker identifier",
+                {"scrip_name_count": len(kwargs.get("ScripName", pd.Series()))},
+            )
 
-        def split_fno(fno_symbol):
-            # Check if it's SENSEX format (ends with CE/PE)
-            if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
-                # Extract symbol
-                symbol = "SENSEX"
+            ScripName = kwargs.get("ScripName")
+            if ScripName is None:
+                context = create_error_context(available_keys=list(kwargs.keys()))
+                raise ValidationError("Missing required argument: 'ScripName'", context)
 
-                # Extract option type (last 2 characters)
-                option_type = fno_symbol[-2:]  # CE or PE
-                part3 = "C" if option_type == "CE" else "P"
+            if not isinstance(ScripName, pd.Series) or len(ScripName) == 0:
+                context = create_error_context(
+                    scrip_name_type=type(ScripName),
+                    scrip_name_length=len(ScripName) if hasattr(ScripName, "__len__") else None,
+                )
+                raise ValidationError("ScripName must be a non-empty pandas Series", context)
 
-                # Extract the part after SENSEX and before CE/PE
-                middle_part = fno_symbol[6:-2]  # e.g., "25SEP91600", "25DEC89000", "2580591600"
+            def split_fno(fno_symbol):
+                # Check if it's SENSEX format (ends with CE/PE)
+                if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
+                    # Extract symbol
+                    symbol = "SENSEX"
 
-                # Try to parse different SENSEX formats
-                try:
-                    # Extract year (first 2 digits)
-                    year = "20" + middle_part[:2]
+                    # Extract option type (last 2 characters)
+                    option_type = fno_symbol[-2:]  # CE or PE
+                    part3 = "C" if option_type == "CE" else "P"
 
-                    # Extract the remaining part after year
-                    remaining = middle_part[2:]
+                    # Extract the part after SENSEX and before CE/PE
+                    middle_part = fno_symbol[6:-2]  # e.g., "25SEP91600", "25DEC89000", "2580591600"
 
-                    # Check if next 3 characters are letters (month abbreviation) - check this FIRST
-                    if len(remaining) >= 3 and remaining[:3].isalpha():
-                        # Month abbreviation format (3 letters)
-                        month_abbr = remaining[:3]
+                    # Try to parse different SENSEX formats
+                    try:
+                        # Extract year (first 2 digits)
+                        year = "20" + middle_part[:2]
 
-                        # Convert month abbreviation to number
-                        month_map = {
-                            "JAN": "01",
-                            "FEB": "02",
-                            "MAR": "03",
-                            "APR": "04",
-                            "MAY": "05",
-                            "JUN": "06",
-                            "JUL": "07",
-                            "AUG": "08",
-                            "SEP": "09",
-                            "OCT": "10",
-                            "NOV": "11",
-                            "DEC": "12",
-                        }
+                        # Extract the remaining part after year
+                        remaining = middle_part[2:]
 
-                        if month_abbr in month_map:
-                            month = month_map[month_abbr]
+                        # Check if next 3 characters are letters (month abbreviation) - check this FIRST
+                        if len(remaining) >= 3 and remaining[:3].isalpha():
+                            # Month abbreviation format (3 letters)
+                            month_abbr = remaining[:3]
 
-                            # For 3-letter month format, no day is given
-                            # We need to find the last working Tuesday of the month
-                            # For now, we'll use a placeholder day (25th)
-                            day = "25"  # Placeholder - should be calculated as last working Tuesday
-                            first_dom = f"01-{month}-{year}"
-                            expiry = get_expiry(first_dom, weekly=0, day_of_week=2, exchange="BSE")
-                            day = expiry[:2]
-                            # Extract strike (remaining digits after month abbreviation)
+                            # Convert month abbreviation to number
+                            month_map = {
+                                "JAN": "01",
+                                "FEB": "02",
+                                "MAR": "03",
+                                "APR": "04",
+                                "MAY": "05",
+                                "JUN": "06",
+                                "JUL": "07",
+                                "AUG": "08",
+                                "SEP": "09",
+                                "OCT": "10",
+                                "NOV": "11",
+                                "DEC": "12",
+                            }
+
+                            if month_abbr in month_map:
+                                month = month_map[month_abbr]
+
+                                # For 3-letter month format, no day is given
+                                # We need to find the last working Tuesday of the month
+                                # For now, we'll use a placeholder day (25th)
+                                day = "25"  # Placeholder - should be calculated as last working Tuesday
+                                first_dom = f"01-{month}-{year}"
+                                expiry = get_expiry(first_dom, weekly=0, day_of_week=2, exchange="BSE")
+                                day = expiry[:2]
+                                # Extract strike (remaining digits after month abbreviation)
+                                strike = remaining[3:]
+
+                                # Construct date string
+                                part2 = f"{year}{month}{day}"
+                                part4 = strike
+
+                                return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
+
+                        # Check if next character is a digit (single digit month)
+                        elif remaining[0].isdigit():
+                            # Single digit month format
+                            month_digit = remaining[0]
+                            month = month_digit.zfill(2)  # 8 -> 08 (August)
+
+                            # Extract day (next 2 digits)
+                            day = remaining[1:3]
+
+                            # Extract strike (remaining digits before CE/PE)
                             strike = remaining[3:]
 
                             # Construct date string
@@ -2001,92 +2286,126 @@ class FlatTrade(BrokerBase):
 
                             return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
 
-                    # Check if next character is a digit (single digit month)
-                    elif remaining[0].isdigit():
-                        # Single digit month format
-                        month_digit = remaining[0]
-                        month = month_digit.zfill(2)  # 8 -> 08 (August)
+                        # Check if next character is O, N, or D (single letter month)
+                        elif remaining[0] in ["O", "N", "D"]:
+                            # Single letter month format
+                            month_letter = remaining[0]
 
-                        # Extract day (next 2 digits)
-                        day = remaining[1:3]
+                            # Map single letters to months: O=October, N=November, D=December
+                            month_map = {"O": "10", "N": "11", "D": "12"}  # October  # November  # December
 
-                        # Extract strike (remaining digits before CE/PE)
-                        strike = remaining[3:]
+                            month = month_map[month_letter]
 
-                        # Construct date string
-                        part2 = f"{year}{month}{day}"
-                        part4 = strike
+                            # Extract day (next 2 digits)
+                            day = remaining[1:3]
 
-                        return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
+                            # Extract strike (remaining digits before CE/PE)
+                            strike = remaining[3:]
 
-                    # Check if next character is O, N, or D (single letter month)
-                    elif remaining[0] in ["O", "N", "D"]:
-                        # Single letter month format
-                        month_letter = remaining[0]
+                            # Construct date string
+                            part2 = f"{year}{month}{day}"
+                            part4 = strike
 
-                        # Map single letters to months: O=October, N=November, D=December
-                        month_map = {"O": "10", "N": "11", "D": "12"}  # October  # November  # December
+                            return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
 
-                        month = month_map[month_letter]
+                        # Fallback for unexpected formats
+                        else:
+                            trading_logger.log_warning(
+                                "Unexpected SENSEX format",
+                                {"fno_symbol": fno_symbol, "middle_part": middle_part, "remaining": remaining},
+                            )
+                            part2 = "20250101"
+                            part4 = middle_part[2:]  # Use remaining part as strike
+                            return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
 
-                        # Extract day (next 2 digits)
-                        day = remaining[1:3]
-
-                        # Extract strike (remaining digits before CE/PE)
-                        strike = remaining[3:]
-
-                        # Construct date string
-                        part2 = f"{year}{month}{day}"
-                        part4 = strike
-
-                        return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-
-                    # Fallback for unexpected formats
-                    else:
-                        trading_logger.log_warning(
-                            "Unexpected SENSEX format",
-                            {"fno_symbol": fno_symbol, "middle_part": middle_part, "remaining": remaining},
+                    except Exception as e:
+                        trading_logger.log_error(
+                            "Error parsing SENSEX symbol", e, {"fno_symbol": fno_symbol, "middle_part": middle_part}
                         )
                         part2 = "20250101"
-                        part4 = middle_part[2:]  # Use remaining part as strike
+                        part4 = middle_part
                         return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
 
-                except Exception as e:
-                    trading_logger.log_error(
-                        "Error parsing SENSEX symbol", e, {"fno_symbol": fno_symbol, "middle_part": middle_part}
-                    )
-                    part2 = "20250101"
-                    part4 = middle_part
-                    return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
+                else:
+                    # Original NIFTY format: NIFTY07AUG25C25050
+                    part1 = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol).group()
+                    date_match = re.search(r"\d{2}[A-Z]{3}\d{2}", fno_symbol)
+                    part2 = dt.datetime.strptime(date_match.group(), "%d%b%y").date().strftime("%Y%m%d")
+                    part3 = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol).group(1)
+                    part4 = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol).group(1)
+                    return f"{part1}_{'FUT' if part3 == 'F' else 'OPT'}_{part2}_{'CALL' if part3=='C' else 'PUT' if part3 =='P' else ''}_{part4}"
 
-            else:
-                # Original NIFTY format: NIFTY07AUG25C25050
-                part1 = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol).group()
-                date_match = re.search(r"\d{2}[A-Z]{3}\d{2}", fno_symbol)
-                part2 = dt.datetime.strptime(date_match.group(), "%d%b%y").date().strftime("%Y%m%d")
-                part3 = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol).group(1)
-                part4 = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol).group(1)
-                return f"{part1}_{'FUT' if part3 == 'F' else 'OPT'}_{part2}_{'CALL' if part3=='C' else 'PUT' if part3 =='P' else ''}_{part4}"
+            def split_cash(cash_symbol):
+                lst = cash_symbol.split("_")
+                if len(lst) > 1:
+                    return "-".join(lst[:-1]) + "_STK___"
+                else:
+                    return lst[0] + "_STK___"
 
-        def split_cash(cash_symbol):
-            lst = cash_symbol.split("_")
-            if len(lst) > 1:
-                return "-".join(lst[:-1]) + "_STK___"
-            else:
-                return lst[0] + "_STK___"
+            result = ScripName.apply(lambda x: split_cash(x) if x[-3] == "-" else split_fno(x))
 
-        ScripName = kwargs.get("ScripName")
-        return ScripName.apply(lambda x: split_cash(x) if x[-3] == "-" else split_fno(x))
+            trading_logger.log_debug(
+                "Long name generated successfully", {"input_count": len(ScripName), "output_count": len(result)}
+            )
+
+            return result
+
+        except (ValidationError, DataError):
+            raise
+        except Exception as e:
+            context = create_error_context(kwargs=kwargs, error=str(e))
+            trading_logger.log_error("Unexpected error generating long name", e, context)
+            raise DataError(f"Unexpected error generating long name: {str(e)}", context)
 
     @log_execution_time
     @validate_inputs(
         long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
+    @log_execution_time
+    @validate_inputs(
+        long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    )
     def get_min_lot_size(self, long_symbol, exchange="NSE"):
-        exchange = self.map_exchange_for_api(long_symbol, exchange)
-        code = self.exchange_mappings[exchange]["symbol_map"].get(long_symbol)
-        if code is not None:
-            return self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
-        else:
-            return 0
+        try:
+            trading_logger.log_debug("Getting minimum lot size", {"long_symbol": long_symbol, "exchange": exchange})
+
+            try:
+                exchange = self.map_exchange_for_api(long_symbol, exchange)
+            except Exception as e:
+                context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
+                raise SymbolError(f"Failed to map exchange: {str(e)}", context)
+
+            try:
+                code = self.exchange_mappings[exchange]["symbol_map"].get(long_symbol)
+            except KeyError as e:
+                context = create_error_context(
+                    exchange=exchange, long_symbol=long_symbol, available_exchanges=list(self.exchange_mappings.keys())
+                )
+                raise SymbolError(f"Exchange mapping not found: {str(e)}", context)
+
+            if code is not None:
+                try:
+                    lot_size = self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
+                    trading_logger.log_debug(
+                        "Lot size retrieved successfully",
+                        {"long_symbol": long_symbol, "exchange": exchange, "code": code, "lot_size": lot_size},
+                    )
+                    return lot_size
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Error retrieving lot size from codes",
+                        {"long_symbol": long_symbol, "exchange": exchange, "code": code, "error": str(e)},
+                    )
+                    return 0
+            else:
+                trading_logger.log_warning("Symbol code not found", {"long_symbol": long_symbol, "exchange": exchange})
+                return 0
+
+        except (ValidationError, SymbolError):
+            raise
+        except Exception as e:
+            context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
+            trading_logger.log_error("Unexpected error getting minimum lot size", e, context)
+            raise SymbolError(f"Unexpected error getting minimum lot size: {str(e)}", context)

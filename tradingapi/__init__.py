@@ -2,6 +2,7 @@
 import inspect
 import logging
 import os
+import signal
 import sys
 from importlib.resources import files
 from logging.handlers import TimedRotatingFileHandler
@@ -331,3 +332,94 @@ def initialize_config(config_file_path: str, force_reload: bool = True):
 
 
 initialize_config(get_default_config_path())
+
+
+def enable_runtime_log_level_toggle(enable: bool = True):
+    """
+    Enable runtime log level toggling via SIGUSR1 signal.
+    
+    When enabled, sending SIGUSR1 to the process will toggle between
+    DEBUG and INFO logging levels.
+    
+    This implementation supports handler chaining - if another package
+    has already registered a SIGUSR1 handler, both handlers will execute
+    (this handler runs first, then calls the previous handler).
+    
+    Args:
+        enable: If True, register the signal handler. If False, remove it.
+    """
+    def toggle_debug(signum, frame):
+        current_level = trading_logger.logger.level
+        if current_level == logging.DEBUG:
+            # Change to INFO
+            trading_logger.logger.setLevel(logging.INFO)
+            # Also update all handlers
+            for handler in trading_logger.logger.handlers:
+                handler.setLevel(logging.INFO)
+            trading_logger.log_info(
+                "Log level changed to INFO via signal",
+                {"signal": "SIGUSR1", "previous_level": "DEBUG"}
+            )
+        else:
+            # Change to DEBUG
+            trading_logger.logger.setLevel(logging.DEBUG)
+            # Also update all handlers
+            for handler in trading_logger.logger.handlers:
+                handler.setLevel(logging.DEBUG)
+            trading_logger.log_info(
+                "Log level changed to DEBUG via signal",
+                {"signal": "SIGUSR1", "previous_level": logging.getLevelName(current_level)}
+            )
+    
+    if enable:
+        try:
+            # Get the current handler (if any) before registering ours
+            current_handler = signal.signal(signal.SIGUSR1, toggle_debug)
+            
+            # If there was a previous handler, chain it
+            if current_handler not in (signal.SIG_DFL, signal.SIG_IGN, None):
+                def chained_handler(signum, frame):
+                    # Execute our handler first
+                    toggle_debug(signum, frame)
+                    # Then call the previous handler if it's callable
+                    if callable(current_handler):
+                        try:
+                            current_handler(signum, frame)
+                        except Exception as e:
+                            # Log but don't fail if previous handler has issues
+                            trading_logger.log_warning(
+                                "Error in chained SIGUSR1 handler",
+                                {"error": str(e), "error_type": type(e).__name__}
+                            )
+                
+                # Register the chained handler
+                signal.signal(signal.SIGUSR1, chained_handler)
+                trading_logger.log_info(
+                    "Runtime log level toggle enabled (chained with existing handler)",
+                    {
+                        "signal": "SIGUSR1",
+                        "usage": "kill -SIGUSR1 <pid> to toggle DEBUG/INFO",
+                        "previous_handler": str(current_handler)
+                    }
+                )
+            else:
+                trading_logger.log_info(
+                    "Runtime log level toggle enabled",
+                    {"signal": "SIGUSR1", "usage": "kill -SIGUSR1 <pid> to toggle DEBUG/INFO"}
+                )
+        except (ValueError, OSError) as e:
+            # Signal might not be available on all platforms
+            trading_logger.log_warning(
+                "Could not register signal handler for log level toggle",
+                {"error": str(e), "platform": sys.platform}
+            )
+    else:
+        # Restore default handler
+        try:
+            signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+
+
+# Automatically enable runtime log level toggle
+enable_runtime_log_level_toggle(enable=True)

@@ -719,7 +719,7 @@ class FivePaisa(BrokerBase):
             trading_logger.log_info(
                 "Connection check successful",
                 {
-                    "broker_type": "FivePaisa",
+                    "broker_type": self.broker.name,
                     "total_balance": total_balance,
                     "quote_last": quote.last if quote else None,
                 },
@@ -741,7 +741,7 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If disconnection fails
         """
         try:
-            trading_logger.log_info("Disconnecting from FivePaisa", {"broker_type": "FivePaisa"})
+            trading_logger.log_info("Disconnecting from FivePaisa", {"broker_type": self.broker.name})
 
             # Stop streaming if active
             try:
@@ -752,13 +752,13 @@ class FivePaisa(BrokerBase):
             # Clear API reference
             if self.api:
                 self.api = None
-                trading_logger.log_info("API reference cleared", {"broker_type": "FivePaisa"})
+                trading_logger.log_info("API reference cleared", {"broker_type": self.broker.name})
 
-            trading_logger.log_info("Successfully disconnected from FivePaisa", {"broker_type": "FivePaisa"})
+            trading_logger.log_info("Successfully disconnected from FivePaisa", {"broker_type": self.broker.name})
             return True
 
         except Exception as e:
-            context = create_error_context(broker_type="FivePaisa", error=str(e))
+            context = create_error_context(broker_type=self.broker.name, error=str(e))
             raise BrokerConnectionError(f"Failed to disconnect from FivePaisa: {str(e)}", context)
 
     @log_execution_time
@@ -780,18 +780,6 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info(
-                "Placing order with FivePaisa",
-                {
-                    "internal_order_id": order.internal_order_id,
-                    "long_symbol": order.long_symbol,
-                    "order_type": order.order_type,
-                    "quantity": order.quantity,
-                    "exchange": order.exchange,
-                    "paper": order.paper,
-                },
-            )
-
             # Validate mandatory keys
             mandatory_keys = [
                 "long_symbol",
@@ -896,16 +884,6 @@ class FivePaisa(BrokerBase):
                                 "FivePaisa API client is not initialized. Please call connect() first.", context
                             )
 
-                        # Log the payload being sent to API
-                        trading_logger.log_info(
-                            "Calling FivePaisa API place_order",
-                            {
-                                "payload": payload,
-                                "internal_order_id": order.internal_order_id,
-                                "long_symbol": order.long_symbol,
-                            },
-                        )
-
                         # Make API call with error handling
                         try:
                             out = self.api.place_order(**payload)
@@ -923,14 +901,8 @@ class FivePaisa(BrokerBase):
                             )
                             raise OrderError(f"FivePaisa API call failed: {str(api_error)}", context)
 
-                        # Log the API response
-                        trading_logger.log_debug(
-                            "FivePaisa API place_order response",
-                            {
-                                "response": out,
-                                "response_type": type(out).__name__,
-                                "internal_order_id": order.internal_order_id,
-                            },
+                        trading_logger.log_info(
+                            "FivePaisa order info", {"order_info": json.dumps(out, indent=4, default=str), "long_symbol": order.long_symbol, "broker_order_id": order.broker_order_id if hasattr(order, 'broker_order_id') else None}
                         )
 
                         if out is not None:
@@ -979,10 +951,7 @@ class FivePaisa(BrokerBase):
                                     {"broker_order_id": order.broker_order_id, "order": str(order)},
                                 )
 
-                            trading_logger.log_info(
-                                "Order placed successfully",
-                                {"order": str(order), "broker_order_id": order.broker_order_id},
-                            )
+                            trading_logger.log_info("Placed Order", {"order": str(order)})
                             self.log_and_return(order)
                             return order
                         else:
@@ -1156,10 +1125,7 @@ class FivePaisa(BrokerBase):
                         order.status = OrderStatus.FILLED
                         order.scrip_code = 0 if order.scrip_code is None else order.scrip_code
 
-                        trading_logger.log_info(
-                            "Paper order placed successfully",
-                            {"order": str(order), "broker_order_id": order.broker_order_id},
-                        )
+                        trading_logger.log_info("Placed Paper Order", {"order": str(order)})
 
                     except Exception as e:
                         context = create_error_context(order_data=order.to_dict(), error=str(e))
@@ -1175,7 +1141,7 @@ class FivePaisa(BrokerBase):
                     scrip_code=order.scrip_code,
                     paper=order.paper,
                 )
-                trading_logger.log_warning("No broker identifier found for symbol", context)
+                trading_logger.log_info("No broker identifier found for symbol", {"long_symbol": order.long_symbol})
                 self.log_and_return(order)
                 return order
 
@@ -1211,15 +1177,6 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info(
-                "Modifying order with FivePaisa",
-                {
-                    "broker_order_id": kwargs.get("broker_order_id"),
-                    "new_price": kwargs.get("new_price"),
-                    "new_quantity": kwargs.get("new_quantity"),
-                },
-            )
-
             # Validate mandatory keys
             mandatory_keys = ["broker_order_id", "new_price", "new_quantity"]
             missing_keys = [key for key in mandatory_keys if key not in kwargs]
@@ -1273,15 +1230,19 @@ class FivePaisa(BrokerBase):
             order.status = fills.status if fills else OrderStatus.UNDEFINED
 
             if order.status in [OrderStatus.OPEN]:
+                # Determine if this is an entry or exit order based on order_type
+                # BUY/SHORT are entry orders, SELL/COVER are exit orders
+                order_side = "entry" if order.order_type in ["BUY", "SHORT"] else "exit"
                 trading_logger.log_info(
-                    "Modifying order",
+                    f"Modifying {order_side} order",
                     {
                         "broker_order_id": broker_order_id,
                         "old_price": order.price,
                         "new_price": new_price,
                         "old_quantity": order.quantity,
                         "new_quantity": new_quantity,
-                        "fill_info": str(fills) if fills else None,
+                        "current_fills": str(fills.fill_size) if fills else "0",
+                        "long_symbol": order.long_symbol,
                     },
                 )
 
@@ -1313,6 +1274,12 @@ class FivePaisa(BrokerBase):
                             exch_order_id=exch_order_id,
                             new_price=new_price,
                             order_quantity=order_quantity,
+                            long_symbol=order.long_symbol,
+                        )
+                        trading_logger.log_error(
+                            "Error modifying order - API returned None",
+                            None,
+                            context,
                         )
                         raise OrderError("API returned None for order modification", context)
 
@@ -1384,9 +1351,19 @@ class FivePaisa(BrokerBase):
                             },
                         )
                     else:
-                        trading_logger.log_warning(
-                            "Order modification failed",
-                            {"broker_order_id": broker_order_id, "api_status": out.get("Status"), "api_response": out},
+                        trading_logger.log_error(
+                            "Order modification failed - broker returned non-OK status",
+                            None,
+                            {
+                                "broker_order_id": broker_order_id,
+                                "old_price": order.price,
+                                "new_price": new_price,
+                                "old_quantity": order.quantity,
+                                "new_quantity": new_quantity,
+                                "long_symbol": order.long_symbol,
+                                "api_status": out.get("Status"),
+                                "api_response": out,
+                            },
                         )
 
                 except Exception as e:
@@ -1428,10 +1405,6 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info(
-                "Cancelling order with FivePaisa", {"broker_order_id": kwargs.get("broker_order_id")}
-            )
-
             # Validate mandatory keys
             mandatory_keys = ["broker_order_id"]
             missing_keys = [key for key in mandatory_keys if key not in kwargs]
@@ -1474,11 +1447,11 @@ class FivePaisa(BrokerBase):
 
                         if fills and fills.fill_size < round(float(order.quantity)):
                             trading_logger.log_info(
-                                "Cancelling order",
+                                "Cancelling broker order",
                                 {
                                     "broker_order_id": broker_order_id,
-                                    "symbol": order.long_symbol,
-                                    "filled": fills.fill_size,
+                                    "long_symbol": order.long_symbol,
+                                    "filled": str(fills.fill_size),
                                     "ordered": order.quantity,
                                 },
                             )
@@ -2155,10 +2128,10 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info(
+            trading_logger.log_debug(
                 "Getting historical data",
                 {
-                    "symbols": symbols,
+                    "symbols": str(symbols) if isinstance(symbols, (str, dict)) else f"DataFrame({len(symbols)} rows)",
                     "date_start": date_start,
                     "date_end": date_end,
                     "exchange": exchange,
@@ -2666,7 +2639,7 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info("Fetching quote", {"long_symbol": long_symbol, "exchange": exchange})
+            trading_logger.log_debug("Fetching quote", {"long_symbol": long_symbol, "exchange": exchange})
 
             mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
             market_feed = Price()  # Initialize with default values
@@ -3021,7 +2994,7 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info("Getting position", {"long_symbol": long_symbol if long_symbol else "all"})
+            trading_logger.log_debug("Getting position", {"long_symbol": long_symbol if long_symbol else "all"})
 
             # Get holdings data
             try:
@@ -3079,17 +3052,17 @@ class FivePaisa(BrokerBase):
 
             # Return appropriate result
             if long_symbol is None or long_symbol == "":
-                trading_logger.log_info("Returning all positions", {"position_count": len(result)})
+                trading_logger.log_debug("Returning all positions", {"position_count": len(result)})
                 return result
             else:
                 try:
                     pos = result.loc[result.long_symbol == long_symbol, "quantity"]
                     if len(pos) == 0:
-                        trading_logger.log_info("No position found for symbol", {"long_symbol": long_symbol})
+                        trading_logger.log_debug("No position found for symbol", {"long_symbol": long_symbol})
                         return 0
                     elif len(pos) == 1:
                         position_value = pos.item()
-                        trading_logger.log_info(
+                        trading_logger.log_debug(
                             "Position retrieved for symbol", {"long_symbol": long_symbol, "quantity": position_value}
                         )
                         return position_value
@@ -3122,7 +3095,7 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info("Getting orders for today")
+            trading_logger.log_debug("Getting orders for today")
 
             try:
                 orders = self.api.order_book()
@@ -3133,13 +3106,13 @@ class FivePaisa(BrokerBase):
                         orders = orders.assign(
                             long_symbol=self.get_long_name_from_broker_identifier(ScripName=orders.ScripName)
                         )
-                        trading_logger.log_info("Orders retrieved successfully", {"order_count": len(orders)})
+                        trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(orders)})
                         return orders
                     except Exception as e:
                         trading_logger.log_error("Error processing orders data", e, {"order_count": len(orders)})
                         return None
                 else:
-                    trading_logger.log_info("No orders found for today")
+                    trading_logger.log_debug("No orders found for today")
                     return None
 
             except Exception as e:
@@ -3166,7 +3139,7 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If broker connection issues
         """
         try:
-            trading_logger.log_info("Getting trades for today")
+            trading_logger.log_debug("Getting trades for today")
 
             try:
                 trades = self.api.get_tradebook()
@@ -3181,13 +3154,13 @@ class FivePaisa(BrokerBase):
                             long_symbol=self.get_long_name_from_broker_identifier(ScripName=trades.ScripName)
                         )
 
-                        trading_logger.log_info("Trades retrieved successfully", {"trade_count": len(trades)})
+                        trading_logger.log_debug("Trades retrieved successfully", {"trade_count": len(trades)})
                         return trades
                     except Exception as e:
                         trading_logger.log_error("Error processing trades data", e, {"trade_count": len(trades)})
                         return None
                 else:
-                    trading_logger.log_info("No trades found for today")
+                    trading_logger.log_debug("No trades found for today")
                     return None
 
             except Exception as e:
@@ -3218,7 +3191,7 @@ class FivePaisa(BrokerBase):
             DataError: If data processing fails
         """
         try:
-            trading_logger.log_info(
+            trading_logger.log_debug(
                 "Generating long name from broker identifier",
                 {"scrip_name_count": len(kwargs.get("ScripName", pd.Series()))},
             )
@@ -3550,7 +3523,7 @@ class FivePaisa(BrokerBase):
             SymbolError: If symbol lookup fails
         """
         try:
-            trading_logger.log_info("Getting minimum lot size", {"long_symbol": long_symbol, "exchange": exchange})
+            trading_logger.log_debug("Getting minimum lot size", {"long_symbol": long_symbol, "exchange": exchange})
 
             try:
                 exchange = self.map_exchange_for_api(long_symbol, exchange)
