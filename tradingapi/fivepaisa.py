@@ -1266,7 +1266,27 @@ class FivePaisa(BrokerBase):
                         order_quantity = order_quantity if order_quantity > 0 else 0
 
                     # Modify order with API
-                    out = self.api.modify_order(ExchOrderID=exch_order_id, Price=new_price, Qty=order_quantity)
+                    # Convert numpy/pandas types to native Python types before passing to SDK
+                    # The SDK's set_payload doesn't convert types, and JSON serialization fails with int64/float64
+                    try:
+                        # Convert to native types for JSON serialization
+                        native_exch_order_id = int(exch_order_id) if isinstance(exch_order_id, (np.integer, np.int64, np.int32)) else str(exch_order_id)
+                        native_price = float(new_price) if isinstance(new_price, (np.floating, np.float64, np.float32)) else float(new_price)
+                        native_qty = int(order_quantity) if isinstance(order_quantity, (np.integer, np.int64, np.int32)) else int(order_quantity)
+                        out = self.api.modify_order(ExchOrderID=native_exch_order_id, Price=native_price, Qty=native_qty)
+                    except Exception as e:
+                        trading_logger.log_error(
+                            "Exception during SDK modify_order call",
+                            e,
+                            {
+                                "exch_order_id": exch_order_id,
+                                "price": new_price,
+                                "qty": order_quantity,
+                                "broker_order_id": broker_order_id,
+                                "long_symbol": order.long_symbol,
+                            },
+                        )
+                        out = None
 
                     if out is None:
                         context = create_error_context(

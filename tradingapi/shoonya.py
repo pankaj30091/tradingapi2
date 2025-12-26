@@ -1046,14 +1046,31 @@ class Shoonya(BrokerBase):
                 exchange = order.exchange
                 trading_symbol = self._get_tradingsymbol_from_longname(long_symbol, exchange)
                 newprice_type = "LMT" if new_price > 0 else "MKT"
-                out = self.api.modify_order(
-                    exchange=exchange,
-                    tradingsymbol=trading_symbol,
-                    orderno=broker_order_id,
-                    newquantity=new_quantity,
-                    newprice_type=newprice_type,
-                    newprice=new_price,
-                )
+                try:
+                    out = self.api.modify_order(
+                        exchange=exchange,
+                        tradingsymbol=trading_symbol,
+                        orderno=broker_order_id,
+                        newquantity=new_quantity,
+                        newprice_type=newprice_type,
+                        newprice=new_price,
+                    )
+                except Exception as e:
+                    trading_logger.log_error(
+                        "Exception during SDK modify_order call",
+                        e,
+                        {
+                            "exchange": exchange,
+                            "tradingsymbol": trading_symbol,
+                            "orderno": broker_order_id,
+                            "newquantity": new_quantity,
+                            "newprice_type": newprice_type,
+                            "newprice": new_price,
+                            "broker_order_id": broker_order_id,
+                            "long_symbol": order.long_symbol,
+                        },
+                    )
+                    out = None
                 if out is None:
                     trading_logger.log_error(
                         "Error modifying order - API returned None",
