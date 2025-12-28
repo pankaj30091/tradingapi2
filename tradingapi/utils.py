@@ -548,9 +548,9 @@ def get_pnl_table(
         try:
             out = pd.DataFrame(trades)
             if len(out) > 0:
-                out.loc[
+                out = out.loc[
                     ((out.entry_time >= start_time) | (out.entry_time == ""))
-                    & ((out.exit_time <= end_time) | (out.exit_time == 0)),
+                    & ((out.exit_time <= end_time) | (out.exit_time == 0)|(out.entry_time == "")),
                 ]
                 # pnl = (out.exit_price + out.entry_price) * out.exit_quantity
                 # pnl = np.where(out["side"] == "BUY", pnl, -pnl)
@@ -3138,3 +3138,110 @@ def calc_pnl(trades: pd.DataFrame, brok: Optional[BrokerBase] = None):
     )
     trades["pnl"] = trades["gross_pnl"] - trades["commission"]
     return trades
+
+
+@log_execution_time
+@validate_inputs(
+    strategy_name=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    capital_allocated=lambda x: isinstance(x, (int, float)) and x >= 0,
+)
+def register_strategy_capital(
+    strategy_name: str,
+    broker: BrokerBase,
+    capital_allocated: float,
+    redis_host: str = "localhost",
+    redis_port: int = 6379,
+    date: Optional[str] = None,
+) -> bool:
+    """
+    Register strategy capital allocation and broker capital availability in Redis DB 0.
+    
+    Updates the consolidated JSON key: capital:registration:{YYYYMMDD}
+    
+    Args:
+        strategy_name: Strategy/algorithm name
+        broker: BrokerBase instance (used to get broker name and available capital)
+        capital_allocated: Capital allocated to this strategy
+        redis_host: Redis host (default: localhost)
+        redis_port: Redis port (default: 6379)
+        date: Date in YYYYMMDD format (defaults to today)
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Determine date
+        if date is None:
+            date = dt.datetime.now().strftime("%Y%m%d")
+        
+        # Get broker name
+        if hasattr(broker, 'broker') and broker.broker:
+            try:
+                broker_name = broker.broker.name
+            except AttributeError:
+                broker_name = "UNKNOWN"
+        else:
+            broker_name = "UNKNOWN"
+        
+        # Get broker available capital
+        try:
+            capital_available = broker.get_available_capital()
+        except Exception as e:
+            logger.warning(f"Failed to get available capital from broker {broker_name}: {e}")
+            capital_available = 0.0
+        
+        # Connect to Redis DB 0
+        redis_conn = redis.StrictRedis(host=redis_host, db=0, port=redis_port, decode_responses=True)
+        
+        # Get or create registration data
+        registration_key = f"capital:registration:{date}"
+        existing_data_str = redis_conn.get(registration_key)
+        
+        if existing_data_str:
+            try:
+                registration_data = json.loads(existing_data_str)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse existing registration data for {date}, creating new")
+                registration_data = {
+                    "date": date,
+                    "brokers": {},
+                    "strategies": {},
+                    "last_updated": dt.datetime.now().isoformat(),
+                }
+        else:
+            registration_data = {
+                "date": date,
+                "brokers": {},
+                "strategies": {},
+                "last_updated": dt.datetime.now().isoformat(),
+            }
+        
+        # Update broker capital
+        current_time = dt.datetime.now().isoformat()
+        registration_data["brokers"][broker_name] = {
+            "capital_available": capital_available,
+            "timestamp": current_time,
+        }
+        
+        # Update strategy registration
+        registration_data["strategies"][strategy_name] = {
+            "broker": broker_name,
+            "capital_allocated": capital_allocated,
+            "timestamp": current_time,
+        }
+        
+        # Update last_updated timestamp
+        registration_data["last_updated"] = current_time
+        
+        # Save back to Redis
+        redis_conn.set(registration_key, json.dumps(registration_data))
+        
+        logger.info(
+            f"Registered strategy capital: {strategy_name} with broker {broker_name}, "
+            f"allocated={capital_allocated}, broker_capital={capital_available}"
+        )
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to register strategy capital: {e}", exc_info=True)
+        return False

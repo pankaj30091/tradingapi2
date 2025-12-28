@@ -671,4 +671,10 @@ class IciciDirect(BrokerBase):
         """
         raise NotImplementedError("IciciDirect.get_min_lot_size is not implemented yet")
 
+    def get_available_capital(self) -> float:
+        """
+        TODO: Implement using IciciDirect balance/margin API.
+        """
+        raise NotImplementedError("IciciDirect.get_available_capital is not implemented yet")
+
 

@@ -731,6 +731,69 @@ class FivePaisa(BrokerBase):
             trading_logger.log_error("Connection check failed", e, context)
             return False
 
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    @log_execution_time
+    def get_available_capital(self) -> float:
+        """
+        Get available capital/balance for trading (cash + collateral).
+
+        Returns:
+            float: Available capital amount (Ledgerbalance + FundsPayln + Collateral)
+
+        Raises:
+            BrokerConnectionError: If broker is not connected
+            MarketDataError: If balance retrieval fails
+        """
+        try:
+            if not self.is_connected():
+                raise BrokerConnectionError("FivePaisa broker is not connected")
+
+            margin_data = self.api.margin()
+            if not margin_data or len(margin_data) == 0:
+                raise MarketDataError("No margin data available")
+
+            ledger_balance = float(margin_data[0]["Ledgerbalance"])
+            funds_payln = float(margin_data[0]["FundsPayln"])
+            cash = ledger_balance + funds_payln
+            
+            # Get collateral value (FivePaisa has both MF and regular collateral)
+            collateral = 0.0
+            try:
+                mf_collateral = float(margin_data[0].get("MFCollateralValueAfterHaircut", 0))
+                regular_collateral = float(margin_data[0].get("CollateralValueAfterHairCut", 0))
+                collateral = mf_collateral + regular_collateral
+            except (ValueError, TypeError, KeyError):
+                # If specific fields not found, try alternative field names
+                collateral_fields = ["Collateral", "collateral", "CollateralValue", "collateral_value"]
+                for field in collateral_fields:
+                    if field in margin_data[0]:
+                        try:
+                            collateral = float(margin_data[0][field])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+            
+            total_capital = cash + collateral
+
+            trading_logger.log_debug(
+                "Available capital retrieved",
+                {
+                    "ledger_balance": ledger_balance,
+                    "funds_payln": funds_payln,
+                    "cash": cash,
+                    "collateral": collateral,
+                    "total_capital": total_capital,
+                },
+            )
+            return total_capital
+
+        except (BrokerConnectionError, MarketDataError):
+            raise
+        except Exception as e:
+            context = create_error_context(error=str(e))
+            trading_logger.log_error("Error getting available capital", e, context)
+            raise MarketDataError(f"Failed to get available capital: {str(e)}", context)
+
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def disconnect(self):
@@ -2126,6 +2189,7 @@ class FivePaisa(BrokerBase):
         periodicity: str = "1m",
         market_open_time: str = "09:15:00",
         market_close_time: str = "15:30:00",
+        refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
         Retrieves historical bars from FivePaisa with enhanced error handling.
@@ -2138,6 +2202,8 @@ class FivePaisa(BrokerBase):
             exchange: Exchange name. Defaults to "N".
             periodicity: Defaults to '1m'.
             market_close_time: Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            refresh_mapping: If True, load symbol mapping from date_end's symbols CSV file instead of using cached mapping.
+                Defaults to False.
 
         Returns:
             Dict[str, List[HistoricalData]]: Dictionary with historical data for each symbol.
@@ -2156,15 +2222,75 @@ class FivePaisa(BrokerBase):
                     "date_end": date_end,
                     "exchange": exchange,
                     "periodicity": periodicity,
+                    "refresh_mapping": refresh_mapping,
                 },
             )
+
+            # Load symbol mapping from file if refresh_mapping is True
+            refresh_symbol_map = None
+            refresh_exchangetype_map = None
+            if refresh_mapping:
+                try:
+                    # Parse date_end to get YYYYMMDD format
+                    date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
+                    date_end_obj = dt.datetime.strptime(date_end_str, "%Y-%m-%d")
+                    date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
+                    
+                    # Get symbol codes path from config
+                    symbol_codes_path = config.get("FIVEPAISA.SYMBOLCODES")
+                    if not symbol_codes_path:
+                        context = create_error_context(broker_name=self.broker.name)
+                        raise ConfigurationError("FIVEPAISA.SYMBOLCODES path not found in config", context)
+                    
+                    # Construct path to symbols file
+                    symbols_file_path = os.path.join(symbol_codes_path, f"{date_end_yyyymmdd}_symbols.csv")
+                    
+                    trading_logger.log_debug(
+                        "Loading symbol mapping from file",
+                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd}
+                    )
+                    
+                    if not os.path.exists(symbols_file_path):
+                        trading_logger.log_warning(
+                            "Symbols file not found for refresh_mapping",
+                            {"symbols_file_path": symbols_file_path}
+                        )
+                        # Fall back to default mapping
+                        refresh_symbol_map = None
+                    else:
+                        # Load the CSV file
+                        codes = pd.read_csv(symbols_file_path)
+                        
+                        # Create symbol_map and exchangetype_map for each exchange
+                        refresh_symbol_map = {}
+                        refresh_exchangetype_map = {}
+                        for exch, group in codes.groupby("Exch"):
+                            refresh_symbol_map[exch] = dict(zip(group["long_symbol"], group["Scripcode"]))
+                            refresh_exchangetype_map[exch] = dict(zip(group["long_symbol"], group["ExchType"]))
+                        
+                        trading_logger.log_debug(
+                            "Symbol mapping loaded from file",
+                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)}
+                        )
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Error loading symbol mapping from file, falling back to default",
+                        {"error": str(e)},
+                        exc_info=True
+                    )
+                    refresh_symbol_map = None
+                    refresh_exchangetype_map = None
 
             scripCode = None
             # Determine the format of symbols and create a DataFrame
             try:
                 if isinstance(symbols, str):
                     exchange = self.map_exchange_for_api(symbols, exchange)
-                    scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
+                    # Use refresh_symbol_map if available, otherwise use default mapping
+                    if refresh_symbol_map and exchange in refresh_symbol_map:
+                        scripCode = refresh_symbol_map[exchange].get(symbols)
+                    else:
+                        scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
                     if scripCode:
                         symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
                     else:
@@ -2200,7 +2326,11 @@ class FivePaisa(BrokerBase):
                     exch_type = (
                         symbols.get("exch_type")
                         if isinstance(symbols, dict)
-                        else self.exchange_mappings[exchange]["exchangetype_map"].get(row_outer["long_symbol"])
+                        else (
+                            refresh_exchangetype_map[exchange].get(row_outer["long_symbol"])
+                            if refresh_exchangetype_map and exchange in refresh_exchangetype_map
+                            else self.exchange_mappings[exchange]["exchangetype_map"].get(row_outer["long_symbol"])
+                        )
                     )
 
                     s = row_outer["long_symbol"].replace("/", "-")

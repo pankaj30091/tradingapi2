@@ -36,6 +36,7 @@ from .exceptions import (
     SymbolError,
     RedisError,
     ValidationError,
+    ConfigurationError,
     create_error_context,
 )
 from . import trading_logger
@@ -692,19 +693,67 @@ class Shoonya(BrokerBase):
 
             trading_logger.log_info(
                 "Connection check successful",
-                {
-                    "broker_type": self.broker.name,
-                    "cash": cash_float,
-                    "quote_last": quote.last if quote else None,
-                },
+                {"broker": self.broker.name, "cash": cash_float},
             )
-
             return True
 
         except Exception as e:
-            context = create_error_context(broker_type=self.broker.name, error=str(e))
-            trading_logger.log_error("Connection check failed", e, context)
+            trading_logger.log_error("Connection check failed", e, {"broker": self.broker.name})
             return False
+
+    @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
+    @log_execution_time
+    def get_available_capital(self) -> float:
+        """
+        Get available capital/balance for trading (cash + collateral).
+
+        Returns:
+            float: Available capital amount (cash + collateral from limits)
+
+        Raises:
+            BrokerConnectionError: If broker is not connected
+            MarketDataError: If balance retrieval fails
+        """
+        try:
+            if not self.is_connected():
+                raise BrokerConnectionError("Shoonya broker is not connected")
+
+            limits = self.api.get_limits()
+            if not limits:
+                raise MarketDataError("No limits data available")
+
+            cash = limits.get("cash")
+            if cash is None:
+                raise MarketDataError("No cash information in limits")
+
+            cash_float = float(cash)
+            
+            # Try to get collateral value (field name may vary)
+            collateral = 0.0
+            collateral_fields = ["collateral", "Collateral", "collateralvalue", "CollateralValue",
+                               "holdingvalue", "HoldingValue", "securityvalue", "SecurityValue"]
+            for field in collateral_fields:
+                if field in limits:
+                    try:
+                        collateral = float(limits[field])
+                        break
+                    except (ValueError, TypeError):
+                        continue
+            
+            total_capital = cash_float + collateral
+
+            trading_logger.log_debug(
+                "Available capital retrieved",
+                {"cash": cash_float, "collateral": collateral, "total_capital": total_capital, "broker": self.broker.name},
+            )
+            return total_capital
+
+        except (BrokerConnectionError, MarketDataError):
+            raise
+        except Exception as e:
+            context = create_error_context(error=str(e), broker=self.broker.name)
+            trading_logger.log_error("Error getting available capital", e, context)
+            raise MarketDataError(f"Failed to get available capital: {str(e)}", context)
 
     def disconnect(self):
         """
@@ -1275,6 +1324,7 @@ class Shoonya(BrokerBase):
         periodicity="1m",
         market_open_time="09:15:00",
         market_close_time="15:30:00",
+        refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
         Retrieves historical bars from 5paisa.
@@ -1286,6 +1336,8 @@ class Shoonya(BrokerBase):
             date_end (str): Date formatted as YYYY-MM-DD.
             periodicity (str): Defaults to '1m'.
             market_close_time (str): Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            refresh_mapping: If True, load symbol mapping from date_end's symbols CSV file instead of using cached mapping.
+                Defaults to False.
 
         Returns:
             Dict[str, List[HistoricalData]]: Dictionary with historical data for each symbol.
@@ -1299,6 +1351,7 @@ class Shoonya(BrokerBase):
                     "date_end": date_end,
                     "exchange": exchange,
                     "periodicity": periodicity,
+                    "refresh_mapping": refresh_mapping,
                 },
             )
             timezone = pytz.timezone("Asia/Kolkata")
@@ -1309,11 +1362,70 @@ class Shoonya(BrokerBase):
                 # Convert to integer if match is found, else return None
                 return int(match.group()) if match else 1  # default return 1 if no number found
 
+            # Load symbol mapping from file if refresh_mapping is True
+            refresh_symbol_map = None
+            refresh_exchangetype_map = None
+            if refresh_mapping:
+                try:
+                    # Parse date_end to get YYYYMMDD format
+                    date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
+                    date_end_obj = dt.datetime.strptime(date_end_str, "%Y-%m-%d")
+                    date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
+                    
+                    # Get symbol codes path from config
+                    symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
+                    if not symbol_codes_path:
+                        context = create_error_context(broker_name=self.broker.name)
+                        raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.broker.name}", context)
+                    
+                    # Construct path to symbols file
+                    symbols_file_path = os.path.join(symbol_codes_path, f"{date_end_yyyymmdd}_symbols.csv")
+                    
+                    trading_logger.log_debug(
+                        "Loading symbol mapping from file",
+                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd}
+                    )
+                    
+                    if not os.path.exists(symbols_file_path):
+                        trading_logger.log_warning(
+                            "Symbols file not found for refresh_mapping",
+                            {"symbols_file_path": symbols_file_path}
+                        )
+                        # Fall back to default mapping
+                        refresh_symbol_map = None
+                    else:
+                        # Load the CSV file
+                        codes = pd.read_csv(symbols_file_path)
+                        
+                        # Create symbol_map and exchangetype_map for each exchange
+                        refresh_symbol_map = {}
+                        refresh_exchangetype_map = {}
+                        for exch, group in codes.groupby("Exch"):
+                            refresh_symbol_map[exch] = dict(zip(group["long_symbol"], group["Scripcode"]))
+                            refresh_exchangetype_map[exch] = dict(zip(group["long_symbol"], group["ExchType"]))
+                        
+                        trading_logger.log_debug(
+                            "Symbol mapping loaded from file",
+                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)}
+                        )
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Error loading symbol mapping from file, falling back to default",
+                        {"error": str(e)},
+                        exc_info=True
+                    )
+                    refresh_symbol_map = None
+                    refresh_exchangetype_map = None
+
             scripCode = None
             # Determine the format of symbols and create a DataFrame
             if isinstance(symbols, str):
                 exchange = self.map_exchange_for_api(symbols, exchange)
-                scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
+                # Use refresh_symbol_map if available, otherwise use default mapping
+                if refresh_symbol_map and exchange in refresh_symbol_map:
+                    scripCode = refresh_symbol_map[exchange].get(symbols)
+                else:
+                    scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
                 if scripCode:
                     symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
                 else:

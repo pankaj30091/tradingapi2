@@ -1008,3 +1008,17 @@ class BrokerBase(ABC):
             SymbolError: If symbol lookup fails
         """
         pass
+
+    @abstractmethod
+    def get_available_capital(self) -> float:
+        """
+        Get available capital/balance for trading.
+
+        Returns:
+            float: Available capital amount
+
+        Raises:
+            BrokerConnectionError: If broker is not connected
+            MarketDataError: If balance retrieval fails
+        """
+        pass
