@@ -3236,6 +3236,26 @@ def register_strategy_capital(
         # Save back to Redis
         redis_conn.set(registration_key, json.dumps(registration_data))
         
+        # Also register broker in strategy:broker_universe set
+        try:
+            # Get Redis DB number from broker's redis_o connection
+            redis_db = 0  # Default
+            if hasattr(broker, 'redis_o') and broker.redis_o:
+                # Try to get DB number from connection pool
+                if hasattr(broker.redis_o, 'connection_pool'):
+                    pool = broker.redis_o.connection_pool
+                    if hasattr(pool, 'connection_kwargs') and 'db' in pool.connection_kwargs:
+                        redis_db = pool.connection_kwargs['db']
+            
+            # Add broker:DB entry to strategy:broker_universe set
+            broker_universe_key = "strategy:broker_universe"
+            broker_entry = f"{broker_name}:{redis_db}"
+            redis_conn.sadd(broker_universe_key, broker_entry)
+            logger.debug(f"Added broker to strategy:broker_universe: {broker_entry}")
+        except Exception as e:
+            # Non-critical error, log but don't fail the registration
+            logger.warning(f"Failed to register broker in strategy:broker_universe: {e}")
+        
         logger.info(
             f"Registered strategy capital: {strategy_name} with broker {broker_name}, "
             f"allocated={capital_allocated}, broker_capital={capital_available}"
