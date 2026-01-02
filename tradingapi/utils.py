@@ -44,7 +44,7 @@ from . import trading_logger
 from .globals import get_tradingapi_now
 
 logger = logging.getLogger(__name__)
-r = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+r = redis.Redis(db=1, charset="utf-8", decode_responses=True)
 
 
 # Enhanced exception handler with structured logging
@@ -57,7 +57,7 @@ def my_handler(typ, value, trace):
 
 sys.excepthook = my_handler
 config = get_config()
-mds_history = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+mds_history = redis.Redis(db=1, charset="utf-8", decode_responses=True)
 pubsub = mds_history.pubsub()
 
 empty_trades = {
