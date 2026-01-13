@@ -322,8 +322,35 @@ def get_pnl_table(
         trades = []
 
         # Get all internal order IDs for the strategy
-        for int_order_id in broker.redis_o.scan_iter(strategy + "_" + "*"):
-            int_order_ids.append(int_order_id)
+        # Use scan_iter with match pattern to find all order IDs
+        # Note: scan_iter should return fresh results, but if there are issues with stale cursors,
+        # we can force a fresh scan by using scan() with cursor 0
+        pattern = strategy + "_" + "*"
+        
+        # Force a fresh scan by using scan() with cursor 0 to avoid any potential cursor state issues
+        # This ensures we always get the latest keys, even if the connection was created earlier
+        cursor = 0
+        scan_count = 0
+        while True:
+            cursor, keys = broker.redis_o.scan(cursor, match=pattern, count=1000)
+            int_order_ids.extend(keys)
+            scan_count += len(keys)
+            if cursor == 0:
+                break
+        
+        # Log what we found for debugging
+        if len(int_order_ids) > 0:
+            int_order_ids.sort()
+            trading_logger.log_debug(
+                f"Found {len(int_order_ids)} order IDs for strategy {strategy}",
+                {
+                    "strategy": strategy,
+                    "count": len(int_order_ids),
+                    "first": int_order_ids[0] if int_order_ids else None,
+                    "last": int_order_ids[-1] if int_order_ids else None,
+                    "sample": int_order_ids[-5:] if len(int_order_ids) >= 5 else int_order_ids,
+                }
+            )
 
         if not int_order_ids:
             trading_logger.log_info(
@@ -366,6 +393,9 @@ def get_pnl_table(
                         order_1 = Order(**broker.redis_o.hgetall(entry_keys[0]))
                         side = order_1.order_type if "?" not in symbol else "BUY"
                         entry_time, _ = valid_datetime(order_1.remote_order_id[:-2], "%Y-%m-%d %H:%M:%S")
+                        # Handle case where valid_datetime returns False (parsing failed)
+                        if entry_time is False or entry_time is None:
+                            entry_time = ""
                         for ek in entry_keys:
                             additional_info_entry = _merge_additional_info(
                                 additional_info_entry, hget_with_default(broker, ek, "additional_info", "")
@@ -383,6 +413,10 @@ def get_pnl_table(
                     try:
                         order_1 = Order(**broker.redis_o.hgetall(exit_keys[-1]))
                         exit_time, _ = valid_datetime(order_1.remote_order_id[:-2], "%Y-%m-%d %H:%M:%S")
+                        # Handle case where valid_datetime returns False (parsing failed)
+                        # This can happen when exit order status is UNDEFINED and remote_order_id is malformed
+                        if exit_time is False or exit_time is None:
+                            exit_time = ""
                         for ek in exit_keys:
                             additional_info_exit = _merge_additional_info(
                                 additional_info_exit, hget_with_default(broker, ek, "additional_info", "")
@@ -452,23 +486,32 @@ def get_pnl_table(
                         )
 
                 # Calculate exit position
-                try:
-                    exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
-                    base_position = parse_combo_symbol(symbol)
-                    position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
-                    exit_quantity = position_combo_info.get("total_in_progress", 0)
-                    exit_price = (
-                        sum(position.value for position in exit_position.values()) / exit_quantity
-                        if exit_quantity != 0
-                        else 0
-                    )
-                except Exception as e:
-                    trading_logger.log_error(
-                        f"Error calculating exit position for {int_order_id}",
-                        e,
-                        {"int_order_id": int_order_id, "symbol": symbol},
-                    )
-                    continue
+                # Only calculate if exit_keys exist - if empty, set defaults and continue (don't skip trade)
+                if len(exit_keys) > 0:
+                    try:
+                        exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
+                        base_position = parse_combo_symbol(symbol)
+                        position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
+                        exit_quantity = position_combo_info.get("total_in_progress", 0)
+                        exit_price = (
+                            sum(position.value for position in exit_position.values()) / exit_quantity
+                            if exit_quantity != 0
+                            else 0
+                        )
+                    except Exception as e:
+                        trading_logger.log_error(
+                            f"Error calculating exit position for {int_order_id}",
+                            e,
+                            {"int_order_id": int_order_id, "symbol": symbol, "exit_keys": exit_keys},
+                        )
+                        # Don't skip trade - set defaults instead so trade is still included in results
+                        # This is important when exit_keys are being written but order data isn't ready yet
+                        exit_quantity = 0
+                        exit_price = 0.0
+                else:
+                    # exit_keys empty - set defaults, don't skip trade
+                    exit_quantity = 0
+                    exit_price = 0.0
 
                 # Validate quantity consistency
                 if abs(exit_quantity) > abs(entry_quantity):
@@ -1650,7 +1693,13 @@ def update_order_status(
     else:
         if fills.status == OrderStatus.HISTORICAL:
             return fills
-        elif fills.fill_price == 0:
+        # Check if fill_price is 0 or non-numeric
+        try:
+            fill_price_numeric = float(fills.fill_price)
+            is_invalid_price = fill_price_numeric == 0
+        except (ValueError, TypeError):
+            is_invalid_price = True
+        if is_invalid_price:
             broker.redis_o.hset(broker_order_id, "price", str(fills.order_price))
             broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
         else:
