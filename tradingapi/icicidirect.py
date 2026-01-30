@@ -313,7 +313,7 @@ class IciciDirect(BrokerBase):
             self.api: BreezeConnect | None = None
             self.codes = pd.DataFrame()
             self.starting_order_ids_int: Dict[str, int] = {}
-            self.redis_o = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+            self.redis_o = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
 
             trading_logger.log_info(
                 "IciciDirect broker initialized",
@@ -355,7 +355,7 @@ class IciciDirect(BrokerBase):
             self.api = BreezeConnect(api_key=api_key)
             self.api.generate_session(api_secret=api_secret, session_token=session_token)
 
-            self.redis_o = redis.Redis(db=redis_db, charset="utf-8", decode_responses=True)
+            self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
             self.starting_order_ids_int = set_starting_internal_ids_int(self.redis_o)
 
             trading_logger.log_info(

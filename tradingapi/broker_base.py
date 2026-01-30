@@ -704,7 +704,7 @@ class BrokerBase(ABC):
         """Initialize broker-specific components."""
         self.broker = Brokers.UNDEFINED
         self.starting_order_ids_int = {}
-        self.redis_o = redis.Redis(db=0, charset="utf-8", decode_responses=True)
+        self.redis_o = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
         self.exchange_mappings = {
             "symbol_map": {},
             "contractsize_map": {},

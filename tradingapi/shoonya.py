@@ -614,7 +614,7 @@ class Shoonya(BrokerBase):
 
             # Initialize Redis connection with error handling
             try:
-                self.redis_o = redis.Redis(db=redis_db, charset="utf-8", decode_responses=True)
+                self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
                 # Test Redis connection
                 self.redis_o.ping()
                 trading_logger.log_info(
