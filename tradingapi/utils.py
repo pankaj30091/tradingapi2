@@ -44,7 +44,7 @@ from . import trading_logger
 from .globals import get_tradingapi_now
 
 logger = logging.getLogger(__name__)
-r = redis.Redis(db=1, charset="utf-8", decode_responses=True)
+r = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 
 
 # Enhanced exception handler with structured logging
@@ -57,7 +57,7 @@ def my_handler(typ, value, trace):
 
 sys.excepthook = my_handler
 config = get_config()
-mds_history = redis.Redis(db=1, charset="utf-8", decode_responses=True)
+mds_history = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 pubsub = mds_history.pubsub()
 
 empty_trades = {
@@ -108,8 +108,14 @@ def get_all_strategy_names(redis_db) -> set:
     """
     out = set()
     if redis_db is not None:
-        for key in redis_db.scan_iter("[A-Z]*_[0-9]*"):
-            out.add(key.split("_")[0])
+        # Use scan() with cursor 0 instead of scan_iter() to avoid cursor state issues
+        cursor = 0
+        while True:
+            cursor, keys = redis_db.scan(cursor, match="[A-Z]*_[0-9]*", count=1000)
+            for key in keys:
+                out.add(key.split("_")[0])
+            if cursor == 0:
+                break
     return out
 
 
@@ -118,9 +124,16 @@ def set_starting_internal_ids_int(redis_db) -> dict:
     out: dict[str, int] = {}
     strategies = get_all_strategy_names(redis_db)
     for s in strategies:
-        for key in redis_db.scan_iter(s + "_" + "*"):
-            if out.get(s, 1) <= int(key.split("_")[1]):
-                out[s] = int(key.split("_")[1]) + 1
+        # Use scan() with cursor 0 instead of scan_iter() to avoid cursor state issues
+        pattern = s + "_" + "*"
+        cursor = 0
+        while True:
+            cursor, keys = redis_db.scan(cursor, match=pattern, count=1000)
+            for key in keys:
+                if out.get(s, 1) <= int(key.split("_")[1]):
+                    out[s] = int(key.split("_")[1]) + 1
+            if cursor == 0:
+                break
     logger.debug(f"Starting internal ids : {out} ")
     return out
 
@@ -286,14 +299,14 @@ def needs_refresh_status_from_redis(broker: BrokerBase, pnl_df: pd.DataFrame) ->
 @validate_inputs(
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     start_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    end_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    end_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
 def get_pnl_table(
     broker: BrokerBase,
     strategy: str,
     start_time: str = "1970-01-01 00:00:00",
-    end_time: str = get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S"),
+    end_time: str = None,
     refresh_status=False,
     market_close_time="15:30:00",
     eod=False,
@@ -304,7 +317,7 @@ def get_pnl_table(
         broker (BrokerBase): broker instance
         strategy (str): strategy name
         start_time (str, optional): Start Date for strategy pnl. Defaults to "1970-01-01 00:00:00".
-        end_time (str, optional): End Date for strategy pnl. Defaults to dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        end_time (str, optional): End Date for strategy pnl. Defaults to current time when function is called.
         refresh_status (bool, optional): Whether to refresh order status. Defaults to False.
         market_close_time (str, optional): closing time for option expiry, defaults to "15:30:00"
         eod (bool, optional): Whether this is end-of-day processing. Defaults to False.
@@ -317,6 +330,10 @@ def get_pnl_table(
         RedisError: If there are issues with Redis operations
         PnLError: If there are issues with P&L calculations
     """
+    # Set default end_time inside the function body (evaluated at call time, not import time)
+    if end_time is None:
+        end_time = get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
+    
     try:
         int_order_ids = []
         trades = []
@@ -340,7 +357,19 @@ def get_pnl_table(
         
         # Log what we found for debugging
         if len(int_order_ids) > 0:
-            int_order_ids.sort()
+            # Sort numerically by extracting the number after the underscore
+            def extract_order_number(order_id):
+                try:
+                    # Extract number after last underscore (e.g., "SCALPING01_1949" -> 1949)
+                    parts = order_id.rsplit("_", 1)
+                    if len(parts) == 2:
+                        return int(parts[1])
+                    return 0
+                except (ValueError, IndexError):
+                    return 0
+            
+            int_order_ids.sort(key=extract_order_number)
+            last_5 = int_order_ids[-5:] if len(int_order_ids) >= 5 else int_order_ids
             trading_logger.log_debug(
                 f"Found {len(int_order_ids)} order IDs for strategy {strategy}",
                 {
@@ -348,7 +377,7 @@ def get_pnl_table(
                     "count": len(int_order_ids),
                     "first": int_order_ids[0] if int_order_ids else None,
                     "last": int_order_ids[-1] if int_order_ids else None,
-                    "sample": int_order_ids[-5:] if len(int_order_ids) >= 5 else int_order_ids,
+                    "last_5": last_5,
                 }
             )
 
@@ -359,7 +388,18 @@ def get_pnl_table(
             )
             return empty_trades
 
-        int_order_ids.sort()
+        # Sort numerically by extracting the number after the underscore
+        def extract_order_number(order_id):
+            try:
+                # Extract number after last underscore (e.g., "SCALPING01_1949" -> 1949)
+                parts = order_id.rsplit("_", 1)
+                if len(parts) == 2:
+                    return int(parts[1])
+                return 0
+            except (ValueError, IndexError):
+                return 0
+        
+        int_order_ids.sort(key=extract_order_number)
 
         for int_order_id in int_order_ids:
             try:
@@ -378,6 +418,17 @@ def get_pnl_table(
                 exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
                 additional_info_entry = ""
                 additional_info_exit = ""
+                
+                # Debug: Log entry_keys and exit_keys for trades with exit_keys (exits placed)
+                if len(exit_keys) > 0:
+                    trading_logger.log_debug("Trade with exit_keys processing in get_pnl_table", {
+                        "int_order_id": int_order_id,
+                        "symbol": symbol,
+                        "entry_keys": entry_keys,
+                        "exit_keys": exit_keys,
+                        "entry_keys_count": len(entry_keys),
+                        "exit_keys_count": len(exit_keys),
+                    })
 
                 if len(entry_keys) == 0:
                     trading_logger.log_error(
@@ -440,16 +491,30 @@ def get_pnl_table(
 
                 # Refresh status if requested
                 if refresh_status:
+                    # Debug: Log refresh for trades with exit_keys
+                    if len(exit_keys) > 0:
+                        trading_logger.log_debug("Refreshing entry status for trade with exit_keys", {
+                            "int_order_id": int_order_id,
+                            "symbol": symbol,
+                            "entry_keys": entry_keys,
+                            "exit_keys": exit_keys,
+                        })
                     try:
                         for entry_key in entry_keys:
                             order = Order(**broker.redis_o.hgetall(entry_key))
                             broker_order_id = order.broker_order_id
+                            if len(exit_keys) > 0:
+                                trading_logger.log_debug("Calling update_order_status for entry", {
+                                    "int_order_id": int_order_id,
+                                    "entry_key": entry_key,
+                                    "broker_order_id": broker_order_id,
+                                })
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:
                         trading_logger.log_error(
                             f"Error refreshing entry status for {int_order_id}",
                             e,
-                            {"int_order_id": int_order_id, "entry_keys": entry_keys},
+                            {"int_order_id": int_order_id, "entry_keys": entry_keys, "exit_keys": exit_keys},
                         )
 
                 # Calculate entry position
@@ -473,11 +538,51 @@ def get_pnl_table(
 
                 # Refresh exit status if requested
                 if refresh_status:
+                    # Debug: Log refresh for trades with exit_keys
+                    if len(exit_keys) > 0:
+                        trading_logger.log_debug("Refreshing exit status for trade with exit_keys", {
+                            "int_order_id": int_order_id,
+                            "symbol": symbol,
+                            "entry_keys": entry_keys,
+                            "exit_keys": exit_keys,
+                        })
                     try:
                         for exit_key in exit_keys:
-                            order = Order(**broker.redis_o.hgetall(exit_key))
+                            # Get order data before refresh to see what we're working with
+                            exit_order_data_before = broker.redis_o.hgetall(exit_key)
+                            if len(exit_keys) > 0:
+                                trading_logger.log_debug("Exit order data before refresh", {
+                                    "int_order_id": int_order_id,
+                                    "exit_key": exit_key,
+                                    "exit_order_data": dict(exit_order_data_before) if exit_order_data_before else {},
+                                })
+                            
+                            order = Order(**exit_order_data_before) if exit_order_data_before else None
+                            if order is None:
+                                trading_logger.log_warning("Exit order not found in Redis before refresh", {
+                                    "int_order_id": int_order_id,
+                                    "exit_key": exit_key,
+                                })
+                                continue
+                            
                             broker_order_id = order.broker_order_id
+                            if len(exit_keys) > 0:
+                                trading_logger.log_debug("Calling update_order_status for exit", {
+                                    "int_order_id": int_order_id,
+                                    "exit_key": exit_key,
+                                    "broker_order_id": broker_order_id,
+                                })
+                            
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
+                            
+                            # Get order data after refresh to see if anything changed
+                            exit_order_data_after = broker.redis_o.hgetall(exit_key)
+                            if len(exit_keys) > 0:
+                                trading_logger.log_debug("Exit order data after refresh", {
+                                    "int_order_id": int_order_id,
+                                    "exit_key": exit_key,
+                                    "exit_order_data": dict(exit_order_data_after) if exit_order_data_after else {},
+                                })
                     except Exception as e:
                         trading_logger.log_error(
                             f"Error refreshing exit status for {int_order_id}",
@@ -578,6 +683,19 @@ def get_pnl_table(
                     "additional_info": additional_info,
                 }
                 trades.append(row)
+                
+                # Debug: Log when trades with exit_keys are added to trades list
+                if len(exit_keys) > 0:
+                    trading_logger.log_debug("Trade with exit_keys added to trades list", {
+                        "int_order_id": int_order_id,
+                        "symbol": symbol,
+                        "entry_time": str(entry_time),
+                        "exit_time": str(exit_time),
+                        "entry_time_type": type(entry_time).__name__,
+                        "exit_time_type": type(exit_time).__name__,
+                        "entry_quantity": entry_quantity,
+                        "exit_quantity": exit_quantity,
+                    })
 
             except Exception as e:
                 trading_logger.log_error(
@@ -591,10 +709,63 @@ def get_pnl_table(
         try:
             out = pd.DataFrame(trades)
             if len(out) > 0:
+                # Debug: Log trades with exit_keys before filtering
+                if "int_order_id" in out.columns and "exit_keys" in out.columns:
+                    trades_with_exits = out[out["exit_keys"].astype(str).str.strip() != ""]
+                    if len(trades_with_exits) > 0:
+                        for idx, row in trades_with_exits.iterrows():
+                            trading_logger.log_debug("Trade with exit_keys in DataFrame before filter", {
+                                "int_order_id": row.get("int_order_id", ""),
+                                "symbol": row.get("symbol", ""),
+                                "entry_time": str(row.get("entry_time", "")),
+                                "exit_time": str(row.get("exit_time", "")),
+                                "entry_time_type": str(type(row.get("entry_time", ""))),
+                                "exit_time_type": str(type(row.get("exit_time", ""))),
+                                "start_time": start_time,
+                                "end_time": end_time,
+                            })
+                
                 out = out.loc[
                     ((out.entry_time >= start_time) | (out.entry_time == ""))
                     & ((out.exit_time <= end_time) | (out.exit_time == 0)|(out.entry_time == "")),
                 ]
+                
+                # Debug: Log trades with exit_keys that were filtered out
+                if "int_order_id" in out.columns and "exit_keys" in out.columns:
+                    trades_before = pd.DataFrame(trades)
+                    if "int_order_id" in trades_before.columns and "exit_keys" in trades_before.columns:
+                        trades_with_exits_before = trades_before[trades_before["exit_keys"].astype(str).str.strip() != ""]
+                        trades_with_exits_after = out[out["exit_keys"].astype(str).str.strip() != ""]
+                        
+                        # Find trades that were filtered out
+                        if len(trades_with_exits_before) > 0:
+                            before_ids = set(trades_with_exits_before["int_order_id"].values)
+                            after_ids = set(trades_with_exits_after["int_order_id"].values) if len(trades_with_exits_after) > 0 else set()
+                            filtered_out_ids = before_ids - after_ids
+                            
+                            for filtered_id in filtered_out_ids:
+                                row_filtered = trades_with_exits_before[trades_with_exits_before["int_order_id"] == filtered_id].iloc[0]
+                                entry_time_val = row_filtered.get("entry_time", "")
+                                exit_time_val = row_filtered.get("exit_time", "")
+                                
+                                # Check each condition
+                                entry_time_ok = (str(entry_time_val) >= start_time) or (str(entry_time_val) == "")
+                                exit_time_ok = (str(exit_time_val) <= end_time) or (str(exit_time_val) == "0") or (str(entry_time_val) == "")
+                                
+                                trading_logger.log_warning("Trade with exit_keys was filtered out by DataFrame filter", {
+                                    "int_order_id": filtered_id,
+                                    "symbol": row_filtered.get("symbol", ""),
+                                    "start_time": start_time,
+                                    "end_time": end_time,
+                                    "entry_time": str(entry_time_val),
+                                    "exit_time": str(exit_time_val),
+                                    "entry_time_type": str(type(entry_time_val)),
+                                    "exit_time_type": str(type(exit_time_val)),
+                                    "entry_time_ok": entry_time_ok,
+                                    "exit_time_ok": exit_time_ok,
+                                    "trades_count_before": len(trades),
+                                    "trades_count_after": len(out),
+                                })
                 # pnl = (out.exit_price + out.entry_price) * out.exit_quantity
                 # pnl = np.where(out["side"] == "BUY", pnl, -pnl)
                 out["mtm"] = np.where(out["exit_quantity"] != 0, out["exit_price"], out["entry_price"])
@@ -757,8 +928,14 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
 
         # Scan for internal order IDs
         try:
-            for int_order_id in broker.redis_o.scan_iter(strategy + "_" + "*"):
-                int_order_ids.append(int_order_id)
+            # Use scan() with cursor 0 instead of scan_iter() to avoid cursor state issues
+            pattern = strategy + "_" + "*"
+            cursor = 0
+            while True:
+                cursor, keys = broker.redis_o.scan(cursor, match=pattern, count=1000)
+                int_order_ids.extend(keys)
+                if cursor == 0:
+                    break
         except Exception as e:
             context = create_error_context(strategy=strategy, scan_pattern=f"{strategy}_*", error=str(e))
             raise RedisError(f"Failed to scan Redis for strategy {strategy}: {str(e)}", context)
@@ -1537,6 +1714,7 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
             str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
         )
         broker.redis_o.hset(order.orderRef, "exit_keys", new_orders)
+        broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol)
 
     broker.redis_o.hmset(str(order.broker_order_id), {key: str(val) for key, val in order.to_dict().items()})
     update_order_status(broker, order.internal_order_id, str(order.broker_order_id), eod=False)
@@ -1655,7 +1833,47 @@ def update_order_status(
     if eod is false, [price,quantity,status] is updated to [fill_price/order_price,order_size,orderstatus]
     if eod is true, [price,quantity,status] is updated to [fill_price,fill_size,orderstatus]. in addition to eod functionality, order is deleted if fill_size is zero
     """
-    fills = broker.get_order_info(broker_order_id=broker_order_id)
+    # Debug: Log before calling get_order_info, especially for exit orders
+    try:
+        # Check if this is an exit order by checking if broker_order_id is in exit_keys
+        exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
+        is_exit_order = broker_order_id in exit_keys
+        if is_exit_order:
+            trading_logger.log_debug("Calling get_order_info for exit order in update_order_status", {
+                "internal_order_id": internal_order_id,
+                "broker_order_id": broker_order_id,
+                "eod": eod,
+                "exit_keys": exit_keys,
+            })
+    except Exception:
+        pass  # Don't fail if we can't check exit_keys
+    
+    try:
+        fills = broker.get_order_info(broker_order_id=broker_order_id)
+        
+        # Debug: Log result of get_order_info for exit orders
+        try:
+            exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
+            is_exit_order = broker_order_id in exit_keys
+            if is_exit_order:
+                trading_logger.log_debug("get_order_info result for exit order", {
+                    "internal_order_id": internal_order_id,
+                    "broker_order_id": broker_order_id,
+                    "status": fills.status.name if hasattr(fills.status, 'name') else str(fills.status),
+                    "fill_size": fills.fill_size if hasattr(fills, 'fill_size') else None,
+                    "fill_price": fills.fill_price if hasattr(fills, 'fill_price') else None,
+                    "order_size": fills.order_size if hasattr(fills, 'order_size') else None,
+                    "order_price": fills.order_price if hasattr(fills, 'order_price') else None,
+                })
+        except Exception:
+            pass  # Don't fail if we can't log
+    except Exception as e:
+        trading_logger.log_error(
+            f"Error calling get_order_info in update_order_status",
+            e,
+            {"internal_order_id": internal_order_id, "broker_order_id": broker_order_id},
+        )
+        raise
     required_attributes = [
         "broker",
         "status",
@@ -3240,7 +3458,7 @@ def register_strategy_capital(
             capital_available = 0.0
         
         # Connect to Redis DB 0
-        redis_conn = redis.StrictRedis(host=redis_host, db=0, port=redis_port, decode_responses=True)
+        redis_conn = redis.Redis(host=redis_host, db=0, port=redis_port, decode_responses=True)
         
         # Get or create registration data
         registration_key = f"capital:registration:{date}"
