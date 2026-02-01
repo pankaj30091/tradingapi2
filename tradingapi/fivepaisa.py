@@ -71,7 +71,7 @@ def save_symbol_data(saveToFolder: bool = False):
         if response.status_code != 200:
             raise Exception(f"Failed to fetch symbol data. Status code: {response.status_code}")
 
-        df = pd.read_csv(io.BytesIO(response.content))
+        df = pd.read_csv(io.BytesIO(response.content), low_memory=False)
         # Rename the column
         df.rename(columns={"ScripCode": "Scripcode"}, inplace=True)
         # Save the DataFrame back to CSV
@@ -106,7 +106,13 @@ def save_symbol_data(saveToFolder: bool = False):
         # Vectorized string splitting
         codes["symbol_vec"] = codes["Name"].str.split(" ")
 
-        # Function to process each row
+        # Only treat 4/6-token names as FUT/OPT when middle token is a month (e.g. "26JAN25").
+        # Equity names like "NIFTY MID LIQ 15" or "NIFTY GS 8 13YR" are skipped.
+        _MONTH_ABBREV = (
+            "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+        )
+
         def process_row(row):
             symbol_vec = row["symbol_vec"]
             ticksize = row["TickSize"]
@@ -123,30 +129,32 @@ def save_symbol_data(saveToFolder: bool = False):
             elif len(symbol_vec) == 1 and ticksize > 0:
                 return f"{symbol_vec[0]}_STK___".upper()
             elif len(symbol_vec) == 4:
+                if symbol_vec[2].upper() not in _MONTH_ABBREV:
+                    return None
                 expiry_str = f"{symbol_vec[3]}{symbol_vec[2]}{symbol_vec[1]}"
                 try:
                     expiry = dt.datetime.strptime(expiry_str, "%Y%b%d").strftime("%Y%m%d")
                     return f"{symbol_vec[0]}_FUT_{expiry}__".upper()
-                except Exception as e:
-                    trading_logger.log_error(
-                        "Error processing symbol row", e, {"symbol_vec": symbol_vec, "row": str(row)}
+                except (ValueError, TypeError):
+                    logger.debug(
+                        "Symbol row not parsed as FUT (expiry parse failed)",
+                        extra={"symbol_vec": symbol_vec, "expiry_str": expiry_str},
                     )
-                    # Also log to the standard logger as backup
-                    logger.error(f"Error processing symbol row: {e}", exc_info=True)
                     return None
             elif len(symbol_vec) == 6:
+                if symbol_vec[2].upper() not in _MONTH_ABBREV:
+                    return None
                 expiry_str = f"{symbol_vec[3]}{symbol_vec[2]}{symbol_vec[1]}"
                 try:
                     expiry = dt.datetime.strptime(expiry_str, "%Y%b%d").strftime("%Y%m%d")
                     right = "CALL" if symbol_vec[4] == "CE" else "PUT"
                     strike = ("%f" % float(symbol_vec[5])).rstrip("0").rstrip(".")
                     return f"{symbol_vec[0]}_OPT_{expiry}_{right}_{strike}".upper()
-                except Exception as e:
-                    trading_logger.log_error(
-                        "Error processing symbol row", e, {"symbol_vec": symbol_vec, "row": str(row)}
+                except (ValueError, TypeError):
+                    logger.debug(
+                        "Symbol row not parsed as OPT (expiry parse failed)",
+                        extra={"symbol_vec": symbol_vec, "expiry_str": expiry_str},
                     )
-                    # Also log to the standard logger as backup
-                    logger.error(f"Error processing symbol row: {e}", exc_info=True)
                     return None
             else:
                 return None
