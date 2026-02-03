@@ -38,6 +38,11 @@ from .exceptions import (
     AuthenticationError,
     create_error_context,
 )
+try:
+    from websocket import WebSocketConnectionClosedException
+except ImportError:
+    from websocket._exceptions import WebSocketConnectionClosedException  # type: ignore[attr-defined]
+
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from . import trading_logger
 from .globals import get_tradingapi_now
@@ -3004,13 +3009,15 @@ class FivePaisa(BrokerBase):
                     trading_logger.log_error("Error handling WebSocket error", e, {"original_error": str(err)})
 
             def reconnect():
-                """Reconnect to WebSocket."""
+                """Reconnect to WebSocket (used by error_data callback)."""
                 trading_logger.log_info("Attempting to reconnect...")
                 time.sleep(5)  # Wait for a few seconds before reconnecting
                 try:
-                    req_data = expand_symbols_to_request(
-                        self.subscribed_symbols
-                    )  # Store req_data for reconnection purposes
+                    req_list = expand_symbols_to_request(self.subscribed_symbols)
+                    if not req_list:
+                        trading_logger.log_warning("No symbols to reconnect", {"subscribed_symbols": self.subscribed_symbols})
+                        return
+                    req_data = self.api.Request_Feed("mf", "s", req_list)
                     connect_and_receive(req_data)
                 except Exception as e:
                     trading_logger.log_error("Reconnection failed", e, {"subscribed_symbols": self.subscribed_symbols})
@@ -3091,7 +3098,39 @@ class FivePaisa(BrokerBase):
                         trading_logger.log_info(
                             "Requesting streaming for existing connection", {"req_data": json.dumps(req_data)}
                         )
-                        self.api.ws.send(json.dumps(req_data))
+                        try:
+                            self.api.ws.send(json.dumps(req_data))
+                        except WebSocketConnectionClosedException:
+                            trading_logger.log_info(
+                                "WebSocket closed, reconnecting...",
+                                {"operation": operation, "symbols_count": len(symbols), "exchange": exchange},
+                            )
+                            try:
+                                self.api.close_data()
+                            except Exception:
+                                pass
+                            self.subscribe_thread = None
+                            req_list_full = expand_symbols_to_request(self.subscribed_symbols)
+                            if not req_list_full:
+                                context = create_error_context(
+                                    operation=operation, symbols=symbols, exchange=exchange
+                                )
+                                raise MarketDataError(
+                                    "No symbols to reconnect after socket closure", context
+                                )
+                            req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
+                            self.subscribe_thread = threading.Thread(
+                                target=connect_and_receive,
+                                args=(req_data_full,),
+                                name="MarketDataStreamer",
+                            )
+                            self.subscribe_thread.start()
+                            time.sleep(2)
+                            trading_logger.log_info(
+                                "Reconnected after socket closure",
+                                {"subscribed_count": len(self.subscribed_symbols)},
+                            )
+                            # New connection already has full subscription; no need to send again
                 else:
                     trading_logger.log_warning(
                         "No valid request list generated", {"symbols": symbols, "req_list": req_list}
