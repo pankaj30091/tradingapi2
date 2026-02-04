@@ -2736,8 +2736,8 @@ class FivePaisa(BrokerBase):
                 context = create_error_context(date_string=date_string, date_string_type=type(date_string))
                 raise ValidationError("Invalid date string", context)
 
-            # Extract the timestamp using regex
-            match = re.search(r"/Date\((\d+)\)/", date_string)
+            # Extract the timestamp using regex (allow negative for .NET min-date, treated as invalid)
+            match = re.search(r"/Date\((-?\d+)\)/", date_string)
             if not match:
                 trading_logger.log_warning(
                     "Invalid date format", {"date_string": date_string, "expected_format": "/Date(milliseconds)/"}
@@ -2747,6 +2747,12 @@ class FivePaisa(BrokerBase):
             try:
                 # Convert the timestamp from milliseconds to seconds
                 timestamp_ms = int(match.group(1))
+                # Treat negative timestamps (e.g. .NET min date) as invalid; substitute current time
+                if timestamp_ms < 0:
+                    trading_logger.log_warning(
+                        "Invalid date (negative timestamp)", {"date_string": date_string, "expected_format": "/Date(milliseconds)/"}
+                    )
+                    return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
                 timestamp_s = timestamp_ms / 1000
 
                 # Convert to UTC datetime
