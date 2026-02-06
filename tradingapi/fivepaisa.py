@@ -746,12 +746,12 @@ class FivePaisa(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     @log_execution_time
-    def get_available_capital(self) -> float:
+    def get_available_capital(self) -> Dict[str, float]:
         """
         Get available capital/balance for trading (cash + collateral).
 
         Returns:
-            float: Available capital amount (Ledgerbalance + FundsPayln + Collateral)
+            Dict[str, float]: Dictionary with 'cash' and 'collateral' keys containing float values
 
         Raises:
             BrokerConnectionError: If broker is not connected
@@ -785,8 +785,6 @@ class FivePaisa(BrokerBase):
                             break
                         except (ValueError, TypeError):
                             continue
-            
-            total_capital = cash + collateral
 
             trading_logger.log_debug(
                 "Available capital retrieved",
@@ -795,10 +793,10 @@ class FivePaisa(BrokerBase):
                     "funds_payln": funds_payln,
                     "cash": cash,
                     "collateral": collateral,
-                    "total_capital": total_capital,
+                    "total_capital": cash + collateral,
                 },
             )
-            return total_capital
+            return {"cash": cash, "collateral": collateral}
 
         except (BrokerConnectionError, MarketDataError):
             raise

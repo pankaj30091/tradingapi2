@@ -1010,12 +1010,12 @@ class BrokerBase(ABC):
         pass
 
     @abstractmethod
-    def get_available_capital(self) -> float:
+    def get_available_capital(self) -> Dict[str, float]:
         """
         Get available capital/balance for trading.
 
         Returns:
-            float: Available capital amount
+            Dict[str, float]: Dictionary with 'cash' and 'collateral' keys containing float values
 
         Raises:
             BrokerConnectionError: If broker is not connected

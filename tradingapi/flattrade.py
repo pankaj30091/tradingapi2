@@ -830,12 +830,12 @@ class FlatTrade(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
-    def get_available_capital(self) -> float:
+    def get_available_capital(self) -> Dict[str, float]:
         """
         Get available capital/balance for trading (cash + collateral).
 
         Returns:
-            float: Available capital amount (cash + collateral from limits)
+            Dict[str, float]: Dictionary with 'cash' and 'collateral' keys containing float values
 
         Raises:
             BrokerConnectionError: If broker is not connected
@@ -866,19 +866,17 @@ class FlatTrade(BrokerBase):
                         break
                     except (ValueError, TypeError):
                         continue
-            
-            total_capital = cash_float + collateral
 
             trading_logger.log_debug(
                 "Available capital retrieved",
                 {
                     "cash": cash_float,
                     "collateral": collateral,
-                    "total_capital": total_capital,
+                    "total_capital": cash_float + collateral,
                     "broker_type": self.broker.name,
                 },
             )
-            return total_capital
+            return {"cash": cash_float, "collateral": collateral}
 
         except (BrokerConnectionError, MarketDataError):
             raise

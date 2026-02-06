@@ -703,12 +703,12 @@ class Shoonya(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
-    def get_available_capital(self) -> float:
+    def get_available_capital(self) -> Dict[str, float]:
         """
         Get available capital/balance for trading (cash + collateral).
 
         Returns:
-            float: Available capital amount (cash + collateral from limits)
+            Dict[str, float]: Dictionary with 'cash' and 'collateral' keys containing float values
 
         Raises:
             BrokerConnectionError: If broker is not connected
@@ -739,14 +739,12 @@ class Shoonya(BrokerBase):
                         break
                     except (ValueError, TypeError):
                         continue
-            
-            total_capital = cash_float + collateral
 
             trading_logger.log_debug(
                 "Available capital retrieved",
-                {"cash": cash_float, "collateral": collateral, "total_capital": total_capital, "broker": self.broker.name},
+                {"cash": cash_float, "collateral": collateral, "total_capital": cash_float + collateral, "broker": self.broker.name},
             )
-            return total_capital
+            return {"cash": cash_float, "collateral": collateral}
 
         except (BrokerConnectionError, MarketDataError):
             raise
@@ -1961,7 +1959,15 @@ class Shoonya(BrokerBase):
                 if message.get("t") == "tk":
                     price = map_to_price(message)
                     prices[message.get("tk")] = price
-                    ext_callback(price)
+                    if ext_callback is not None:
+                        try:
+                            ext_callback(price)
+                        except Exception as e:
+                            trading_logger.log_error(
+                                "Error in external price callback",
+                                e,
+                                {"symbol": price.symbol, "src": price.src},
+                            )
                 elif message.get("t") == "tf":
                     required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l"}
                     if required_keys & message.keys():
@@ -1986,7 +1992,15 @@ class Shoonya(BrokerBase):
                             price.volume = float(message.get("v"))
                         price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
                         prices[message.get("tk")] = price
-                        ext_callback(price)
+                        if ext_callback is not None:
+                            try:
+                                ext_callback(price)
+                            except Exception as e:
+                                trading_logger.log_error(
+                                    "Error in external price callback",
+                                    e,
+                                    {"symbol": price.symbol, "src": price.src},
+                                )
 
             # Function to handle WebSocket errors
             def handle_socket_error(error=None):
@@ -2029,8 +2043,23 @@ class Shoonya(BrokerBase):
                         if self.socket_opened:
                             trading_logger.log_info("WebSocket reconnected successfully.")
                             try:
-                                self.api.subscribe(req_list)
-                                trading_logger.log_info("Resubscribed to symbols after reconnection")
+                                # Rebuild subscription list from all currently subscribed symbols
+                                active_symbols = list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
+                                if active_symbols:
+                                    reconnect_req_list = expand_symbols_to_request(active_symbols)
+                                    trading_logger.log_info(
+                                        "Resubscribing to symbols after reconnection",
+                                        {
+                                            "symbols_count": len(active_symbols),
+                                            "req_list": reconnect_req_list,
+                                        },
+                                    )
+                                    self.api.subscribe(reconnect_req_list)
+                                else:
+                                    trading_logger.log_warning(
+                                        "No active symbols found in subscribed_symbols during reconnection; "
+                                        "skipping resubscribe."
+                                    )
                                 return
                             except Exception as e:
                                 trading_logger.log_error("Failed to resubscribe after reconnection", e)

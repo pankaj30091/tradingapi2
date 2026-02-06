@@ -138,6 +138,103 @@ def set_starting_internal_ids_int(redis_db) -> dict:
     return out
 
 
+def publish_trades_to_redis(
+    broker: BrokerBase,
+    strategy_name: str,
+    paper: bool = False,
+    channel: Optional[str] = None,
+) -> int:
+    """
+    Publish today's trades for a strategy to Redis so downstream consumers
+    (e.g. order_manager, dashboards) can consume a consistent trade feed.
+
+    This helper centralizes the \"PnL \u2192 Redis\" publishing logic so all strategies
+    can use the same mechanism instead of reimplementing it.
+
+    Args:
+        broker: Broker instance (e.g. FivePaisa, Shoonya). Must expose ``redis_o`` for publishing.
+        strategy_name: Strategy name as used in internal order IDs (e.g. \"TCS01\", \"SCALPING01\").
+        paper: If True, no data is published (simulated mode; logs only).
+        channel: Optional Redis channel name. Defaults to ``strategy_name`` when not provided.
+
+    Returns:
+        int: Number of trade rows published, or 0 if nothing was published.
+    """
+    try:
+        today = dt.date.today().strftime("%Y-%m-%d")
+        trades = get_pnl_table(broker, strategy_name, refresh_status=True)
+
+        if trades is None or trades.empty:
+            trading_logger.log_info(
+                f"No trades found for {strategy_name} to publish",
+                {"strategy_name": strategy_name},
+            )
+            return 0
+
+        # Filter to \"today\" when entry/exit timestamps are available; fall back gracefully on any error.
+        trades_today = trades
+        try:
+            if "entry_time" in trades.columns and "exit_time" in trades.columns:
+                # Be robust to NaNs and non-string types
+                entry_s = trades.entry_time.fillna("").astype(str).str[:10]
+                exit_s = trades.exit_time.fillna("").astype(str).str[:10]
+                mask = (entry_s == today) | (exit_s == today)
+                trades_today = trades[mask]
+        except Exception as e:
+            trading_logger.log_warning(
+                f"Error filtering trades by date for {strategy_name}: {e}",
+                {"strategy_name": strategy_name, "error": str(e)},
+            )
+            trades_today = trades
+
+        if paper or trades_today.empty:
+            if paper:
+                trading_logger.log_debug(
+                    f"Skipping publish for {strategy_name} (paper trading mode)",
+                    {"strategy_name": strategy_name},
+                )
+            else:
+                trading_logger.log_info(
+                    f"No trades to publish for {strategy_name} today (trades_today is empty)",
+                    {"strategy_name": strategy_name, "today": today},
+                )
+            return 0
+
+        publish_channel = channel or strategy_name
+
+        try:
+            pnl_json = trades_today.to_json(orient="split")
+            broker.redis_o.publish(publish_channel, pnl_json)
+            trading_logger.log_info(
+                f"Published {len(trades_today)} trades for {strategy_name} to Redis",
+                {
+                    "strategy_name": strategy_name,
+                    "channel": publish_channel,
+                    "trades_count": len(trades_today),
+                    "paper": paper,
+                },
+            )
+            return len(trades_today)
+        except Exception as e:
+            trading_logger.log_warning(
+                f"Failed to publish trades to Redis for {strategy_name}: {e}",
+                {
+                    "strategy_name": strategy_name,
+                    "channel": publish_channel,
+                    "error": str(e),
+                },
+            )
+            return 0
+
+    except Exception as e:
+        trading_logger.log_error(
+            f"Error publishing trades to Redis for {strategy_name}: {e}",
+            {"strategy_name": strategy_name, "error": str(e)},
+            exc_info=True,
+        )
+        return 0
+
+
 def _safe_parse_json_or_dict(json_str):
     """
     Safely parse a string that could be either JSON or Python dict string.
@@ -1873,7 +1970,9 @@ def update_order_status(
             e,
             {"internal_order_id": internal_order_id, "broker_order_id": broker_order_id},
         )
-        raise
+        # Don't re-raise - the error is already logged and the caller handles exceptions
+        # Returning None to indicate failure (caller doesn't use return value anyway)
+        return None
     required_attributes = [
         "broker",
         "status",
@@ -3411,6 +3510,7 @@ def calc_pnl(trades: pd.DataFrame, brok: Optional[BrokerBase] = None):
 @validate_inputs(
     strategy_name=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     capital_allocated=lambda x: isinstance(x, (int, float)) and x >= 0,
+    username=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
 )
 def register_strategy_capital(
     strategy_name: str,
@@ -3419,11 +3519,14 @@ def register_strategy_capital(
     redis_host: str = "localhost",
     redis_port: int = 6379,
     date: Optional[str] = None,
+    username: Optional[str] = None,
 ) -> bool:
     """
     Register strategy capital allocation and broker capital availability in Redis DB 0.
     
-    Updates the consolidated JSON key: capital:registration:{YYYYMMDD}
+    Updates the consolidated JSON key:
+    - capital:user:{username}:registration:{YYYYMMDD} when username is provided
+    - capital:registration:{YYYYMMDD} otherwise
     
     Args:
         strategy_name: Strategy/algorithm name
@@ -3432,6 +3535,7 @@ def register_strategy_capital(
         redis_host: Redis host (default: localhost)
         redis_port: Redis port (default: 6379)
         date: Date in YYYYMMDD format (defaults to today)
+        username: Optional username (when provided, writes to user-scoped key)
     
     Returns:
         bool: True if successful, False otherwise
@@ -3452,16 +3556,28 @@ def register_strategy_capital(
         
         # Get broker available capital
         try:
-            capital_available = broker.get_available_capital()
+            capital_dict = broker.get_available_capital()
+            if not isinstance(capital_dict, dict):
+                # Fallback for old implementations that might still return float
+                logger.warning(f"get_available_capital returned non-dict type {type(capital_dict)}, converting to dict")
+                capital_dict = {"cash": float(capital_dict) if isinstance(capital_dict, (int, float)) else 0.0, "collateral": 0.0}
+            # Ensure both keys exist
+            cash = capital_dict.get("cash", 0.0)
+            collateral = capital_dict.get("collateral", 0.0)
+            capital_available = cash + collateral
         except Exception as e:
             logger.warning(f"Failed to get available capital from broker {broker_name}: {e}")
+            capital_dict = {"cash": 0.0, "collateral": 0.0}
             capital_available = 0.0
         
         # Connect to Redis DB 0
         redis_conn = redis.Redis(host=redis_host, db=0, port=redis_port, decode_responses=True)
         
         # Get or create registration data
-        registration_key = f"capital:registration:{date}"
+        if username:
+            registration_key = f"capital:user:{username}:registration:{date}"
+        else:
+            registration_key = f"capital:registration:{date}"
         existing_data_str = redis_conn.get(registration_key)
         
         if existing_data_str:
@@ -3483,10 +3599,12 @@ def register_strategy_capital(
                 "last_updated": dt.datetime.now().isoformat(),
             }
         
-        # Update broker capital
+        # Update broker capital (store both individual values and total)
         current_time = dt.datetime.now().isoformat()
         registration_data["brokers"][broker_name] = {
-            "capital_available": capital_available,
+            "capital_available": capital_available,  # Total for backward compatibility
+            "cash": capital_dict.get("cash", 0.0),
+            "collateral": capital_dict.get("collateral", 0.0),
             "timestamp": current_time,
         }
         
@@ -3496,6 +3614,8 @@ def register_strategy_capital(
             "capital_allocated": capital_allocated,
             "timestamp": current_time,
         }
+        if username:
+            registration_data["strategies"][strategy_name]["username"] = username
         
         # Update last_updated timestamp
         registration_data["last_updated"] = current_time
