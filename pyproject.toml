@@ -12,7 +12,7 @@ module = ["yaml", "pytz","requests"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["numpy", "pyreadr", "rpy2", "pandas", "scipy","redis"]
+module = ["numpy", "pyreadr", "rpy2", "scipy"]
 ignore_missing_imports = true
 
 [build-system]
@@ -21,13 +21,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
+packages = ["tradingapi"]
 
 [tool.setuptools.package-data]
-"tradingapi2" = ["config/config_sample.yaml", "config/commissions_20241216.yaml"]
+"tradingapi" = ["config/config_sample.yaml", "config/commissions_20241216.yaml"]
 
 [project]
 name = "tradingapi"
-version = "0.1.6"
+version = "0.1.7"
 description = "Trade integration with brokers"
 readme = "README.md"
 license = "MIT"
@@ -41,7 +42,9 @@ dependencies = [
     "redis==7.1.0",
     "pyotp==2.9.0",
     "httpx>=0.25.0,<0.29.0",
-    "bcrypt<4.0.0"
+    "bcrypt<4.0.0",
+    "pandas-stubs>=2.0.0",
+    "types-redis>=4.6.0"
 ]
 
 [project.urls]

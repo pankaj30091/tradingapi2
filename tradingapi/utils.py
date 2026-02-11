@@ -11,12 +11,12 @@ import time
 import traceback
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, cast, Sequence
 
 import numpy as np
 import pandas as pd
 import redis
-from chameli.dateutils import calc_fractional_business_days, valid_datetime
+from chameli.dateutils import calc_fractional_business_days, parse_datetime, safe_datetime_compare
 from chameli.europeanoptions import BlackScholesDelta, BlackScholesIV
 from requests import Session
 from selenium import webdriver
@@ -60,7 +60,7 @@ config = get_config()
 mds_history = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 pubsub = mds_history.pubsub()
 
-empty_trades = {
+empty_trades = pd.DataFrame({
     "symbol": pd.Series(dtype="object"),
     "side": pd.Series(dtype="object"),
     "entry_time": pd.Series(dtype="string"),
@@ -78,9 +78,7 @@ empty_trades = {
     "gross_pnl": pd.Series(dtype="float64"),
     "mtm": pd.Series(dtype="float64"),
     "pnl": pd.Series(dtype="float64"),
-}
-
-empty_trades = pd.DataFrame(empty_trades)
+})
 
 empty_md = {
     "date": pd.Series(dtype="datetime64[ns]"),
@@ -141,11 +139,12 @@ def set_starting_internal_ids_int(redis_db) -> dict:
 def publish_trades_to_redis(
     broker: BrokerBase,
     strategy_name: str,
-    paper: bool = False,
+    publish: bool = True,
     channel: Optional[str] = None,
+    trades_out: Optional[list] = None,
 ) -> int:
     """
-    Publish today's trades for a strategy to Redis so downstream consumers
+    Publish relevant trades for a strategy to Redis so downstream consumers
     (e.g. order_manager, dashboards) can consume a consistent trade feed.
 
     This helper centralizes the \"PnL \u2192 Redis\" publishing logic so all strategies
@@ -154,8 +153,9 @@ def publish_trades_to_redis(
     Args:
         broker: Broker instance (e.g. FivePaisa, Shoonya). Must expose ``redis_o`` for publishing.
         strategy_name: Strategy name as used in internal order IDs (e.g. \"TCS01\", \"SCALPING01\").
-        paper: If True, no data is published (simulated mode; logs only).
+        publish: If True, publish to Redis; if False, skip publishing (e.g. paper mode or testing).
         channel: Optional Redis channel name. Defaults to ``strategy_name`` when not provided.
+        trades_out: Optional list to populate with filtered trades DataFrame when publish=False.
 
     Returns:
         int: Number of trade rows published, or 0 if nothing was published.
@@ -171,31 +171,70 @@ def publish_trades_to_redis(
             )
             return 0
 
-        # Filter to \"today\" when entry/exit timestamps are available; fall back gracefully on any error.
-        trades_today = trades
+        # Filter to relevant trades: today's trades + open positions from earlier days
+        # This matches the logic used by pnl_publisher._initial_load
+        relevant_trades = trades
         try:
             if "entry_time" in trades.columns and "exit_time" in trades.columns:
-                # Be robust to NaNs and non-string types
-                entry_s = trades.entry_time.fillna("").astype(str).str[:10]
-                exit_s = trades.exit_time.fillna("").astype(str).str[:10]
-                mask = (entry_s == today) | (exit_s == today)
-                trades_today = trades[mask]
+                # Helper function to safely extract date string from mixed-type datetime columns
+                def safe_date_extract(series):
+                    """Safely extract YYYY-MM-DD date string from mixed datetime/string column."""
+                    date_str = pd.Series([str(x)[:10] if x and str(x) not in ['nan', 'NaT', ''] else '' for x in series], index=series.index)
+                    return date_str
+
+                # Today's trades (entered or exited today)
+                entry_dates = safe_date_extract(trades.entry_time)
+                exit_dates = safe_date_extract(trades.exit_time)
+                today_trades = (entry_dates == today) | (exit_dates == today)
+
+                # Open trades from earlier days (entered before today, still have open position)
+                entry_before_today = (entry_dates < today) & (entry_dates != '')
+
+                # Check if position is still open
+                if "entry_quantity" in trades.columns and "exit_quantity" in trades.columns:
+                    # Primary check: actual open position quantity
+                    has_open_position = trades["entry_quantity"] + trades["exit_quantity"] != 0
+                    # Fallback check: exit_time status (empty string '', None, 0, or >= today)
+                    exit_time_normalized = trades.exit_time.fillna("").astype(str).replace("NaT", "").replace("nan", "")
+                    exit_time_empty = (
+                        (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
+                    )
+                    exit_time_today_or_later = (exit_dates >= today) & (exit_dates != '')
+                    exit_time_still_open = exit_time_empty | exit_time_today_or_later
+                    still_open = has_open_position | exit_time_still_open
+                else:
+                    # Fallback if quantity columns missing
+                    exit_time_normalized = trades.exit_time.fillna("").astype(str).replace("NaT", "").replace("nan", "")
+                    exit_time_empty = (
+                        (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
+                    )
+                    exit_time_today_or_later = (exit_dates >= today) & (exit_dates != '')
+                    still_open = exit_time_empty | exit_time_today_or_later
+
+                open_from_earlier = entry_before_today & still_open
+
+                # Combine: today's trades OR open trades from earlier days
+                relevant_mask = today_trades | open_from_earlier
+                relevant_trades = trades[relevant_mask]
         except Exception as e:
             trading_logger.log_warning(
-                f"Error filtering trades by date for {strategy_name}: {e}",
+                f"Error filtering trades for {strategy_name}: {e}",
                 {"strategy_name": strategy_name, "error": str(e)},
             )
-            trades_today = trades
+            relevant_trades = trades
 
-        if paper or trades_today.empty:
-            if paper:
+        if not publish or relevant_trades.empty:
+            if not publish:
                 trading_logger.log_debug(
-                    f"Skipping publish for {strategy_name} (paper trading mode)",
+                    f"Skipping publish for {strategy_name} (publish=False)",
                     {"strategy_name": strategy_name},
                 )
+                # Populate trades_out if provided
+                if trades_out is not None:
+                    trades_out.append(relevant_trades)
             else:
                 trading_logger.log_info(
-                    f"No trades to publish for {strategy_name} today (trades_today is empty)",
+                    f"No relevant trades to publish for {strategy_name} (relevant_trades is empty)",
                     {"strategy_name": strategy_name, "today": today},
                 )
             return 0
@@ -203,18 +242,18 @@ def publish_trades_to_redis(
         publish_channel = channel or strategy_name
 
         try:
-            pnl_json = trades_today.to_json(orient="split")
-            broker.redis_o.publish(publish_channel, pnl_json)
+            pnl_json = relevant_trades.to_json(orient="split")
+            cast(None, broker.redis_o.publish(publish_channel, pnl_json))
             trading_logger.log_info(
-                f"Published {len(trades_today)} trades for {strategy_name} to Redis",
+                f"Published {len(relevant_trades)} relevant trades for {strategy_name} to Redis",
                 {
                     "strategy_name": strategy_name,
                     "channel": publish_channel,
-                    "trades_count": len(trades_today),
-                    "paper": paper,
+                    "trades_count": len(relevant_trades),
+                    "publish": publish,
                 },
             )
-            return len(trades_today)
+            return len(relevant_trades)
         except Exception as e:
             trading_logger.log_warning(
                 f"Failed to publish trades to Redis for {strategy_name}: {e}",
@@ -229,6 +268,7 @@ def publish_trades_to_redis(
     except Exception as e:
         trading_logger.log_error(
             f"Error publishing trades to Redis for {strategy_name}: {e}",
+            e,
             {"strategy_name": strategy_name, "error": str(e)},
             exc_info=True,
         )
@@ -386,7 +426,7 @@ def needs_refresh_status_from_redis(broker: BrokerBase, pnl_df: pd.DataFrame) ->
             order_id = row.get(order_id_col)
             if order_id:
                 redis_key = f"order:{order_id}"
-                price = broker.redis_o.hget(redis_key, "price")
+                price = cast(str, broker.redis_o.hget(redis_key, "price"))
                 if price is not None and float(price) == 0.0:
                     return True
     return False
@@ -403,7 +443,7 @@ def get_pnl_table(
     broker: BrokerBase,
     strategy: str,
     start_time: str = "1970-01-01 00:00:00",
-    end_time: str = None,
+    end_time: Optional[str] = None,
     refresh_status=False,
     market_close_time="15:30:00",
     eod=False,
@@ -429,54 +469,27 @@ def get_pnl_table(
     """
     # Set default end_time inside the function body (evaluated at call time, not import time)
     if end_time is None:
-        end_time = get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
-    
+        current_time = get_tradingapi_now()
+        # For EOD processing, add a small buffer to account for processing time
+        if eod:
+            current_time = current_time + dt.timedelta(minutes=2)
+        end_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
+
     try:
         int_order_ids = []
         trades = []
 
         # Get all internal order IDs for the strategy
         # Use scan_iter with match pattern to find all order IDs
-        # Note: scan_iter should return fresh results, but if there are issues with stale cursors,
-        # we can force a fresh scan by using scan() with cursor 0
         pattern = strategy + "_" + "*"
-        
-        # Force a fresh scan by using scan() with cursor 0 to avoid any potential cursor state issues
-        # This ensures we always get the latest keys, even if the connection was created earlier
         cursor = 0
         scan_count = 0
         while True:
-            cursor, keys = broker.redis_o.scan(cursor, match=pattern, count=1000)
+            cursor, keys = cast(tuple, broker.redis_o.scan(cursor, match=pattern, count=1000))
             int_order_ids.extend(keys)
             scan_count += len(keys)
             if cursor == 0:
                 break
-        
-        # Log what we found for debugging
-        if len(int_order_ids) > 0:
-            # Sort numerically by extracting the number after the underscore
-            def extract_order_number(order_id):
-                try:
-                    # Extract number after last underscore (e.g., "SCALPING01_1949" -> 1949)
-                    parts = order_id.rsplit("_", 1)
-                    if len(parts) == 2:
-                        return int(parts[1])
-                    return 0
-                except (ValueError, IndexError):
-                    return 0
-            
-            int_order_ids.sort(key=extract_order_number)
-            last_5 = int_order_ids[-5:] if len(int_order_ids) >= 5 else int_order_ids
-            trading_logger.log_debug(
-                f"Found {len(int_order_ids)} order IDs for strategy {strategy}",
-                {
-                    "strategy": strategy,
-                    "count": len(int_order_ids),
-                    "first": int_order_ids[0] if int_order_ids else None,
-                    "last": int_order_ids[-1] if int_order_ids else None,
-                    "last_5": last_5,
-                }
-            )
 
         if not int_order_ids:
             trading_logger.log_info(
@@ -495,7 +508,7 @@ def get_pnl_table(
                 return 0
             except (ValueError, IndexError):
                 return 0
-        
+
         int_order_ids.sort(key=extract_order_number)
 
         for int_order_id in int_order_ids:
@@ -503,7 +516,7 @@ def get_pnl_table(
                 if is_not_int_order_id(int_order_id):
                     continue
 
-                symbol = broker.redis_o.hget(int_order_id, "long_symbol")
+                symbol = cast(str, broker.redis_o.hget(int_order_id, "long_symbol"))
                 if not symbol:
                     trading_logger.log_warning(
                         f"No symbol found for internal order ID: {int_order_id}",
@@ -511,21 +524,10 @@ def get_pnl_table(
                     )
                     continue
 
-                entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
-                exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+                entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()  # type: ignore  # type: ignore
+                exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()  # type: ignore
                 additional_info_entry = ""
                 additional_info_exit = ""
-                
-                # Debug: Log entry_keys and exit_keys for trades with exit_keys (exits placed)
-                if len(exit_keys) > 0:
-                    trading_logger.log_debug("Trade with exit_keys processing in get_pnl_table", {
-                        "int_order_id": int_order_id,
-                        "symbol": symbol,
-                        "entry_keys": entry_keys,
-                        "exit_keys": exit_keys,
-                        "entry_keys_count": len(entry_keys),
-                        "exit_keys_count": len(exit_keys),
-                    })
 
                 if len(entry_keys) == 0:
                     trading_logger.log_error(
@@ -538,11 +540,14 @@ def get_pnl_table(
                 # Process entry keys
                 if len(entry_keys) > 0:
                     try:
-                        order_1 = Order(**broker.redis_o.hgetall(entry_keys[0]))
+                        order_1 = Order(**cast(dict, broker.redis_o.hgetall(entry_keys[0])))
                         side = order_1.order_type if "?" not in symbol else "BUY"
-                        entry_time, _ = valid_datetime(order_1.remote_order_id[:-2], "%Y-%m-%d %H:%M:%S")
-                        # Handle case where valid_datetime returns False (parsing failed)
-                        if entry_time is False or entry_time is None:
+                        try:
+                            entry_time = parse_datetime(order_1.remote_order_id[:-2])
+                        except (ValueError, TypeError):
+                            entry_time = None
+                        # Handle case where parsing failed
+                        if entry_time is None:
                             entry_time = ""
                         for ek in entry_keys:
                             additional_info_entry = _merge_additional_info(
@@ -559,11 +564,14 @@ def get_pnl_table(
                 # Process exit keys
                 if len(exit_keys) > 0:
                     try:
-                        order_1 = Order(**broker.redis_o.hgetall(exit_keys[-1]))
-                        exit_time, _ = valid_datetime(order_1.remote_order_id[:-2], "%Y-%m-%d %H:%M:%S")
-                        # Handle case where valid_datetime returns False (parsing failed)
+                        order_1 = Order(**cast(dict, broker.redis_o.hgetall(exit_keys[-1])))
+                        try:
+                            exit_time = parse_datetime(order_1.remote_order_id[:-2])
+                        except (ValueError, TypeError):
+                            exit_time = None
+                        # Handle case where parsing failed
                         # This can happen when exit order status is UNDEFINED and remote_order_id is malformed
-                        if exit_time is False or exit_time is None:
+                        if exit_time is None:
                             exit_time = ""
                         for ek in exit_keys:
                             additional_info_exit = _merge_additional_info(
@@ -588,24 +596,10 @@ def get_pnl_table(
 
                 # Refresh status if requested
                 if refresh_status:
-                    # Debug: Log refresh for trades with exit_keys
-                    if len(exit_keys) > 0:
-                        trading_logger.log_debug("Refreshing entry status for trade with exit_keys", {
-                            "int_order_id": int_order_id,
-                            "symbol": symbol,
-                            "entry_keys": entry_keys,
-                            "exit_keys": exit_keys,
-                        })
                     try:
                         for entry_key in entry_keys:
-                            order = Order(**broker.redis_o.hgetall(entry_key))
+                            order = Order(**cast(dict, broker.redis_o.hgetall(entry_key)))
                             broker_order_id = order.broker_order_id
-                            if len(exit_keys) > 0:
-                                trading_logger.log_debug("Calling update_order_status for entry", {
-                                    "int_order_id": int_order_id,
-                                    "entry_key": entry_key,
-                                    "broker_order_id": broker_order_id,
-                                })
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:
                         trading_logger.log_error(
@@ -635,51 +629,10 @@ def get_pnl_table(
 
                 # Refresh exit status if requested
                 if refresh_status:
-                    # Debug: Log refresh for trades with exit_keys
-                    if len(exit_keys) > 0:
-                        trading_logger.log_debug("Refreshing exit status for trade with exit_keys", {
-                            "int_order_id": int_order_id,
-                            "symbol": symbol,
-                            "entry_keys": entry_keys,
-                            "exit_keys": exit_keys,
-                        })
                     try:
                         for exit_key in exit_keys:
-                            # Get order data before refresh to see what we're working with
-                            exit_order_data_before = broker.redis_o.hgetall(exit_key)
-                            if len(exit_keys) > 0:
-                                trading_logger.log_debug("Exit order data before refresh", {
-                                    "int_order_id": int_order_id,
-                                    "exit_key": exit_key,
-                                    "exit_order_data": dict(exit_order_data_before) if exit_order_data_before else {},
-                                })
-                            
-                            order = Order(**exit_order_data_before) if exit_order_data_before else None
-                            if order is None:
-                                trading_logger.log_warning("Exit order not found in Redis before refresh", {
-                                    "int_order_id": int_order_id,
-                                    "exit_key": exit_key,
-                                })
-                                continue
-                            
                             broker_order_id = order.broker_order_id
-                            if len(exit_keys) > 0:
-                                trading_logger.log_debug("Calling update_order_status for exit", {
-                                    "int_order_id": int_order_id,
-                                    "exit_key": exit_key,
-                                    "broker_order_id": broker_order_id,
-                                })
-                            
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
-                            
-                            # Get order data after refresh to see if anything changed
-                            exit_order_data_after = broker.redis_o.hgetall(exit_key)
-                            if len(exit_keys) > 0:
-                                trading_logger.log_debug("Exit order data after refresh", {
-                                    "int_order_id": int_order_id,
-                                    "exit_key": exit_key,
-                                    "exit_order_data": dict(exit_order_data_after) if exit_order_data_after else {},
-                                })
                     except Exception as e:
                         trading_logger.log_error(
                             f"Error refreshing exit status for {int_order_id}",
@@ -691,7 +644,9 @@ def get_pnl_table(
                 # Only calculate if exit_keys exist - if empty, set defaults and continue (don't skip trade)
                 if len(exit_keys) > 0:
                     try:
-                        exit_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["exit"])
+                        exit_position = get_open_position_by_order(
+                            broker, int_order_id, exclude_zero=True, side=["exit"]
+                        )
                         base_position = parse_combo_symbol(symbol)
                         position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
                         exit_quantity = position_combo_info.get("total_in_progress", 0)
@@ -739,7 +694,7 @@ def get_pnl_table(
                             get_open_position_by_order(
                                 broker=broker, int_order_id=int_order_id, market_close_time=market_close_time
                             )
-                            exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+                            exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()  # type: ignore
                             exit_position = get_open_position_by_order(
                                 broker, int_order_id, exclude_zero=True, side=["exit"]
                             )
@@ -763,14 +718,24 @@ def get_pnl_table(
                                 },
                             )
 
-                # create trade row for internal order id
+                # create trade row for internal order id (entry_time/exit_time as string for consistent dtype)
+                _entry_time_str = (
+                    entry_time.strftime("%Y-%m-%d %H:%M:%S")
+                    if isinstance(entry_time, dt.datetime)
+                    else str(entry_time or "")
+                )
+                _exit_time_str = (
+                    exit_time.strftime("%Y-%m-%d %H:%M:%S")
+                    if isinstance(exit_time, dt.datetime)
+                    else str(exit_time or "")
+                )
                 row = {
                     "symbol": symbol,
                     "side": side,
-                    "entry_time": entry_time,
+                    "entry_time": _entry_time_str,
                     "entry_quantity": entry_quantity,
                     "entry_price": float(entry_price),
-                    "exit_time": exit_time,
+                    "exit_time": _exit_time_str,
                     "exit_quantity": exit_quantity,
                     "exit_price": float(exit_price),
                     "commission": commission,
@@ -780,19 +745,22 @@ def get_pnl_table(
                     "additional_info": additional_info,
                 }
                 trades.append(row)
-                
+
                 # Debug: Log when trades with exit_keys are added to trades list
                 if len(exit_keys) > 0:
-                    trading_logger.log_debug("Trade with exit_keys added to trades list", {
-                        "int_order_id": int_order_id,
-                        "symbol": symbol,
-                        "entry_time": str(entry_time),
-                        "exit_time": str(exit_time),
-                        "entry_time_type": type(entry_time).__name__,
-                        "exit_time_type": type(exit_time).__name__,
-                        "entry_quantity": entry_quantity,
-                        "exit_quantity": exit_quantity,
-                    })
+                    trading_logger.log_debug(
+                        "Trade with exit_keys added to trades list",
+                        {
+                            "int_order_id": int_order_id,
+                            "symbol": symbol,
+                            "entry_time": str(entry_time),
+                            "exit_time": str(exit_time),
+                            "entry_time_type": type(entry_time).__name__,
+                            "exit_time_type": type(exit_time).__name__,
+                            "entry_quantity": entry_quantity,
+                            "exit_quantity": exit_quantity,
+                        },
+                    )
 
             except Exception as e:
                 trading_logger.log_error(
@@ -806,63 +774,87 @@ def get_pnl_table(
         try:
             out = pd.DataFrame(trades)
             if len(out) > 0:
+                # Ensure entry_time/exit_time are string-like (historical contract for downstream .str accessor)
+                out["entry_time"] = out["entry_time"].astype(str)
+                out["exit_time"] = out["exit_time"].astype(str)
                 # Debug: Log trades with exit_keys before filtering
                 if "int_order_id" in out.columns and "exit_keys" in out.columns:
                     trades_with_exits = out[out["exit_keys"].astype(str).str.strip() != ""]
                     if len(trades_with_exits) > 0:
                         for idx, row in trades_with_exits.iterrows():
-                            trading_logger.log_debug("Trade with exit_keys in DataFrame before filter", {
-                                "int_order_id": row.get("int_order_id", ""),
-                                "symbol": row.get("symbol", ""),
-                                "entry_time": str(row.get("entry_time", "")),
-                                "exit_time": str(row.get("exit_time", "")),
-                                "entry_time_type": str(type(row.get("entry_time", ""))),
-                                "exit_time_type": str(type(row.get("exit_time", ""))),
-                                "start_time": start_time,
-                                "end_time": end_time,
-                            })
-                
-                out = out.loc[
-                    ((out.entry_time >= start_time) | (out.entry_time == ""))
-                    & ((out.exit_time <= end_time) | (out.exit_time == 0)|(out.entry_time == "")),
-                ]
-                
+                            trading_logger.log_debug(
+                                "Trade with exit_keys in DataFrame before filter",
+                                {
+                                    "int_order_id": row.get("int_order_id", ""),
+                                    "symbol": row.get("symbol", ""),
+                                    "entry_time": str(row.get("entry_time", "")),
+                                    "exit_time": str(row.get("exit_time", "")),
+                                    "entry_time_type": str(type(row.get("entry_time", ""))),
+                                    "exit_time_type": str(type(row.get("exit_time", ""))),
+                                    "start_time": start_time,
+                                    "end_time": end_time,
+                                },
+                            )
+
+                # Handle mixed types in datetime columns by converting to string for comparison
+
+                mask = (
+                    ((safe_datetime_compare(out.entry_time, start_time, ">=")) | (out.entry_time.astype(str) == ""))
+                    & ((safe_datetime_compare(out.exit_time, end_time, "<=")) | (out.exit_time.astype(str) == "") | (out.entry_time.astype(str) == ""))
+                )
+                out = out[mask]
+
                 # Debug: Log trades with exit_keys that were filtered out
                 if "int_order_id" in out.columns and "exit_keys" in out.columns:
                     trades_before = pd.DataFrame(trades)
                     if "int_order_id" in trades_before.columns and "exit_keys" in trades_before.columns:
-                        trades_with_exits_before = trades_before[trades_before["exit_keys"].astype(str).str.strip() != ""]
+                        trades_with_exits_before = trades_before[
+                            trades_before["exit_keys"].astype(str).str.strip() != ""
+                        ]
                         trades_with_exits_after = out[out["exit_keys"].astype(str).str.strip() != ""]
-                        
+
                         # Find trades that were filtered out
                         if len(trades_with_exits_before) > 0:
-                            before_ids = set(trades_with_exits_before["int_order_id"].values)
-                            after_ids = set(trades_with_exits_after["int_order_id"].values) if len(trades_with_exits_after) > 0 else set()
+                            before_ids = set(cast(pd.Series, trades_with_exits_before["int_order_id"]).values)
+                            after_ids = (
+                                set(cast(pd.Series, trades_with_exits_after["int_order_id"]).values)
+                                if len(trades_with_exits_after) > 0
+                                else set()
+                            )
                             filtered_out_ids = before_ids - after_ids
-                            
+
                             for filtered_id in filtered_out_ids:
-                                row_filtered = trades_with_exits_before[trades_with_exits_before["int_order_id"] == filtered_id].iloc[0]
+                                row_filtered = cast(pd.DataFrame, trades_with_exits_before[
+                                    trades_with_exits_before["int_order_id"] == filtered_id
+                                ]).iloc[0]
                                 entry_time_val = row_filtered.get("entry_time", "")
                                 exit_time_val = row_filtered.get("exit_time", "")
-                                
+
                                 # Check each condition
                                 entry_time_ok = (str(entry_time_val) >= start_time) or (str(entry_time_val) == "")
-                                exit_time_ok = (str(exit_time_val) <= end_time) or (str(exit_time_val) == "0") or (str(entry_time_val) == "")
-                                
-                                trading_logger.log_warning("Trade with exit_keys was filtered out by DataFrame filter", {
-                                    "int_order_id": filtered_id,
-                                    "symbol": row_filtered.get("symbol", ""),
-                                    "start_time": start_time,
-                                    "end_time": end_time,
-                                    "entry_time": str(entry_time_val),
-                                    "exit_time": str(exit_time_val),
-                                    "entry_time_type": str(type(entry_time_val)),
-                                    "exit_time_type": str(type(exit_time_val)),
-                                    "entry_time_ok": entry_time_ok,
-                                    "exit_time_ok": exit_time_ok,
-                                    "trades_count_before": len(trades),
-                                    "trades_count_after": len(out),
-                                })
+                                exit_time_ok = (
+                                    (str(exit_time_val) <= end_time)
+                                    or (str(exit_time_val) == "0")
+                                    or (str(entry_time_val) == "")
+                                )
+
+                                trading_logger.log_warning(
+                                    "Trade with exit_keys was filtered out by DataFrame filter",
+                                    {
+                                        "int_order_id": filtered_id,
+                                        "symbol": row_filtered.get("symbol", ""),
+                                        "start_time": start_time,
+                                        "end_time": end_time,
+                                        "entry_time": str(entry_time_val),
+                                        "exit_time": str(exit_time_val),
+                                        "entry_time_type": str(type(entry_time_val)),
+                                        "exit_time_type": str(type(exit_time_val)),
+                                        "entry_time_ok": entry_time_ok,
+                                        "exit_time_ok": exit_time_ok,
+                                        "trades_count_before": len(trades),
+                                        "trades_count_after": len(out),
+                                    },
+                                )
                 # pnl = (out.exit_price + out.entry_price) * out.exit_quantity
                 # pnl = np.where(out["side"] == "BUY", pnl, -pnl)
                 out["mtm"] = np.where(out["exit_quantity"] != 0, out["exit_price"], out["entry_price"])
@@ -872,7 +864,7 @@ def get_pnl_table(
                     + out["entry_quantity"] * out["entry_price"]
                 )
                 out["pnl"] = out["gross_pnl"]
-                out.sort_values(["entry_time", "symbol"], ascending=[1, 1], inplace=True)
+                out.sort_values(["entry_time", "symbol"], ascending=[True, True], inplace=True)
                 out.reset_index(drop=True, inplace=True)
             else:
                 out = empty_trades
@@ -1029,7 +1021,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
             pattern = strategy + "_" + "*"
             cursor = 0
             while True:
-                cursor, keys = broker.redis_o.scan(cursor, match=pattern, count=1000)
+                cursor, keys = cast(tuple, broker.redis_o.scan(cursor, match=pattern, count=1000))
                 int_order_ids.extend(keys)
                 if cursor == 0:
                     break
@@ -1048,9 +1040,9 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
             int_order_ids = [
                 int_order_id
                 for int_order_id in int_order_ids
-                if broker.redis_o.type(int_order_id) == "hash"
-                and broker.redis_o.hexists(int_order_id, "long_symbol")
-                and long_symbol == broker.redis_o.hget(int_order_id, "long_symbol")
+                if cast(str, broker.redis_o.type(int_order_id)) == "hash"
+                and cast(bool, broker.redis_o.hexists(int_order_id, "long_symbol"))
+                and long_symbol == cast(str, broker.redis_o.hget(int_order_id, "long_symbol"))
             ]
         except Exception as e:
             context = create_error_context(
@@ -1064,9 +1056,9 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
             try:
                 entry_keys = []
                 for int_order_id in int_order_ids:
-                    symbol = broker.redis_o.hget(int_order_id, "long_symbol")
+                    symbol = cast(str, broker.redis_o.hget(int_order_id, "long_symbol"))
                     combo = True if ":" in symbol else False
-                    entry_keys_str = broker.redis_o.hget(int_order_id, "entry_keys")
+                    entry_keys_str = cast(str, broker.redis_o.hget(int_order_id, "entry_keys"))
                     if entry_keys_str:
                         entry_keys.append(entry_keys_str.split()[0])
                     else:
@@ -1078,7 +1070,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
                 jsons = []
                 for entry_key in entry_keys:
                     if entry_key:
-                        jsons.append(broker.redis_o.hgetall(entry_key))
+                        jsons.append(cast(dict, broker.redis_o.hgetall(entry_key)))
                     else:
                         jsons.append({})
                 if combo:
@@ -1168,7 +1160,7 @@ def get_open_position_by_order(
                     continue
 
                 try:
-                    order_data = broker.redis_o.hgetall(key)
+                    order_data = cast(dict, broker.redis_o.hgetall(key))
                     if not order_data:
                         trading_logger.log_warning(
                             "No order data found for key", {"key": key, "int_order_id": int_order_id}
@@ -1219,10 +1211,10 @@ def get_open_position_by_order(
             )
         ):
             expire = True
-            entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
+            entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()  # type: ignore  # type: ignore
             entry_key = entry_keys[0]
-            exchange = hget_with_default(broker, entry_key, "exchange", "NSE")
-            exit_price = broker.get_quote(symbol, exchange).last
+            exchange = hget_with_default(broker, entry_key, "exchange", "NSE")  # type: ignore
+            exit_price = broker.get_quote(symbol, exchange).last  # type: ignore
             exit_quantity = abs(size)
             sq_off_order = Order(
                 order_type="SELL" if size > 0 else "COVER",
@@ -1243,8 +1235,8 @@ def get_open_position_by_order(
             sq_off_order.message = "Expiration Paper Order"
             sq_off_order.status = OrderStatus.FILLED
             sq_off_order.long_symbol = symbol
-            sq_off_order.scrip_code = hget_with_default(broker, entry_key, "scrip_code", "0")
-            sq_off_order.price_type = "LMT*1"
+            sq_off_order.scrip_code = int(hget_with_default(broker, entry_key, "scrip_code", "0"))  # type: ignore
+            sq_off_order.price_type = 0.0  # LMT order type
             _process_broker_order_update(broker, sq_off_order, symbol)
         return expire
 
@@ -1252,10 +1244,10 @@ def get_open_position_by_order(
     entry = True if "entry" in side else False
     exit = True if "exit" in side else False
     if entry:
-        entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
+        entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()  # type: ignore
         positions = _get_position_by_broker_order_ids(entry_keys, positions)
     if exit:
-        exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()
+        exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()  # type: ignore
         positions = _get_position_by_broker_order_ids(exit_keys, positions)
     for position in positions.values():
         position.price = position.value / position.size if position.size != 0 else 0
@@ -1399,7 +1391,7 @@ def get_limit_price(
         symbol: Trading symbol
         price_broker: Optional list of brokers for price data
         exchange: Exchange name
-        mds: Market data service channel name (str). If None or empty, uses broker quotes. 
+        mds: Market data service channel name (str). If None or empty, uses broker quotes.
              If provided (e.g., "mds"), uses market data service with that channel.
 
     Returns:
@@ -1632,7 +1624,7 @@ def transmit_exit_order(
         broker: BrokerBase,
         internal_order_id: str,
     ):
-        order_mapping = broker.redis_o.hgetall(internal_order_id)
+        order_mapping = cast(dict, broker.redis_o.hgetall(internal_order_id))
         entry_keys = order_mapping.get("entry_keys")
         if entry_keys is not None:
             entry_keys_list = entry_keys.split(" ")
@@ -1798,20 +1790,20 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
         return ""
 
     if order.order_type in ["BUY", "SHORT"]:
-        current_orders = broker.redis_o.hget(order.internal_order_id, "entry_keys")
+        current_orders = cast(str, broker.redis_o.hget(order.internal_order_id, "entry_keys"))
         new_orders = (
             str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
         )
-        broker.redis_o.hset(order.orderRef, "entry_keys", new_orders)
-        broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol)
+        cast(bool, broker.redis_o.hset(order.orderRef, "entry_keys", new_orders))
+        cast(bool, broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol))
 
     if order.order_type in ["SELL", "COVER"]:
-        current_orders = broker.redis_o.hget(order.internal_order_id, "exit_keys")
+        current_orders = cast(str, broker.redis_o.hget(order.internal_order_id, "exit_keys"))
         new_orders = (
             str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
         )
-        broker.redis_o.hset(order.orderRef, "exit_keys", new_orders)
-        broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol)
+        cast(bool, broker.redis_o.hset(order.orderRef, "exit_keys", new_orders))
+        cast(bool, broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol))
 
     broker.redis_o.hmset(str(order.broker_order_id), {key: str(val) for key, val in order.to_dict().items()})
     update_order_status(broker, order.internal_order_id, str(order.broker_order_id), eod=False)
@@ -1828,12 +1820,12 @@ def exit_is_expiration(broker: BrokerBase, internal_order_id: str) -> bool:
     Returns:
         bool: True if exit key(s) exits and are expiration(s). Else False
     """
-    exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
+    exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()  # type: ignore
     if len(exit_keys) == 0:
         return False
     out = True
     for ek in exit_keys:
-        message = broker.redis_o.hget(ek, "message")
+        message = cast(str, broker.redis_o.hget(ek, "message"))
         if message and "expir" not in message.lower():
             out = out and False
     return out
@@ -1852,7 +1844,7 @@ def delete_broker_order_id(
     """
     if broker_order_id == "0":
         logger.info(f"Deleting internal order id: {internal_order_id} and linked broker order ids")
-        order_mapping = broker.redis_o.hgetall(internal_order_id)
+        order_mapping = cast(dict, broker.redis_o.hgetall(internal_order_id))
         entry_keys = order_mapping.get("entry_keys")
         if entry_keys is not None:
             entry_keys_list = entry_keys.split(" ")
@@ -1868,13 +1860,14 @@ def delete_broker_order_id(
         logger.info(f"Deleting order. Order {internal_order_id}")
         broker.redis_o.delete(internal_order_id)
     else:
-        order_mapping = broker.redis_o.hgetall(internal_order_id)
+        order_mapping = cast(dict, broker.redis_o.hgetall(internal_order_id))
         if len(order_mapping) == 0:
             logger.info(f"Internal Order ID: {internal_order_id} not found")
             return
         # check if removal is from entry
-        if str(broker_order_id) in order_mapping.get("entry_keys"):
-            entry_keys = order_mapping.get("entry_keys").split()
+        entry_keys = order_mapping.get("entry_keys")
+        if entry_keys is not None and str(broker_order_id) in entry_keys:
+            entry_keys = entry_keys.split()
             entry_keys.remove(str(broker_order_id))
             logger.info(f"Deleting broker order id: {broker_order_id}")
             exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
@@ -1904,14 +1897,16 @@ def delete_broker_order_id(
                 logger.info(
                     f"Deleting unfilled order and updating internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
                 )
-        elif order_mapping.get("exit_keys") is not None and str(broker_order_id) in order_mapping.get("exit_keys"):
-            # check if removal is from exit
-            exit_keys = order_mapping.get("exit_keys").split()
-            exit_keys.remove(str(broker_order_id))
-            if len(exit_keys) == 0:
+        else:
+            exit_keys = order_mapping.get("exit_keys")
+            if exit_keys is not None and str(broker_order_id) in exit_keys:
+                # check if removal is from exit
+                exit_keys_list = exit_keys.split()
+            exit_keys_list.remove(str(broker_order_id))
+            if len(exit_keys_list) == 0:
                 order_mapping.pop("exit_keys")
             else:
-                order_mapping["exit_keys"] = " ".join(exit_keys)
+                order_mapping["exit_keys"] = " ".join(exit_keys_list)
             pipe = broker.redis_o.pipeline()
             pipe.delete(internal_order_id)
             pipe.hmset(internal_order_id, order_mapping)
@@ -1925,54 +1920,25 @@ def delete_broker_order_id(
 
 def update_order_status(
     broker: BrokerBase, internal_order_id: str, broker_order_id: str, eod: bool = False
-) -> OrderInfo:
+) -> Optional[OrderInfo]:
     """
     if eod is false, [price,quantity,status] is updated to [fill_price/order_price,order_size,orderstatus]
     if eod is true, [price,quantity,status] is updated to [fill_price,fill_size,orderstatus]. in addition to eod functionality, order is deleted if fill_size is zero
     """
-    # Debug: Log before calling get_order_info, especially for exit orders
-    try:
-        # Check if this is an exit order by checking if broker_order_id is in exit_keys
-        exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
-        is_exit_order = broker_order_id in exit_keys
-        if is_exit_order:
-            trading_logger.log_debug("Calling get_order_info for exit order in update_order_status", {
-                "internal_order_id": internal_order_id,
-                "broker_order_id": broker_order_id,
-                "eod": eod,
-                "exit_keys": exit_keys,
-            })
-    except Exception:
-        pass  # Don't fail if we can't check exit_keys
-    
+    # Skip refresh if broker_order_id is invalid (e.g., "0" for paper orders or missing IDs)
+    if not broker_order_id or broker_order_id == "0":
+        return None
+
     try:
         fills = broker.get_order_info(broker_order_id=broker_order_id)
-        
-        # Debug: Log result of get_order_info for exit orders
-        try:
-            exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
-            is_exit_order = broker_order_id in exit_keys
-            if is_exit_order:
-                trading_logger.log_debug("get_order_info result for exit order", {
-                    "internal_order_id": internal_order_id,
-                    "broker_order_id": broker_order_id,
-                    "status": fills.status.name if hasattr(fills.status, 'name') else str(fills.status),
-                    "fill_size": fills.fill_size if hasattr(fills, 'fill_size') else None,
-                    "fill_price": fills.fill_price if hasattr(fills, 'fill_price') else None,
-                    "order_size": fills.order_size if hasattr(fills, 'order_size') else None,
-                    "order_price": fills.order_price if hasattr(fills, 'order_price') else None,
-                })
-        except Exception:
-            pass  # Don't fail if we can't log
     except Exception as e:
         trading_logger.log_error(
-            f"Error calling get_order_info in update_order_status",
+            "Error calling get_order_info in update_order_status",
             e,
             {"internal_order_id": internal_order_id, "broker_order_id": broker_order_id},
         )
-        # Don't re-raise - the error is already logged and the caller handles exceptions
-        # Returning None to indicate failure (caller doesn't use return value anyway)
         return None
+
     required_attributes = [
         "broker",
         "status",
@@ -1991,7 +1957,7 @@ def update_order_status(
 
     if broker.broker != fills.broker:
         return fills
-    logger.debug(f"Order information for {internal_order_id}, broker_order_id: {broker_order_id} {fills}")
+
     if fills.status == OrderStatus.CANCELLED and fills.fill_size > 0:
         broker.redis_o.hset(broker_order_id, "price", str(fills.fill_price))
         broker.redis_o.hset(broker_order_id, "quantity", str(fills.fill_size))
@@ -2032,7 +1998,9 @@ def update_order_status(
     symbol_name=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
-def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = "", exchange: str = "NSE") -> list[str]:
+def get_linked_options(
+    broker: BrokerBase, symbol_name: str, expiry: Optional[str] = None, exchange: str = "NSE"
+) -> list[str]:
     """Get option chain with enhanced error handling.
 
     Args:
@@ -2054,8 +2022,17 @@ def get_linked_options(broker: BrokerBase, symbol_name: str, expiry: str = "", e
     short_symbol = symbol_name.split("_")[0]
     linked_options = []
     if expiry:
-        expiry, _ = valid_datetime(expiry, "%Y%m%d")
-        symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_{expiry}")]
+        try:
+            parsed_expiry = parse_datetime(expiry)
+            expiry_parsed = True
+        except (ValueError, TypeError):
+            parsed_expiry = None
+            expiry_parsed = False
+        if expiry_parsed:
+            expiry_str = parsed_expiry.strftime("%Y%m%d")
+            symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_{expiry_str}")]
+        else:
+            symbols = []
     else:
         symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_")]
     linked_options = list(symbols)
@@ -2096,7 +2073,9 @@ def get_latest_symbol_file(directory_path="/home/psharma/onedrive/data/static/sy
     return latest_file
 
 
-def get_universe(file_path: str = "", product_types=["OPT", "FUT"], exchanges=["N", "B"], expiry=None):
+def get_universe(
+    file_path: Optional[str] = "", product_types=["OPT", "FUT"], exchanges=["N", "B"], expiry: Optional[str] = None
+) -> List[str]:
     """Get list of all symbols for a given product type and exchange
 
     Args:
@@ -2110,6 +2089,8 @@ def get_universe(file_path: str = "", product_types=["OPT", "FUT"], exchanges=["
     """
     if not file_path:
         file_path = get_latest_symbol_file()
+    if file_path is None:
+        raise FileNotFoundError("No symbol files found")
     symbols = pd.read_csv(file_path)
     out: List[str] = []
 
@@ -2123,7 +2104,12 @@ def get_universe(file_path: str = "", product_types=["OPT", "FUT"], exchanges=["
             if expiry is not None:
                 condition &= symbols["long_symbol"].str.contains(expiry)
 
-            temp = list(symbols.loc[condition, "long_symbol"])
+            # Always get a Series by using proper pandas indexing, then convert to list
+            matching_rows = symbols.loc[condition]
+            if not matching_rows.empty:
+                temp = matching_rows["long_symbol"].tolist()
+            else:
+                temp = []
             out = out + temp
     return out
 
@@ -2166,9 +2152,19 @@ def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str =
         return []
 
     # Filter and extract unique short names
+    # Ensure long_symbol column is treated as strings
+    symbols["long_symbol"] = symbols["long_symbol"].astype(str)
     filtered_symbols = symbols[(symbols.Exch == exchange) & (symbols.long_symbol.str.contains(f"_{sec_type}"))]
-    short_names = filtered_symbols["long_symbol"].str.split("_").str[0].unique()
-    return list(short_names)
+
+    # Extract and process the long_symbol column as pandas Series
+    long_symbol_series = pd.Series(filtered_symbols["long_symbol"], dtype=str)
+    short_names = long_symbol_series.str.split("_").str[0].unique()
+    # Ensure short_names is always iterable before converting to list
+    if isinstance(short_names, (list, tuple, np.ndarray)):
+        return list(short_names)
+    else:
+        # Handle scalar case
+        return [short_names] if short_names is not None else []
 
 
 @log_execution_time
@@ -2237,7 +2233,7 @@ def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = "", ex
         return 1000000
 
 
-def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: str = "") -> int:
+def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: Optional[str] = "") -> int:
     """Get margin from SAMCO for option contracts
 
     Args:
@@ -2342,7 +2338,7 @@ def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: str = "") -
     return output
 
 
-def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = "", proxy: str = "") -> int:
+def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = "", proxy: Optional[str] = "") -> int:
     output = 1000000
     strike = long_symbol.split("_")[4]
     type = long_symbol.split("_")[3].lower()
@@ -2432,7 +2428,7 @@ def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = ""
     return output
 
 
-def get_free_proxy(driver_path: str = "") -> str:
+def get_free_proxy(driver_path: str = "") -> Optional[str]:
     """Get working proxy. This requires firefox driver (geckodriver) to be available in specified driver path
 
     Args:
@@ -2482,13 +2478,17 @@ def get_free_proxy(driver_path: str = "") -> str:
         except Exception:
             logger.exception("Error")
             continue
-    
+
     if selected_proxy_index is None:
         logger.warning("No working proxy found, returning default")
         return None
-    
+
     logger.info(f"Proxy selected: {proxies[selected_proxy_index]}")
-    return proxies[selected_proxy_index].get("IP Address", "127.0.0.1") + ":" + proxies[selected_proxy_index].get("Port", "0")
+    return (
+        proxies[selected_proxy_index].get("IP Address", "127.0.0.1")
+        + ":"
+        + proxies[selected_proxy_index].get("Port", "0")
+    )
 
 
 @log_execution_time
@@ -2531,7 +2531,7 @@ def review_price_history(symbol: str, exchange: str = "NSE", count: int = 1):
     """Retrieve the last `count` prices for a symbol from Redis."""
     global mds_history
     price_history_key = f"price_history:{symbol}~{exchange}"
-    price_history = mds_history.zrevrange(price_history_key, 0, 0)
+    price_history = cast(list, mds_history.zrevrange(price_history_key, 0, 0))
     return [json.loads(price) for price in price_history]
 
 
@@ -2550,9 +2550,18 @@ def is_within_60_seconds(json_price):
     # Parse the timestamp string into a datetime object
     price = Price.from_dict(json_price)
     try:
-        timestamp, _ = valid_datetime(price.timestamp)
+        try:
+            timestamp = parse_datetime(price.timestamp)
+            timestamp_parsed = True
+        except (ValueError, TypeError):
+            timestamp = None
+            timestamp_parsed = False
+        if not timestamp_parsed:
+            return False  # Return False if timestamp parsing failed
     except ValueError:
         return False  # Return False if the timestamp format is invalid
+    # Ensure timestamp is a datetime object for type checker
+    assert isinstance(timestamp, dt.datetime), f"Expected datetime object, got {type(timestamp)}"
     now = dt.datetime.now()
     return now <= timestamp + dt.timedelta(seconds=60)
 
@@ -2629,6 +2638,7 @@ def get_price(
                         )
                         return out
                 except Exception as e:
+                    err_msg = f"{type(e).__name__}: {getattr(e, 'message', str(e))}"
                     trading_logger.log_warning(
                         f"Failed to get price for {long_symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
                         {
@@ -2636,7 +2646,7 @@ def get_price(
                             "exchange": exchange,
                             "attempt": attempt + 1,
                             "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
-                            "error": str(e),
+                            "error": err_msg,
                         },
                     )
                     continue
@@ -2659,6 +2669,7 @@ def get_price(
                             valid_price_found = True
                             break  # Stop attempts for this symbol if a valid price is found
                     except Exception as e:
+                        err_msg = f"{type(e).__name__}: {getattr(e, 'message', str(e))}"
                         trading_logger.log_warning(
                             f"Failed to get price for {symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
                             {
@@ -2666,7 +2677,7 @@ def get_price(
                                 "exchange": exchange,
                                 "attempt": attempt + 1,
                                 "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
-                                "error": str(e),
+                                "error": err_msg,
                             },
                         )
                         continue
@@ -2704,7 +2715,13 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
 
 
 def get_option_underlying_price(
-    brokers: list[BrokerBase], symbol: str, opt_expiry: str, fut_expiry: str = "", exchange="NSE", mds: Optional[str] = None, last=False
+    brokers: list[BrokerBase],
+    symbol: str,
+    opt_expiry: str,
+    fut_expiry: Optional[str] = "",
+    exchange="NSE",
+    mds: Optional[str] = None,
+    last=False,
 ) -> float:
     """Retrieve underlying price for a symbol and interpolates, if if needed
 
@@ -2748,7 +2765,12 @@ def get_option_underlying_price(
 
 
 def calculate_delta(
-    brokers: list[BrokerBase], long_symbol, price_f, market_close_time="15:30:00", exchange="NSE", mds: Optional[str] = None
+    brokers: list[BrokerBase],
+    long_symbol,
+    price_f,
+    market_close_time="15:30:00",
+    exchange="NSE",
+    mds: Optional[str] = None,
 ):
     delta = float("nan")
     ticker = get_price(brokers, long_symbol, checks=["bid", "ask", "prior_close"], exchange=exchange, mds=mds)
@@ -2906,7 +2928,7 @@ def get_delta_strike(
         search_range: Range around underlying price to search
         market_close_time: Market close time
         exchange: Exchange name
-        mds: Market data service channel name (str). If None or empty, uses broker quotes. 
+        mds: Market data service channel name (str). If None or empty, uses broker quotes.
              If provided (e.g., "mds"), uses market data service with that channel.
 
     Returns:
@@ -2991,6 +3013,7 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
         additional_info = (additional_info + [""] * n)[:n]
     include_triggers = trigger_prices is not None
     if include_triggers:
+        assert trigger_prices is not None  # Type narrowing for mypy
         if not isinstance(trigger_prices, list):
             trigger_prices = [trigger_prices]
         if len(trigger_prices) < n:
@@ -3002,11 +3025,15 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
     # Zip the relevant pairs based on whether exchanges are provided
     if exchanges is not None:
         if include_triggers:
+            # Type assertion: trigger_prices is guaranteed to be not None here
+            assert trigger_prices is not None
             zipped_pairs = list(zip(quantities, symbols, exchanges, price_types, additional_info, trigger_prices))
         else:
             zipped_pairs = list(zip(quantities, symbols, exchanges, price_types, additional_info))
     else:
         if include_triggers:
+            # Type assertion: trigger_prices is guaranteed to be not None here
+            assert trigger_prices is not None
             zipped_pairs = list(zip(quantities, symbols, price_types, additional_info, trigger_prices))
         else:
             zipped_pairs = list(zip(quantities, symbols, price_types, additional_info))
@@ -3041,19 +3068,31 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
                     sorted_order_types,
                     sorted_additional_info,
                 ) = zip(*sorted_pairs)
-        return (
-            list(sorted_symbols),
-            list(sorted_quantities),
-            list(sorted_order_types),
-            list(sorted_exchanges),
-            list(sorted_additional_info),
-            list(sorted_triggers) if include_triggers else None,
-        )
+        if include_triggers:
+            # Type assertion: sorted_triggers is guaranteed to be a list when include_triggers is True
+            assert sorted_triggers is not None
+            return (
+                list(sorted_symbols),
+                list(sorted_quantities),
+                list(sorted_order_types),
+                list(sorted_exchanges),
+                list(sorted_additional_info),
+                list(sorted_triggers),
+            )
+        else:
+            return (
+                list(sorted_symbols),
+                list(sorted_quantities),
+                list(sorted_order_types),
+                list(sorted_exchanges),
+                list(sorted_additional_info),
+                [],
+            )
     else:
         if not sorted_pairs:
             if include_triggers:
                 return [], [], [], [], []
-            return [], [], [], []
+            return [], [], [], [], []
         if include_triggers:
             (
                 sorted_quantities,
@@ -3071,7 +3110,13 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
             )
         else:
             sorted_quantities, sorted_symbols, sorted_order_types, sorted_additional_info = zip(*sorted_pairs)
-            return list(sorted_symbols), list(sorted_quantities), list(sorted_order_types), list(sorted_additional_info)
+            return (
+                list(sorted_symbols),
+                list(sorted_quantities),
+                list(sorted_order_types),
+                list(sorted_additional_info),
+                [],
+            )
 
 
 @log_execution_time
@@ -3091,7 +3136,7 @@ def place_combo_order(
     exchanges: list[str] = ["NSE"],
     price_broker: Optional[List[BrokerBase]] = None,
     price_types: list = [],
-    trigger_prices: Union[List[float], float, None] = None,
+    trigger_prices: Union[Sequence[float], float, None] = None,
     validate_db_position: bool = True,
     paper: bool = True,
 ) -> dict:
@@ -3154,11 +3199,23 @@ def place_combo_order(
     if trigger_prices is None:
         trigger_prices = [float("nan")] * len(symbols)
     elif isinstance(trigger_prices, list):
-        trigger_prices = (trigger_prices + [trigger_prices[-1]] * len(symbols))[: len(symbols)] if trigger_prices else [
-            float("nan")
-        ] * len(symbols)
+        trigger_prices = (
+            (trigger_prices + [trigger_prices[-1]] * len(symbols))[: len(symbols)]
+            if trigger_prices
+            else [float("nan")] * len(symbols)
+        )
     else:
-        trigger_prices = [trigger_prices] * len(symbols)
+        # trigger_prices is guaranteed to be a scalar (float/int) here, not a sequence
+        trigger_prices = [float(trigger_prices)] * len(symbols)  # type: ignore
+
+    # Ensure all variables are lists for the zip operation
+    assert isinstance(symbols, list)
+    assert isinstance(quantities, list)
+    assert isinstance(price_types, list)
+    assert isinstance(exchanges, list)
+    assert isinstance(additional_infos, list)
+    assert isinstance(trigger_prices, list)
+
     exchanges = [
         execution_broker.map_exchange_for_api(symbol, exchange) for symbol, exchange in zip(symbols, exchanges)
     ]
@@ -3172,7 +3229,7 @@ def place_combo_order(
     ) = _sort_list(symbols, quantities, price_types, additional_infos, exchanges, trigger_prices)
     out = {}
     for symbol, exchange, quantity, price_type, additional_info, trigger_price in zip(
-        symbols, exchanges, quantities, price_types, additional_infos, trigger_prices
+        symbols, exchanges, quantities, price_types, additional_infos, trigger_prices  # type: ignore
     ):
         size = quantity
         if entry:
@@ -3214,7 +3271,7 @@ def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds: Optional[st
     Args:
         brokers: List of broker instances
         pnl: Profit DataFrame with open trades
-        mds: Market data service channel name (str). If None or empty, uses broker quotes. 
+        mds: Market data service channel name (str). If None or empty, uses broker quotes.
              If provided (e.g., "mds"), uses market data service with that channel.
 
     Returns:
@@ -3342,7 +3399,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
         """Fetch the price from Redis using the broker_order_id and ensure it matches the long_symbol."""
         if brok is None:
             return 0
-        order_data = brok.redis_o.hgetall(broker_order_id)
+        order_data = cast(dict, brok.redis_o.hgetall(broker_order_id))
         if order_data.get("long_symbol") == long_symbol:
             return float(order_data.get("price", 0))
         return 0
@@ -3353,18 +3410,21 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
         dataframe["commission"] = 0.0
 
     for index, row in dataframe.iterrows():
-        symbol_parts = row["symbol"].split("_", 2)
+        symbol_str = str(row["symbol"])
+        symbol_parts = symbol_str.split("_", 2)
         if len(symbol_parts) < 2:
             continue  # Skip if the symbol is not in the expected format
-        entry_date = row["entry_time"][0:10]
-        exit_date = row["exit_time"][0:10]
+        entry_date = str(row["entry_time"])[:10]
+        exit_date = str(row["exit_time"])[:10]
         entry_gst = config.get_commission_by_date(entry_date, f"{broker_name}.GST", 0)
         exit_gst = config.get_commission_by_date(exit_date, f"{broker_name}.GST", 0)
 
         # Check if the symbol is a combo symbol and split it into legs
-        legs = row["symbol"].split(":") if ":" in row["symbol"] else [row["symbol"]]
-        entry_keys = row["entry_keys"].split(" ") if "entry_keys" in row and row["entry_keys"] else []
-        exit_keys = row["exit_keys"].split(" ") if "exit_keys" in row and row["exit_keys"] else []
+        legs = symbol_str.split(":") if ":" in symbol_str else [symbol_str]
+        entry_keys_str = str(row.get("entry_keys", ""))
+        entry_keys = entry_keys_str.split(" ") if entry_keys_str else []
+        exit_keys_str = str(row.get("exit_keys", ""))
+        exit_keys = exit_keys_str.split(" ") if exit_keys_str else []
         total_commission = 0
         if len(legs) > 1 and brok is None:
             raise ValueError("brok needs to be specfied for combo trades")
@@ -3378,9 +3438,9 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
 
             # Determine the trade_side for each leg based on leg_size
             if leg_size > 0:
-                trade_side = row["side"]
+                trade_side = str(row["side"])
             else:
-                trade_side = "SHORT" if row["side"] == "BUY" else "BUY"
+                trade_side = "SHORT" if str(row["side"]) == "BUY" else "BUY"
 
             exit_side = "SHORT" if trade_side == "BUY" else "BUY"  # Determine exit side
 
@@ -3467,7 +3527,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
             total_commission += entry_commission + exit_commission
 
         # Update the dataframe with the total commission for the combo symbol
-        dataframe.at[index, "commission"] = round(total_commission, 0)
+        dataframe.at[index, "commission"] = round(float(total_commission), 0)
 
     return dataframe
 
@@ -3523,11 +3583,11 @@ def register_strategy_capital(
 ) -> bool:
     """
     Register strategy capital allocation and broker capital availability in Redis DB 0.
-    
+
     Updates the consolidated JSON key:
     - capital:user:{username}:registration:{YYYYMMDD} when username is provided
     - capital:registration:{YYYYMMDD} otherwise
-    
+
     Args:
         strategy_name: Strategy/algorithm name
         broker: BrokerBase instance (used to get broker name and available capital)
@@ -3536,7 +3596,7 @@ def register_strategy_capital(
         redis_port: Redis port (default: 6379)
         date: Date in YYYYMMDD format (defaults to today)
         username: Optional username (when provided, writes to user-scoped key)
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
@@ -3544,23 +3604,26 @@ def register_strategy_capital(
         # Determine date
         if date is None:
             date = dt.datetime.now().strftime("%Y%m%d")
-        
+
         # Get broker name
-        if hasattr(broker, 'broker') and broker.broker:
+        if hasattr(broker, "broker") and broker.broker:
             try:
                 broker_name = broker.broker.name
             except AttributeError:
                 broker_name = "UNKNOWN"
         else:
             broker_name = "UNKNOWN"
-        
+
         # Get broker available capital
         try:
             capital_dict = broker.get_available_capital()
             if not isinstance(capital_dict, dict):
                 # Fallback for old implementations that might still return float
                 logger.warning(f"get_available_capital returned non-dict type {type(capital_dict)}, converting to dict")
-                capital_dict = {"cash": float(capital_dict) if isinstance(capital_dict, (int, float)) else 0.0, "collateral": 0.0}
+                capital_dict = {
+                    "cash": float(capital_dict) if isinstance(capital_dict, (int, float)) else 0.0,
+                    "collateral": 0.0,
+                }
             # Ensure both keys exist
             cash = capital_dict.get("cash", 0.0)
             collateral = capital_dict.get("collateral", 0.0)
@@ -3569,71 +3632,104 @@ def register_strategy_capital(
             logger.warning(f"Failed to get available capital from broker {broker_name}: {e}")
             capital_dict = {"cash": 0.0, "collateral": 0.0}
             capital_available = 0.0
-        
+
         # Connect to Redis DB 0
         redis_conn = redis.Redis(host=redis_host, db=0, port=redis_port, decode_responses=True)
-        
-        # Get or create registration data
+        logger.info(f"Connected to Redis at {redis_host}:{redis_port} DB 0 for capital registration")
+
+        # Define registration key
         if username:
             registration_key = f"capital:user:{username}:registration:{date}"
         else:
             registration_key = f"capital:registration:{date}"
-        existing_data_str = redis_conn.get(registration_key)
-        
-        if existing_data_str:
+
+        # Use Redis transactions to ensure atomic read-modify-write operations
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                registration_data = json.loads(existing_data_str)
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse existing registration data for {date}, creating new")
-                registration_data = {
-                    "date": date,
-                    "brokers": {},
-                    "strategies": {},
-                    "last_updated": dt.datetime.now().isoformat(),
-                }
-        else:
-            registration_data = {
-                "date": date,
-                "brokers": {},
-                "strategies": {},
-                "last_updated": dt.datetime.now().isoformat(),
-            }
-        
-        # Update broker capital (store both individual values and total)
-        current_time = dt.datetime.now().isoformat()
-        registration_data["brokers"][broker_name] = {
-            "capital_available": capital_available,  # Total for backward compatibility
-            "cash": capital_dict.get("cash", 0.0),
-            "collateral": capital_dict.get("collateral", 0.0),
-            "timestamp": current_time,
-        }
-        
-        # Update strategy registration
-        registration_data["strategies"][strategy_name] = {
-            "broker": broker_name,
-            "capital_allocated": capital_allocated,
-            "timestamp": current_time,
-        }
-        if username:
-            registration_data["strategies"][strategy_name]["username"] = username
-        
-        # Update last_updated timestamp
-        registration_data["last_updated"] = current_time
-        
-        # Save back to Redis
-        redis_conn.set(registration_key, json.dumps(registration_data))
-        
+                with redis_conn.pipeline() as pipe:
+                    # Watch the key for changes
+                    pipe.watch(registration_key)
+                    logger.info(f"Watching registration key: {registration_key}")
+
+                    # Get current data
+                    existing_data_str = pipe.get(registration_key)
+                    logger.info(f"Current registration data length: {len(existing_data_str) if existing_data_str else 0}")
+
+                    if existing_data_str:
+                        try:
+                            registration_data = json.loads(existing_data_str)  # type: ignore
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse existing registration data for {date}, creating new")
+                            registration_data = {
+                                "date": date,
+                                "brokers": {},
+                                "strategies": {},
+                                "last_updated": dt.datetime.now().isoformat(),
+                            }
+                    else:
+                        registration_data = {
+                            "date": date,
+                            "brokers": {},
+                            "strategies": {},
+                            "last_updated": dt.datetime.now().isoformat(),
+                        }
+
+                    # Update broker capital (store both individual values and total)
+                    current_time = dt.datetime.now().isoformat()
+                    registration_data["brokers"][broker_name] = {
+                        "capital_available": capital_available,  # Total for backward compatibility
+                        "cash": capital_dict.get("cash", 0.0),
+                        "collateral": capital_dict.get("collateral", 0.0),
+                        "timestamp": current_time,
+                    }
+
+                    # Update strategy registration
+                    registration_data["strategies"][strategy_name] = {
+                        "broker": broker_name,
+                        "capital_allocated": capital_allocated,
+                        "timestamp": current_time,
+                    }
+                    if username:
+                        registration_data["strategies"][strategy_name]["username"] = username
+
+                    # Update last_updated timestamp
+                    registration_data["last_updated"] = current_time
+                    logger.info(f"Saving registration data with {len(registration_data.get('strategies', {}))} strategies and {len(registration_data.get('brokers', {}))} brokers")
+
+                    # Atomically update the registration data
+                    pipe.multi()
+                    pipe.set(registration_key, json.dumps(registration_data))
+                    result = pipe.execute()
+                    logger.info(f"Redis transaction executed for key {registration_key}, result: {result}")
+
+                # Success - break out of retry loop
+                logger.info(f"Successfully updated capital registration for {strategy_name} with broker {broker_name}")
+                break
+
+            except redis.WatchError:
+                # Another client modified the key, retry
+                if attempt < max_retries - 1:
+                    logger.debug(f"Registration key {registration_key} modified by another client, retrying (attempt {attempt + 1}/{max_retries})")
+                    continue
+                else:
+                    logger.error(f"Failed to update registration data after {max_retries} attempts due to concurrent modifications")
+                    return False
+            except Exception as e:
+                logger.error(f"Unexpected error during registration update: {e}")
+                return False
+
         # Also register broker in strategy:broker_universe set
         try:
             # Get Redis DB number from broker's redis_o connection
             redis_db = 0  # Default
-            if hasattr(broker, 'redis_o') and broker.redis_o:
+            if hasattr(broker, "redis_o") and broker.redis_o:
                 # Try to get DB number from connection pool
-                if hasattr(broker.redis_o, 'connection_pool'):
+                if hasattr(broker.redis_o, "connection_pool"):
                     pool = broker.redis_o.connection_pool
-                    if hasattr(pool, 'connection_kwargs') and 'db' in pool.connection_kwargs:
-                        redis_db = pool.connection_kwargs['db']
-            
+                    if hasattr(pool, "connection_kwargs") and "db" in pool.connection_kwargs:
+                        redis_db = pool.connection_kwargs["db"]
+
             # Add broker:DB entry to strategy:broker_universe set
             broker_universe_key = "strategy:broker_universe"
             broker_entry = f"{broker_name}:{redis_db}"
@@ -3642,13 +3738,27 @@ def register_strategy_capital(
         except Exception as e:
             # Non-critical error, log but don't fail the registration
             logger.warning(f"Failed to register broker in strategy:broker_universe: {e}")
-        
+
         logger.info(
             f"Registered strategy capital: {strategy_name} with broker {broker_name}, "
             f"allocated={capital_allocated}, broker_capital={capital_available}"
         )
+
+        # Verify the data was actually saved
+        try:
+            saved_data = redis_conn.get(registration_key)
+            if saved_data:
+                saved_json = json.loads(saved_data)
+                strategies = list(saved_json.get('strategies', {}).keys())
+                brokers = list(saved_json.get('brokers', {}).keys())
+                logger.info(f"Verification: Redis key {registration_key} contains strategies={strategies}, brokers={brokers}")
+            else:
+                logger.error(f"Verification FAILED: Redis key {registration_key} is empty or missing after successful registration")
+        except Exception as e:
+            logger.error(f"Verification FAILED: Could not read back Redis key {registration_key}: {e}")
+
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to register strategy capital: {e}", exc_info=True)
         return False
