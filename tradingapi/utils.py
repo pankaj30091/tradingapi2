@@ -196,8 +196,9 @@ def publish_trades_to_redis(
                     exit_time_empty = (
                         (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
                     )
-                    exit_time_today_or_later = safe_datetime_compare(trades.exit_time, today_start, ">=")
-                    exit_time_still_open = exit_time_empty | exit_time_today_or_later
+                    # A trade is still open if it has no exit recorded OR has open quantity
+                    # (don't consider trades with exit times as "still open", even if exit was today)
+                    exit_time_still_open = exit_time_empty
                     still_open = has_open_position | exit_time_still_open
                 else:
                     # Fallback if quantity columns missing
@@ -205,8 +206,9 @@ def publish_trades_to_redis(
                     exit_time_empty = (
                         (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
                     )
-                    exit_time_today_or_later = safe_datetime_compare(trades.exit_time, today_start, ">=")
-                    still_open = exit_time_empty | exit_time_today_or_later
+                    # A trade is still open if it has no exit recorded
+                    # (don't consider trades with exit times as "still open", even if exit was today)
+                    still_open = exit_time_empty
 
                 open_from_earlier = entry_before_today & still_open
 
