@@ -185,7 +185,7 @@ def publish_trades_to_redis(
                 today_trades = entry_today | exit_today
 
                 # Open trades from earlier days (entered before today, still have open position)
-                entry_before_today = safe_datetime_compare(trades.entry_time, today_start, "<") & ~trades.entry_time.astype(str).isin(['', 'nan', 'NaT'])
+                entry_before_today = safe_datetime_compare(trades.entry_time, today_start, "<")
 
                 # Check if position is still open
                 if "entry_quantity" in trades.columns and "exit_quantity" in trades.columns:
@@ -196,7 +196,7 @@ def publish_trades_to_redis(
                     exit_time_empty = (
                         (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
                     )
-                    exit_time_today_or_later = safe_datetime_compare(trades.exit_time, today_start, ">=") & ~trades.exit_time.astype(str).isin(['', 'nan', 'NaT'])
+                    exit_time_today_or_later = safe_datetime_compare(trades.exit_time, today_start, ">=")
                     exit_time_still_open = exit_time_empty | exit_time_today_or_later
                     still_open = has_open_position | exit_time_still_open
                 else:
@@ -205,7 +205,7 @@ def publish_trades_to_redis(
                     exit_time_empty = (
                         (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
                     )
-                    exit_time_today_or_later = safe_datetime_compare(trades.exit_time, today_start, ">=") & ~trades.exit_time.astype(str).isin(['', 'nan', 'NaT'])
+                    exit_time_today_or_later = safe_datetime_compare(trades.exit_time, today_start, ">=")
                     still_open = exit_time_empty | exit_time_today_or_later
 
                 open_from_earlier = entry_before_today & still_open
