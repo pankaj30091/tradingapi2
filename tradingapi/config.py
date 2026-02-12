@@ -2,7 +2,7 @@ import datetime as dt
 import logging
 import os
 import sys
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, cast
 from pathlib import Path
 
 import yaml
@@ -311,6 +311,15 @@ class Config:
             )
             return default
 
+    def keys(self):
+        """
+        Return the keys of the configuration dictionary.
+
+        Returns:
+            Keys of the configuration dictionary.
+        """
+        return self.configs.keys()
+
     def get_commission_by_date(self, target_date: str, key_path: str, default: Any = None) -> Union[float, int]:
         """
         Get commission value for a specific date with enhanced validation and error handling.
@@ -529,7 +538,7 @@ def get_config() -> Config:
         )
         raise ConfigurationError("Configuration has not been loaded yet.", context)
 
-    return _config_instance
+    return cast(Config, _config_instance)
 
 
 # Example usage with enhanced error handling

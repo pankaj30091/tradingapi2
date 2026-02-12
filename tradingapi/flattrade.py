@@ -25,7 +25,16 @@ import pyotp
 import pytz
 import redis
 import requests
-from chameli.dateutils import valid_datetime, get_expiry
+from chameli.dateutils import parse_datetime, get_expiry
+
+
+def _validate_datetime_input(date_input):
+    """Helper function to validate datetime input for decorators. Returns True if valid, False if invalid."""
+    try:
+        parse_datetime(date_input)
+        return True
+    except (ValueError, TypeError):
+        return False
 from NorenRestApiPy.NorenApi import NorenApi
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
@@ -57,6 +66,7 @@ logger = logging.getLogger(__name__)
 def my_handler(typ, value, trace):
     trading_logger.log_error(
         "Unhandled exception",
+        None,
         {
             "exception_type": typ.__name__,
             "exception_value": str(value),
@@ -357,7 +367,7 @@ class FlatTrade(BrokerBase):
         raise ValueError("Could not determine a valid expiry day within expected range.")
 
     def _get_tradingsymbol_from_longname(self, long_name: str, exchange: str) -> str:
-        def reverse_split_fno(long_name, exchange):
+        def reverse_split_fno(long_name: str, exchange: str) -> str:
             if exchange in ["NSE", "NFO"]:
                 parts = long_name.split("_")
                 part1 = parts[0]
@@ -370,9 +380,11 @@ class FlatTrade(BrokerBase):
                 if trading_symbol is not None:
                     return trading_symbol
                 else:
-                    return pd.NA
+                    return ""  # Return empty string for missing symbols
+            else:
+                return ""  # Return empty string for unsupported exchanges
 
-        def reverse_split_cash(long_name, exchange):
+        def reverse_split_cash(long_name: str, exchange: str) -> str:
             if exchange in ["NSE", "NFO"]:
                 parts = long_name.split("_")
                 # part1 = '-'.join(parts[0].split('-')[:-1]) if '-' in parts[0] else parts[0]
@@ -383,7 +395,7 @@ class FlatTrade(BrokerBase):
                 part1 = parts[0]
                 return f"{part1}"
             else:
-                return pd.NA
+                return ""  # Return empty string for unsupported exchanges
 
         if "FUT" in long_name or "OPT" in long_name:
             return reverse_split_fno(long_name, exchange).upper()
@@ -459,7 +471,7 @@ class FlatTrade(BrokerBase):
                     return False
 
             except Exception as e:
-                trading_logger.log_warning("Failed to restore session", e, {"broker": self.broker.name})
+                trading_logger.log_warning("Failed to restore session", {"error": str(e), "broker": self.broker.name})
                 return False
 
         def _fresh_login(susertoken_path):
@@ -721,8 +733,7 @@ class FlatTrade(BrokerBase):
                 except Exception as e:
                     trading_logger.log_warning(
                         "Error checking token file, performing fresh login",
-                        e,
-                        {"broker": self.broker.name, "susertoken_path": susertoken_path},
+                        {"error": str(e), "broker": self.broker.name, "susertoken_path": susertoken_path},
                     )
                     _fresh_login(susertoken_path)
                     return True
@@ -824,7 +835,11 @@ class FlatTrade(BrokerBase):
 
         trading_logger.log_info(
             "Connection check successful",
-            {"broker_type": self.broker.name, "cash_balance": cash_balance, "quote_last": quote.last if quote else None},
+            {
+                "broker_type": self.broker.name,
+                "cash_balance": cash_balance,
+                "quote_last": quote.last if quote else None,
+            },
         )
         return True
 
@@ -845,27 +860,19 @@ class FlatTrade(BrokerBase):
             if not self.is_connected():
                 raise BrokerConnectionError("FlatTrade broker is not connected")
 
-            limits_data = self.api.get_limits()
-            if not limits_data:
+            if self.api is None:
+                raise BrokerConnectionError("FlatTrade API is not initialized")
+
+            limits = self.api.get_limits()
+            if not limits:
                 raise MarketDataError("No limits data available")
 
-            cash = limits_data.get("cash")
+            cash = limits.get("cash")
             if cash is None:
                 raise MarketDataError("No cash information in limits")
 
             cash_float = float(cash)
-            
-            # Try to get collateral value (field name may vary)
-            collateral = 0.0
-            collateral_fields = ["collateral", "Collateral", "collateralvalue", "CollateralValue",
-                               "holdingvalue", "HoldingValue", "securityvalue", "SecurityValue"]
-            for field in collateral_fields:
-                if field in limits_data:
-                    try:
-                        collateral = float(limits_data[field])
-                        break
-                    except (ValueError, TypeError):
-                        continue
+            collateral = float(limits.get("collateral", 0))
 
             trading_logger.log_debug(
                 "Available capital retrieved",
@@ -873,7 +880,6 @@ class FlatTrade(BrokerBase):
                     "cash": cash_float,
                     "collateral": collateral,
                     "total_capital": cash_float + collateral,
-                    "broker_type": self.broker.name,
                 },
             )
             return {"cash": cash_float, "collateral": collateral}
@@ -881,9 +887,8 @@ class FlatTrade(BrokerBase):
         except (BrokerConnectionError, MarketDataError):
             raise
         except Exception as e:
-            context = create_error_context(error=str(e), broker_type=self.broker.name)
-            trading_logger.log_error("Error getting available capital", e, context)
-            raise MarketDataError(f"Failed to get available capital: {str(e)}", context)
+            trading_logger.log_error("Error getting available capital", e, {"broker": self.broker.name})
+            raise MarketDataError(f"Failed to get available capital: {str(e)}")
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
@@ -982,7 +987,8 @@ class FlatTrade(BrokerBase):
                         log_object = any_object.to_dict()  # Use the object's attributes as a dictionary
                     except Exception as e:
                         trading_logger.log_warning(
-                            "Error converting object to dict", {"error": str(e), "object_type": type(any_object).__name__}
+                            "Error converting object to dict",
+                            {"error": str(e), "object_type": type(any_object).__name__},
                         )
                         log_object = {"error": f"Error accessing to_dict: {str(e)}"}
                 else:
@@ -990,7 +996,11 @@ class FlatTrade(BrokerBase):
                     log_object = any_object
 
                 # Add the calling function name to the log
-                log_entry = {"caller": caller_function, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "object": log_object}
+                log_entry = {
+                    "caller": caller_function,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "object": log_object,
+                }
 
                 # Log the entry to Redis
                 try:
@@ -1009,7 +1019,9 @@ class FlatTrade(BrokerBase):
 
             except Exception as e:
                 context = create_error_context(object_type=type(any_object).__name__, error=str(e))
-                trading_logger.log_warning("Error logging object to Redis", {"error": str(e), "object_type": type(any_object).__name__})
+                trading_logger.log_warning(
+                    "Error logging object to Redis", {"error": str(e), "object_type": type(any_object).__name__}
+                )
                 return any_object  # Return object even if logging fails
 
         except (ValidationError, RedisError):
@@ -1030,13 +1042,16 @@ class FlatTrade(BrokerBase):
     )
     def place_order(self, order: Order, **kwargs) -> Order:
         try:
+            if self.api is None:
+                raise BrokerConnectionError("FlatTrade API is not initialized")
+
             order.broker = self.broker
 
             # Validate exchange mapping exists
             if order.exchange not in self.exchange_mappings:
                 trading_logger.log_error(
                     "Exchange not found in mappings",
-                    {"exchange": order.exchange, "available_exchanges": list(self.exchange_mappings.keys())},
+                    context={"exchange": order.exchange, "available_exchanges": list(self.exchange_mappings.keys())},
                 )
                 return order
 
@@ -1044,17 +1059,13 @@ class FlatTrade(BrokerBase):
             orig_order_type = order.order_type
 
             if order.scrip_code is not None or order.paper:  # if paper, we dont check for valid scrip_code
-                has_trigger = not math.isnan(order.trigger_price)
-                if has_trigger:
-                    order.is_stoploss_order = True
-                    order.stoploss_price = order.trigger_price
                 if order.order_type == "BUY" or order.order_type == "COVER":
                     order.order_type = "B"
                 elif order.order_type == "SHORT" or order.order_type == "SELL":
                     order.order_type = "S"
                 else:
                     trading_logger.log_error(
-                        "Invalid order type", {"order_type": order.order_type, "long_symbol": order.long_symbol}
+                        "Invalid order type", context={"order_type": order.order_type, "long_symbol": order.long_symbol}
                     )
                     return order
                 order.remote_order_id = get_tradingapi_now().strftime("%Y%m%d%H%M%S%f")[:-4]
@@ -1063,6 +1074,7 @@ class FlatTrade(BrokerBase):
                     try:
                         quantity = order.quantity
                         product_type = "C" if "_STK_" in order.long_symbol else "M"  # M is NRML , 'I' is MIS
+                        has_trigger = not math.isnan(order.trigger_price)
                         price_type = "LMT" if order.price > 0 else "MKT"
                         if has_trigger:
                             price_type = "SL-LMT" if order.price > 0 else "SL-MKT"
@@ -1071,7 +1083,7 @@ class FlatTrade(BrokerBase):
                         if not trading_symbol:
                             trading_logger.log_error(
                                 "Failed to get trading symbol",
-                                {"long_symbol": order.long_symbol, "exchange": order.exchange},
+                                context={"long_symbol": order.long_symbol, "exchange": order.exchange},
                             )
                             return order
 
@@ -1090,21 +1102,39 @@ class FlatTrade(BrokerBase):
                         )
 
                         trading_logger.log_info(
-                            "Flattrade order info", {"order_info": json.dumps(out, indent=4, default=str), "long_symbol": order.long_symbol, "broker_order_id": order.broker_order_id if hasattr(order, 'broker_order_id') else None}
+                            "FlatTrade order info",
+                            {
+                                "order_info": json.dumps(out, indent=4, default=str),
+                                "long_symbol": order.long_symbol,
+                                "broker_order_id": order.broker_order_id if hasattr(order, "broker_order_id") else None,
+                            },
                         )
 
                         if not out:
                             trading_logger.log_error(
                                 "Empty response from broker",
-                                {"order": str(order), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                context={
+                                    "order": str(order),
+                                    "long_symbol": order.long_symbol,
+                                    "internal_order_id": order.internal_order_id,
+                                },
                             )
+                            order.status = OrderStatus.REJECTED
+                            order.message = "Empty response from broker"
                             return order
 
                         if out.get("stat") is None:
                             trading_logger.log_error(
                                 "Error placing order",
-                                {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                context={
+                                    "order": str(order),
+                                    "response": str(out),
+                                    "long_symbol": order.long_symbol,
+                                    "internal_order_id": order.internal_order_id,
+                                },
                             )
+                            order.status = OrderStatus.REJECTED
+                            order.message = "Invalid response from broker"
                             return order
 
                         if out["stat"].upper() == "OK":
@@ -1116,8 +1146,15 @@ class FlatTrade(BrokerBase):
                             if not order.broker_order_id:
                                 trading_logger.log_error(
                                     "No broker order ID in response",
-                                    {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                    context={
+                                        "order": str(order),
+                                        "response": str(out),
+                                        "long_symbol": order.long_symbol,
+                                        "internal_order_id": order.internal_order_id,
+                                    },
                                 )
+                                order.status = OrderStatus.REJECTED
+                                order.message = "No broker order ID in response"
                                 return order
 
                             try:
@@ -1141,21 +1178,34 @@ class FlatTrade(BrokerBase):
                             if order.price == 0:
                                 if fills.fill_price > 0 and order.price == 0:
                                     order.price = fills.fill_price
-                            
+
                             trading_logger.log_info("Placed Order", {"order": str(order)})
                         else:
                             trading_logger.log_error(
                                 "Order placement failed",
-                                {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                context={
+                                    "order": str(order),
+                                    "response": str(out),
+                                    "long_symbol": order.long_symbol,
+                                    "internal_order_id": order.internal_order_id,
+                                },
                             )
+                            order.status = OrderStatus.REJECTED
+                            order.message = out.get("emsg", "Order placement failed")
                             return order
 
                     except Exception as e:
                         trading_logger.log_error(
                             "Exception during order placement",
                             e,
-                            {"order": str(order), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                            {
+                                "order": str(order),
+                                "long_symbol": order.long_symbol,
+                                "internal_order_id": order.internal_order_id,
+                            },
                         )
+                        order.status = OrderStatus.REJECTED
+                        order.message = f"Exception during order placement: {str(e)}"
                         return order
                 else:
                     order.order_type = orig_order_type
@@ -1196,8 +1246,16 @@ class FlatTrade(BrokerBase):
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
         broker_order_id = kwargs.get("broker_order_id")
+        if broker_order_id is None:
+            raise ValueError("broker_order_id is required")
         new_price = float(kwargs.get("new_price", 0.0))
         new_quantity = int(kwargs.get("new_quantity", 0))
+
+        # Check connection before proceeding
+        if not self.is_connected():
+            raise BrokerConnectionError("FlatTrade broker is not connected")
+
+        assert self.api is not None  # Type checker assurance after connection check
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.broker_order_id != "0":
             fills = self.get_order_info(broker_order_id=broker_order_id)
@@ -1305,21 +1363,30 @@ class FlatTrade(BrokerBase):
 
     @log_execution_time
     @validate_inputs(broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0)
-    def cancel_order(self, **kwargs):
+    def cancel_order(self, **kwargs) -> Order:
         """
         mandatory_keys = ['broker_order_id']
 
         """
+        if self.api is None:
+            raise BrokerConnectionError("FlatTrade API is not initialized")
+
         mandatory_keys = ["broker_order_id"]
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
         broker_order_id = kwargs.get("broker_order_id")
+        if broker_order_id is None:
+            raise ValueError("broker_order_id is required")
 
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.status in [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNDEFINED]:
-            valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-            if valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d"):
+            try:
+                valid_date = parse_datetime(order.remote_order_id[:8])
+                date_matches = valid_date.strftime("%Y-%m-%d") == dt.datetime.today().strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                date_matches = False
+            if date_matches:
                 fills = self.get_order_info(broker_order_id=broker_order_id)
                 if fills.fill_size < round(float(order.quantity)):
                     trading_logger.log_info(
@@ -1335,9 +1402,10 @@ class FlatTrade(BrokerBase):
                     self.log_and_return(out)
                     fills = update_order_status(self, order.internal_order_id, broker_order_id, eod=True)
                     self.log_and_return(fills)
-                    order.status = fills.status
-                    order.quantity = fills.fill_size
-                    order.price = fills.fill_price
+                    if fills is not None:
+                        order.status = fills.status
+                        order.quantity = fills.fill_size
+                        order.price = fills.fill_price
                     self.log_and_return(order)
                     return order
         self.log_and_return(order)
@@ -1351,11 +1419,19 @@ class FlatTrade(BrokerBase):
         mandatory_keys = ['broker_order_id']
 
         """
+        if self.api is None:
+            raise BrokerConnectionError("FlatTrade API is not initialized")
 
-        def return_db_as_fills(order: Order):
+        trading_logger.log_debug("Getting order info", {"broker_order_id": kwargs.get("broker_order_id")})
+
+        def return_db_as_fills(order: Order) -> OrderInfo:
             order_info = OrderInfo()
-            valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-            if valid_date and valid_date != dt.datetime.today().strftime("%Y-%m-%d"):
+            try:
+                valid_date = parse_datetime(order.remote_order_id[:8])
+                date_differs = valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                date_differs = False
+            if date_differs:
                 order_info.status = order.status
             else:
                 order_info.status = OrderStatus.HISTORICAL
@@ -1395,10 +1471,14 @@ class FlatTrade(BrokerBase):
                 broker=self.broker,
             )
 
-        valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-        if (
-            valid_date
-            and valid_date != dt.datetime.today().strftime("%Y-%m-%d")
+        try:
+            valid_date = parse_datetime(order.remote_order_id[:8])
+            date_valid = True
+        except (ValueError, TypeError):
+            date_valid = False
+        # Compare as string: valid_date is datetime from parse_datetime; only use return_db_as_fills for past days
+        if date_valid and (
+            valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
             or (order.remote_order_id != "" and order.broker != self.broker)
         ):
             return return_db_as_fills(order)
@@ -1433,8 +1513,8 @@ class FlatTrade(BrokerBase):
     @log_execution_time
     @validate_inputs(
         symbols=lambda x: x is not None and (isinstance(x, str) or isinstance(x, dict) or isinstance(x, pd.DataFrame)),
-        date_start=lambda x: valid_datetime(x)[0] is not False,
-        date_end=lambda x: valid_datetime(x)[0] is not False,
+        date_start=lambda x: _validate_datetime_input(x),
+        date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
@@ -1467,6 +1547,9 @@ class FlatTrade(BrokerBase):
             Dict[str, List[HistoricalData]]: Dictionary with historical data for each symbol.
         """
         try:
+            if self.api is None:
+                raise BrokerConnectionError("FlatTrade API is not initialized")
+
             trading_logger.log_debug(
                 "Getting historical data",
                 {
@@ -1492,51 +1575,58 @@ class FlatTrade(BrokerBase):
             if refresh_mapping:
                 try:
                     # Parse date_end to get YYYYMMDD format
-                    date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
-                    date_end_obj = dt.datetime.strptime(date_end_str, "%Y-%m-%d")
+                    try:
+                        date_end_dt = parse_datetime(date_end)
+                        date_end_str = date_end_dt.strftime("%Y-%m-%d")
+                        date_end_valid = True
+                    except (ValueError, TypeError):
+                        date_end_valid = False
+                    if not date_end_valid:
+                        raise ValueError(f"Invalid date_end format: {date_end}")
+                    date_end_obj = dt.datetime.strptime(str(date_end_str), "%Y-%m-%d")
                     date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
-                    
+
                     # Get symbol codes path from config
                     symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
                     if not symbol_codes_path:
                         context = create_error_context(broker_name=self.broker.name)
-                        raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.broker.name}", context)
-                    
+                        raise ConfigurationError(
+                            f"SYMBOLCODES path not found in config for {self.broker.name}", context
+                        )
+
                     # Construct path to symbols file
                     symbols_file_path = os.path.join(symbol_codes_path, f"{date_end_yyyymmdd}_symbols.csv")
-                    
+
                     trading_logger.log_debug(
                         "Loading symbol mapping from file",
-                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd}
+                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd},
                     )
-                    
+
                     if not os.path.exists(symbols_file_path):
                         trading_logger.log_warning(
-                            "Symbols file not found for refresh_mapping",
-                            {"symbols_file_path": symbols_file_path}
+                            "Symbols file not found for refresh_mapping", {"symbols_file_path": symbols_file_path}
                         )
                         # Fall back to default mapping
                         refresh_symbol_map = None
                     else:
                         # Load the CSV file
                         codes = pd.read_csv(symbols_file_path)
-                        
+
                         # Create symbol_map and exchangetype_map for each exchange
                         refresh_symbol_map = {}
                         refresh_exchangetype_map = {}
                         for exch, group in codes.groupby("Exch"):
                             refresh_symbol_map[exch] = dict(zip(group["long_symbol"], group["Scripcode"]))
                             refresh_exchangetype_map[exch] = dict(zip(group["long_symbol"], group["ExchType"]))
-                        
+
                         trading_logger.log_debug(
                             "Symbol mapping loaded from file",
-                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)}
+                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)},
                         )
                 except Exception as e:
                     trading_logger.log_warning(
                         "Error loading symbol mapping from file, falling back to default",
                         {"error": str(e)},
-                        exc_info=True
                     )
                     refresh_symbol_map = None
                     refresh_exchangetype_map = None
@@ -1554,7 +1644,7 @@ class FlatTrade(BrokerBase):
                     symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
                 else:
                     trading_logger.log_error(
-                        "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "string"}
+                        "Did not get ScripCode for symbols", context={"symbols": symbols, "symbol_type": "string"}
                     )
                     return {}
             elif isinstance(symbols, dict):
@@ -1563,7 +1653,7 @@ class FlatTrade(BrokerBase):
                     symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
                 else:
                     trading_logger.log_error(
-                        "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "dict"}
+                        "Did not get ScripCode for symbols", context={"symbols": symbols, "symbol_type": "dict"}
                     )
                     return {}
             else:
@@ -1584,14 +1674,43 @@ class FlatTrade(BrokerBase):
                 # we do the above remapping for downloading permin data to database for legacy reasons.
                 # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
 
-                date_start_dt, _ = valid_datetime(date_start, None)
-                date_end, _ = valid_datetime(date_end, "%Y%m%d")
-                date_end_dt, _ = valid_datetime(date_end + " " + market_close_time, None)
-                if isinstance(date_start_dt, dt.date) and not isinstance(date_start_dt, dt.datetime):
-                    date_start_dt = dt.datetime.combine(date_start_dt, dt.datetime.min.time())
-                if isinstance(date_end_dt, dt.date) and not isinstance(date_end_dt, dt.datetime):
-                    date_end_dt = dt.datetime.combine(date_end_dt, dt.datetime.min.time())
+                # Parse date_start (accepts datetime, date, or string) -> datetime for API
                 try:
+                    date_start_parsed = parse_datetime(date_start)
+                    date_start_valid = True
+                except (ValueError, TypeError):
+                    date_start_valid = False
+                if (
+                    not date_start_valid
+                    or date_start_parsed is None
+                    or not isinstance(date_start_parsed, (dt.datetime, dt.date))
+                ):
+                    raise ValueError(f"Invalid date_start format: {date_start}")
+                date_start_dt = dt.datetime.strptime(
+                    date_start_parsed.strftime("%Y-%m-%d") + " " + market_open_time,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+
+                # Parse date_end (accepts datetime, date, or string) -> datetime for API
+                try:
+                    date_end_parsed = parse_datetime(date_end)
+                    date_end_valid = True
+                except (ValueError, TypeError):
+                    date_end_valid = False
+                if (
+                    not date_end_valid
+                    or date_end_parsed is None
+                    or not isinstance(date_end_parsed, (dt.datetime, dt.date))
+                ):
+                    raise ValueError(f"Invalid date_end format: {date_end}")
+                date_end_dt = dt.datetime.strptime(
+                    date_end_parsed.strftime("%Y-%m-%d") + " " + market_close_time,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                try:
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
+                    data: Optional[List] = None
                     if periodicity.endswith("m"):
                         data = self.api.get_time_price_series(
                             exchange=exch,
@@ -1603,9 +1722,11 @@ class FlatTrade(BrokerBase):
                     elif periodicity == "1d":
                         if row_outer["long_symbol"] == "NSENIFTY_IND___":
                             row_outer["long_symbol"] = "NIFTY_IND___"
-                        trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(row_outer["long_symbol"])
+                        trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(
+                            row_outer["long_symbol"]
+                        )
 
-                        def _timeout_handler(signum, frame):
+                        def _timeout_handler(signum, frame) -> None:
                             raise TimeoutError("daily_price_series call timed out")
 
                         signal.signal(signal.SIGALRM, _timeout_handler)  # Install the handler
@@ -1658,11 +1779,12 @@ class FlatTrade(BrokerBase):
                         if isinstance(d, str):
                             d = json.loads(d)
                         if periodicity.endswith("m"):
-                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
+                            date = pd.Timestamp(
+                                timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S"))
+                            )
                             # Filter by market open/close time for intraday
                             if not (market_open <= date.time() < market_close):
                                 continue
-                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
                         elif periodicity == "1d":
                             date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
                         historical_data = HistoricalData(
@@ -1700,7 +1822,7 @@ class FlatTrade(BrokerBase):
                             today_start = get_tradingapi_now().date()
                         today_start = dt.datetime.combine(today_start, dt.datetime.min.time())
                     else:
-                        today_start = dt.datetime.combine(get_tradingapi_now().date(), dt.datetime.min.time())
+                        today_start = dt.datetime.combine(dt.datetime.today(), dt.datetime.min.time())
                     try:
                         intraday_data = self.api.get_time_price_series(
                             exchange=exch,
@@ -1710,7 +1832,9 @@ class FlatTrade(BrokerBase):
                         )
                     except Exception as e:
                         trading_logger.log_error(
-                            "Error in get_time_price_series for intraday data", e, {"long_symbol": row_outer["long_symbol"]}
+                            "Error in get_time_price_series for intraday data",
+                            e,
+                            {"long_symbol": row_outer["long_symbol"]},
                         )
                         intraday_data = None
 
@@ -1739,10 +1863,10 @@ class FlatTrade(BrokerBase):
                         date_start = timezone.localize(date_start_dt)
                         date_end = timezone.localize(date_end_dt)
                         for _, row in df_intraday.iterrows():
-                            date = pd.Timestamp(row.name).tz_localize(timezone)
+                            date = pd.Timestamp(row.name).tz_localize(timezone)  # type: ignore
                             if date_start <= date <= date_end:
                                 historical_data = HistoricalData(
-                                    date=pd.Timestamp(row.name).tz_localize(timezone),
+                                    date=date,
                                     open=row["into"],
                                     high=row["inth"],
                                     low=row["intl"],
@@ -1768,7 +1892,7 @@ class FlatTrade(BrokerBase):
             )
             return {}
 
-    def map_exchange_for_api(self, long_symbol, exchange):
+    def map_exchange_for_api(self, long_symbol, exchange) -> str:
         """
         Map the exchange for API based on the long symbol and exchange.
 
@@ -1794,7 +1918,7 @@ class FlatTrade(BrokerBase):
             }
 
             # Return mapped exchange if "N" or "B", otherwise default to the given exchange
-            result = exchange_map.get(exchange, exchange)
+            result = cast(str, exchange_map.get(exchange, exchange))
 
             trading_logger.log_debug(
                 "Exchange mapped for API",
@@ -1810,7 +1934,7 @@ class FlatTrade(BrokerBase):
             context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
             raise ValidationError(f"Unexpected error mapping exchange for API: {str(e)}", context)
 
-    def map_exchange_for_db(self, long_symbol, exchange):
+    def map_exchange_for_db(self, long_symbol, exchange) -> str:
         """
         Map the exchange for the database based on the exchange's starting letter.
 
@@ -1895,6 +2019,9 @@ class FlatTrade(BrokerBase):
         Returns:
             Price: Quote details.
         """
+        if self.api is None:
+            raise BrokerConnectionError("FlatTrade API is not initialized")
+
         try:
             trading_logger.log_debug("Fetching quote", {"long_symbol": long_symbol, "exchange": exchange})
             mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
@@ -1906,6 +2033,7 @@ class FlatTrade(BrokerBase):
             if mapped_exchange not in self.exchange_mappings:
                 trading_logger.log_error(
                     "Exchange mapping not found",
+                    None,
                     {"mapped_exchange": mapped_exchange, "available_exchanges": list(self.exchange_mappings.keys())},
                 )
                 return market_feed
@@ -1913,7 +2041,7 @@ class FlatTrade(BrokerBase):
             token = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
             if token is None:
                 trading_logger.log_error(
-                    "No token found for symbol", {"long_symbol": long_symbol, "mapped_exchange": mapped_exchange}
+                    "No token found for symbol", None, {"long_symbol": long_symbol, "mapped_exchange": mapped_exchange}
                 )
                 return market_feed  # Return default Price object if no token is found
 
@@ -2021,6 +2149,9 @@ class FlatTrade(BrokerBase):
             ext_callback (function): External callback function for processing price updates.
             exchange (str): Exchange name (default: 'NSE').
         """
+        if self.api is None:
+            raise BrokerConnectionError("FlatTrade API is not initialized")
+
         try:
             trading_logger.log_info(
                 "Starting quotes streaming",
@@ -2028,7 +2159,7 @@ class FlatTrade(BrokerBase):
             )
 
             if not symbols or len(symbols) == 0:
-                trading_logger.log_error("Symbols list cannot be empty", {"operation": operation, "exchange": exchange})
+                trading_logger.log_error("Symbols list cannot be empty", None, {"operation": operation, "exchange": exchange})
                 return
 
             prices = {}
@@ -2049,10 +2180,14 @@ class FlatTrade(BrokerBase):
                     else float(json_data.get("sp1"))
                 )
                 price.bid_volume = (
-                    float("nan") if json_data.get("bq1") in [None, 0, "0", float("nan")] else float(json_data.get("bq1"))
+                    float("nan")
+                    if json_data.get("bq1") in [None, 0, "0", float("nan")]
+                    else float(json_data.get("bq1"))
                 )
                 price.ask_volume = (
-                    float("nan") if json_data.get("sq1") in [None, 0, "0", float("nan")] else float(json_data.get("sq1"))
+                    float("nan")
+                    if json_data.get("sq1") in [None, 0, "0", float("nan")]
+                    else float(json_data.get("sq1"))
                 )
                 price.prior_close = (
                     float("nan")
@@ -2116,13 +2251,13 @@ class FlatTrade(BrokerBase):
             # Function to handle WebSocket errors
             def handle_socket_error(error=None):
                 if error:
-                    trading_logger.log_error("WebSocket error", {"error": str(error)})
+                    trading_logger.log_error("WebSocket error", None, {"error": str(error)})
                 else:
                     trading_logger.log_error("WebSocket error. Connection to remote host was lost.")
 
             def handle_socket_close(close_code=None, close_msg=None):
                 if close_msg:
-                    trading_logger.log_error("WebSocket closed", {"close_msg": str(close_msg)})
+                    trading_logger.log_error("WebSocket closed", None, {"close_msg": str(close_msg)})
                     initiate_reconnect()
 
             def initiate_reconnect(max_retries=5, retry_delay=5):
@@ -2131,7 +2266,9 @@ class FlatTrade(BrokerBase):
                 """
                 for attempt in range(max_retries):
                     try:
-                        trading_logger.log_info("Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries})
+                        trading_logger.log_info(
+                            "Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries}
+                        )
 
                         # Close the existing WebSocket connection if open
                         if hasattr(self, "api") and self.api and hasattr(self, "socket_opened") and self.socket_opened:
@@ -2140,7 +2277,7 @@ class FlatTrade(BrokerBase):
                                 self.socket_opened = False
                                 trading_logger.log_info("Closed existing WebSocket connection")
                             except Exception as e:
-                                trading_logger.log_warning("Failed to close existing WebSocket", e)
+                                trading_logger.log_warning("Failed to close existing WebSocket", {"error": str(e)})
 
                         # Reinitialize the WebSocket connection
                         connect_and_subscribe()
@@ -2167,7 +2304,9 @@ class FlatTrade(BrokerBase):
 
                         # Wait before the next retry with exponential backoff
                         wait_time = retry_delay * (2**attempt)
-                        trading_logger.log_info("Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1})
+                        trading_logger.log_info(
+                            "Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1}
+                        )
                         time.sleep(wait_time)
 
                 trading_logger.log_error("Max reconnect attempts reached. Unable to reconnect the WebSocket.")
@@ -2199,7 +2338,7 @@ class FlatTrade(BrokerBase):
                     if scrip_code:
                         req_list.append(f"{mapped_exchange}|{scrip_code}")
                     else:
-                        trading_logger.log_error("Did not find scrip_code for symbol", {"symbol": symbol})
+                        trading_logger.log_error("Did not find scrip_code for symbol", None, {"symbol": symbol})
                 return req_list
 
             # Function to update the subscription list
@@ -2240,7 +2379,10 @@ class FlatTrade(BrokerBase):
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0)
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_position(self, long_symbol: str):
+    def get_position(self, long_symbol: str = "") -> Union[float, pd.DataFrame, int]:
+        if self.api is None:
+            raise BrokerConnectionError("FlatTrade API is not initialized")
+
         try:
             trading_logger.log_debug("Getting position", {"long_symbol": long_symbol if long_symbol else "all"})
 
@@ -2269,6 +2411,7 @@ class FlatTrade(BrokerBase):
                     else:
                         trading_logger.log_error(
                             "Multiple positions found for symbol",
+                            None,
                             {"long_symbol": long_symbol, "position_count": len(pos_filtered)},
                         )
                         raise MarketDataError(f"Multiple positions found for symbol: {long_symbol}")
@@ -2285,7 +2428,7 @@ class FlatTrade(BrokerBase):
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_orders_today(self, **kwargs):
+    def get_orders_today(self, **kwargs) -> pd.DataFrame:
         try:
             trading_logger.log_debug("Getting orders for today")
             result = super().get_orders_today(**kwargs)
@@ -2301,7 +2444,7 @@ class FlatTrade(BrokerBase):
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_trades_today(self, **kwargs):
+    def get_trades_today(self, **kwargs) -> pd.DataFrame:
         try:
             trading_logger.log_debug("Getting trades for today")
             result = super().get_trades_today(**kwargs)
@@ -2317,7 +2460,7 @@ class FlatTrade(BrokerBase):
 
     @log_execution_time
     @validate_inputs(ScripName=lambda x: isinstance(x, pd.Series) and len(x) > 0)
-    def get_long_name_from_broker_identifier(self, **kwargs):
+    def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
         """Generates Long Name
 
         Args:
@@ -2393,9 +2536,11 @@ class FlatTrade(BrokerBase):
                                 # We need to find the last working Tuesday of the month
                                 # For now, we'll use a placeholder day (25th)
                                 day = "25"  # Placeholder - should be calculated as last working Tuesday
-                                first_dom = f"01-{month}-{year}"
+                                # Create datetime object for the first day of the month
+                                first_dom = dt.datetime(int(year), int(month), 1)
                                 expiry = get_expiry(first_dom, weekly=0, day_of_week=2, exchange="BSE")
-                                day = expiry[:2]
+                                expiry_str = expiry.strftime("%d-%m-%Y")
+                                day = expiry_str[:2]
                                 # Extract strike (remaining digits after month abbreviation)
                                 strike = remaining[3:]
 
@@ -2504,7 +2649,7 @@ class FlatTrade(BrokerBase):
         long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
-    def get_min_lot_size(self, long_symbol, exchange="NSE"):
+    def get_min_lot_size(self, long_symbol: str, exchange: str) -> int:
         try:
             trading_logger.log_debug("Getting minimum lot size", {"long_symbol": long_symbol, "exchange": exchange})
 

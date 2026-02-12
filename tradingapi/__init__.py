@@ -157,7 +157,7 @@ class TradingAPILogger:
             },
         )
 
-    def get_logger(self, name: str = None) -> logging.Logger:
+    def get_logger(self, name: Optional[str] = None) -> logging.Logger:
         """Get a logger instance with the specified name."""
         if name:
             return logging.getLogger(f"tradingapi.{name}")
@@ -167,8 +167,9 @@ class TradingAPILogger:
         """Get information about the calling function."""
         try:
             # Get the caller frame (skip this method and the logging method)
-            caller_frame = inspect.currentframe().f_back.f_back
-            if caller_frame:
+            current_frame = inspect.currentframe()
+            if current_frame and current_frame.f_back and current_frame.f_back.f_back:
+                caller_frame = current_frame.f_back.f_back
                 info = inspect.getframeinfo(caller_frame)
                 return {
                     "caller_filename": info.filename,
@@ -179,7 +180,9 @@ class TradingAPILogger:
             pass
         return {}
 
-    def log_error(self, message: str, error: Exception = None, context: dict = None, exc_info: bool = True):
+    def log_error(
+        self, message: str, error: Optional[Exception] = None, context: Optional[dict] = None, exc_info: bool = True
+    ):
         """Log an error with structured context."""
         extra = context or {}
         if error:
@@ -192,7 +195,7 @@ class TradingAPILogger:
 
         self.logger.error(message, extra=extra, exc_info=exc_info)
 
-    def log_warning(self, message: str, context: dict = None):
+    def log_warning(self, message: str, context: Optional[dict] = None):
         """Log a warning with structured context."""
         extra = context or {}
 
@@ -202,7 +205,7 @@ class TradingAPILogger:
 
         self.logger.warning(message, extra=extra)
 
-    def log_info(self, message: str, context: dict = None):
+    def log_info(self, message: str, context: Optional[dict] = None):
         """Log an info message with structured context."""
         extra = context or {}
 
@@ -212,7 +215,7 @@ class TradingAPILogger:
 
         self.logger.info(message, extra=extra)
 
-    def log_debug(self, message: str, context: dict = None):
+    def log_debug(self, message: str, context: Optional[dict] = None):
         """Log a debug message with structured context."""
         extra = context or {}
 
@@ -331,23 +334,24 @@ def initialize_config(config_file_path: str, force_reload: bool = True):
         raise
 
 
-initialize_config(get_default_config_path())
+initialize_config(str(get_default_config_path()))
 
 
 def enable_runtime_log_level_toggle(enable: bool = True):
     """
     Enable runtime log level toggling via SIGUSR1 signal.
-    
+
     When enabled, sending SIGUSR1 to the process will toggle between
     DEBUG and INFO logging levels.
-    
+
     This implementation supports handler chaining - if another package
     has already registered a SIGUSR1 handler, both handlers will execute
     (this handler runs first, then calls the previous handler).
-    
+
     Args:
         enable: If True, register the signal handler. If False, remove it.
     """
+
     def toggle_debug(signum, frame):
         current_level = trading_logger.logger.level
         if current_level == logging.DEBUG:
@@ -357,8 +361,7 @@ def enable_runtime_log_level_toggle(enable: bool = True):
             for handler in trading_logger.logger.handlers:
                 handler.setLevel(logging.INFO)
             trading_logger.log_info(
-                "Log level changed to INFO via signal",
-                {"signal": "SIGUSR1", "previous_level": "DEBUG"}
+                "Log level changed to INFO via signal", {"signal": "SIGUSR1", "previous_level": "DEBUG"}
             )
         else:
             # Change to DEBUG
@@ -368,16 +371,17 @@ def enable_runtime_log_level_toggle(enable: bool = True):
                 handler.setLevel(logging.DEBUG)
             trading_logger.log_info(
                 "Log level changed to DEBUG via signal",
-                {"signal": "SIGUSR1", "previous_level": logging.getLevelName(current_level)}
+                {"signal": "SIGUSR1", "previous_level": logging.getLevelName(current_level)},
             )
-    
+
     if enable:
         try:
             # Get the current handler (if any) before registering ours
             current_handler = signal.signal(signal.SIGUSR1, toggle_debug)
-            
+
             # If there was a previous handler, chain it
             if current_handler not in (signal.SIG_DFL, signal.SIG_IGN, None):
+
                 def chained_handler(signum, frame):
                     # Execute our handler first
                     toggle_debug(signum, frame)
@@ -388,10 +392,9 @@ def enable_runtime_log_level_toggle(enable: bool = True):
                         except Exception as e:
                             # Log but don't fail if previous handler has issues
                             trading_logger.log_warning(
-                                "Error in chained SIGUSR1 handler",
-                                {"error": str(e), "error_type": type(e).__name__}
+                                "Error in chained SIGUSR1 handler", {"error": str(e), "error_type": type(e).__name__}
                             )
-                
+
                 # Register the chained handler
                 signal.signal(signal.SIGUSR1, chained_handler)
                 trading_logger.log_info(
@@ -399,19 +402,18 @@ def enable_runtime_log_level_toggle(enable: bool = True):
                     {
                         "signal": "SIGUSR1",
                         "usage": "kill -SIGUSR1 <pid> to toggle DEBUG/INFO",
-                        "previous_handler": str(current_handler)
-                    }
+                        "previous_handler": str(current_handler),
+                    },
                 )
             else:
                 trading_logger.log_info(
                     "Runtime log level toggle enabled",
-                    {"signal": "SIGUSR1", "usage": "kill -SIGUSR1 <pid> to toggle DEBUG/INFO"}
+                    {"signal": "SIGUSR1", "usage": "kill -SIGUSR1 <pid> to toggle DEBUG/INFO"},
                 )
         except (ValueError, OSError) as e:
             # Signal might not be available on all platforms
             trading_logger.log_warning(
-                "Could not register signal handler for log level toggle",
-                {"error": str(e), "platform": sys.platform}
+                "Could not register signal handler for log level toggle", {"error": str(e), "platform": sys.platform}
             )
     else:
         # Restore default handler

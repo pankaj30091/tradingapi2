@@ -114,7 +114,11 @@ def retry_on_error(
             if on_final_failure and last_exception:
                 on_final_failure(last_exception)
 
-            raise last_exception
+            if last_exception:
+                raise last_exception
+            else:
+                # This should never happen, but handle it gracefully
+                raise RuntimeError("Function failed but no exception was captured")
 
         return wrapper
 
@@ -153,7 +157,7 @@ def safe_execute(
         return default_return
 
 
-def validate_inputs(**validations: Dict[str, Any]) -> Callable:
+def validate_inputs(**validations: Callable[[Any], bool]) -> Callable:
     """
     Decorator to validate function inputs.
 

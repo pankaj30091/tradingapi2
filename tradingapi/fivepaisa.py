@@ -11,14 +11,23 @@ import sys
 import threading
 import time
 import traceback
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, cast
 
 import numpy as np
 import pandas as pd
 import pyotp
 import redis
 import requests
-from chameli.dateutils import valid_datetime
+from chameli.dateutils import parse_datetime
+
+
+def _validate_datetime_input(date_input):
+    """Helper function to validate datetime input for decorators. Returns True if valid, False if invalid."""
+    try:
+        parse_datetime(date_input)
+        return True
+    except (ValueError, TypeError):
+        return False
 from py5paisa import FivePaisaClient
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
@@ -38,6 +47,7 @@ from .exceptions import (
     AuthenticationError,
     create_error_context,
 )
+
 try:
     from websocket import WebSocketConnectionClosedException
 except ImportError:
@@ -114,8 +124,18 @@ def save_symbol_data(saveToFolder: bool = False):
         # Only treat 4/6-token names as FUT/OPT when middle token is a month (e.g. "26JAN25").
         # Equity names like "NIFTY MID LIQ 15" or "NIFTY GS 8 13YR" are skipped.
         _MONTH_ABBREV = (
-            "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-            "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+            "JAN",
+            "FEB",
+            "MAR",
+            "APR",
+            "MAY",
+            "JUN",
+            "JUL",
+            "AUG",
+            "SEP",
+            "OCT",
+            "NOV",
+            "DEC",
         )
 
         def process_row(row):
@@ -348,7 +368,9 @@ class FivePaisa(BrokerBase):
                 symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
 
                 if not symbol_codes_path:
-                    context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
+                    context = create_error_context(
+                        broker_name=self.broker.name, config_keys=list(config.configs.keys())
+                    )
                     raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.broker.name}", context)
 
                 symbols_path = os.path.join(symbol_codes_path, f"{dt_today}_symbols.csv")
@@ -455,12 +477,14 @@ class FivePaisa(BrokerBase):
 
                 missing_keys = [key for key, value in credentials.items() if not value]
                 if missing_keys:
-                    context = create_error_context(missing_keys=missing_keys, available_keys=list(config.keys()))
+                    context = create_error_context(
+                        missing_keys=missing_keys, available_keys=list(config.configs.keys())
+                    )
                     raise AuthenticationError(f"Missing required FivePaisa credentials: {missing_keys}", context)
 
                 return credentials
             except Exception as e:
-                context = create_error_context(error=str(e), config_keys=list(config.keys()))
+                context = create_error_context(error=str(e), config_keys=list(config.configs.keys()))
                 raise AuthenticationError(f"Error extracting credentials: {str(e)}", context)
 
         def _verify_session(self):
@@ -498,7 +522,7 @@ class FivePaisa(BrokerBase):
                     return False
 
             except Exception as e:
-                trading_logger.log_warning("Failed to restore session", e, {"broker": self.broker.name})
+                trading_logger.log_error("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
         def _fresh_login(susertoken_path):
@@ -542,7 +566,7 @@ class FivePaisa(BrokerBase):
                                 trading_logger.log_info("Token saved successfully", {"broker": self.broker.name})
                                 return  # Success, exit retry loop
                             except Exception as e:
-                                trading_logger.log_warning(
+                                trading_logger.log_error(
                                     "Failed to save token",
                                     e,
                                     {"broker": self.broker.name, "susertoken_path": susertoken_path},
@@ -579,7 +603,7 @@ class FivePaisa(BrokerBase):
             susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
 
             if not susertoken_path:
-                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
+                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.configs.keys()))
                 raise BrokerConnectionError("USERTOKEN path not configured", context)
 
             # Check if we can use existing token
@@ -615,7 +639,7 @@ class FivePaisa(BrokerBase):
                         return True
 
                 except Exception as e:
-                    trading_logger.log_warning(
+                    trading_logger.log_error(
                         "Error checking token file, performing fresh login",
                         e,
                         {"broker": self.broker.name, "susertoken_path": susertoken_path},
@@ -631,7 +655,7 @@ class FivePaisa(BrokerBase):
             trading_logger.log_info("Connecting to FivePaisa", {"redis_db": redis_db, "broker_name": self.broker.name})
 
             if config.get(self.broker.name) == {}:
-                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
+                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.configs.keys()))
                 raise BrokerConnectionError("Configuration file not found or empty", context)
 
             # Update symbology
@@ -761,6 +785,7 @@ class FivePaisa(BrokerBase):
             if not self.is_connected():
                 raise BrokerConnectionError("FivePaisa broker is not connected")
 
+            assert self.api is not None  # Type checker assurance after connection check
             margin_data = self.api.margin()
             if not margin_data or len(margin_data) == 0:
                 raise MarketDataError("No margin data available")
@@ -768,7 +793,7 @@ class FivePaisa(BrokerBase):
             ledger_balance = float(margin_data[0]["Ledgerbalance"])
             funds_payln = float(margin_data[0]["FundsPayln"])
             cash = ledger_balance + funds_payln
-            
+
             # Get collateral value (FivePaisa has both MF and regular collateral)
             collateral = 0.0
             try:
@@ -976,7 +1001,12 @@ class FivePaisa(BrokerBase):
                             raise OrderError(f"FivePaisa API call failed: {str(api_error)}", context)
 
                         trading_logger.log_info(
-                            "FivePaisa order info", {"order_info": json.dumps(out, indent=4, default=str), "long_symbol": order.long_symbol, "broker_order_id": order.broker_order_id if hasattr(order, 'broker_order_id') else None}
+                            "FivePaisa order info",
+                            {
+                                "order_info": json.dumps(out, indent=4, default=str),
+                                "long_symbol": order.long_symbol,
+                                "broker_order_id": order.broker_order_id if hasattr(order, "broker_order_id") else None,
+                            },
                         )
 
                         if out is not None:
@@ -1056,7 +1086,9 @@ class FivePaisa(BrokerBase):
 
                                 # Update order with existing order details
                                 broker_order_id_raw = existing_order.get("BrokerOrderID")
-                                order.broker_order_id = str(broker_order_id_raw) if broker_order_id_raw is not None else ""
+                                order.broker_order_id = (
+                                    str(broker_order_id_raw) if broker_order_id_raw is not None else ""
+                                )
                                 order.exch_order_id = existing_order.get("ExchOrderID") or "0"
                                 order.local_order_id = existing_order.get("LocalOrderID") or 0
                                 order.order_type = orig_order_type
@@ -1111,19 +1143,29 @@ class FivePaisa(BrokerBase):
 
                                         # Update entry_keys or exit_keys based on order type
                                         if order.order_type in ["BUY", "SHORT"]:
-                                            current_entry_keys = self.redis_o.hget(order.internal_order_id, "entry_keys")
-                                            if current_entry_keys is None or str(order.broker_order_id) not in current_entry_keys:
+                                            current_entry_keys = self.redis_o.hget(
+                                                order.internal_order_id, "entry_keys"
+                                            )
+                                            if (
+                                                current_entry_keys is None
+                                                or str(order.broker_order_id) not in current_entry_keys
+                                            ):
                                                 new_entry_keys = (
                                                     str(order.broker_order_id)
                                                     if current_entry_keys is None
                                                     else current_entry_keys + " " + str(order.broker_order_id)
                                                 )
                                                 self.redis_o.hset(order.orderRef, "entry_keys", new_entry_keys)
-                                                self.redis_o.hset(order.internal_order_id, "long_symbol", order.long_symbol)
+                                                self.redis_o.hset(
+                                                    order.internal_order_id, "long_symbol", order.long_symbol
+                                                )
 
                                         elif order.order_type in ["SELL", "COVER"]:
                                             current_exit_keys = self.redis_o.hget(order.internal_order_id, "exit_keys")
-                                            if current_exit_keys is None or str(order.broker_order_id) not in current_exit_keys:
+                                            if (
+                                                current_exit_keys is None
+                                                or str(order.broker_order_id) not in current_exit_keys
+                                            ):
                                                 new_exit_keys = (
                                                     str(order.broker_order_id)
                                                     if current_exit_keys is None
@@ -1229,8 +1271,10 @@ class FivePaisa(BrokerBase):
     @validate_inputs(
         broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         new_price=lambda x: isinstance(x, (int, float)) and x >= 0,
-        new_quantity=lambda x: isinstance(x, (int, float, str))
-        and (isinstance(x, (int, float)) and x >= 0 or (isinstance(x, str) and x.strip() and float(x.strip()) >= 0)),
+        new_quantity=lambda x: bool(
+            isinstance(x, (int, float, str))
+            and (isinstance(x, (int, float)) and x >= 0 or (isinstance(x, str) and x.strip() and float(x.strip()) >= 0))
+        ),
     )
     def modify_order(self, **kwargs) -> Order:
         """
@@ -1261,6 +1305,12 @@ class FivePaisa(BrokerBase):
             broker_order_id = str(kwargs.get("broker_order_id", "0"))
             new_price = float(kwargs.get("new_price", 0))
             new_quantity = kwargs.get("new_quantity", 0)
+
+            # Check connection before proceeding
+            if not self.is_connected():
+                raise BrokerConnectionError("FivePaisa broker is not connected")
+
+            assert self.api is not None  # Type checker assurance after connection check
 
             # Validate parameters
             if not broker_order_id or broker_order_id == "0":
@@ -1344,10 +1394,16 @@ class FivePaisa(BrokerBase):
                     # The SDK's set_payload doesn't convert types, and JSON serialization fails with int64/float64
                     try:
                         # Convert to native types for JSON serialization
-                        native_exch_order_id = int(exch_order_id) if isinstance(exch_order_id, (np.integer, np.int64, np.int32)) else str(exch_order_id)
-                        native_price = float(new_price) if isinstance(new_price, (np.floating, np.float64, np.float32)) else float(new_price)
-                        native_qty = int(order_quantity) if isinstance(order_quantity, (np.integer, np.int64, np.int32)) else int(order_quantity)
-                        out = self.api.modify_order(ExchOrderID=native_exch_order_id, Price=native_price, Qty=native_qty)
+                        native_exch_order_id = (
+                            int(exch_order_id) if isinstance(exch_order_id, np.integer) else str(exch_order_id)
+                        )
+                        native_price = float(new_price) if isinstance(new_price, np.floating) else float(new_price)
+                        native_qty = (
+                            int(order_quantity) if isinstance(order_quantity, np.integer) else int(order_quantity)
+                        )
+                        out = self.api.modify_order(
+                            ExchOrderID=native_exch_order_id, Price=native_price, Qty=native_qty
+                        )
                     except Exception as e:
                         trading_logger.log_error(
                             "Exception during SDK modify_order call",
@@ -1425,7 +1481,10 @@ class FivePaisa(BrokerBase):
                         # Update order status
                         try:
                             fills = update_order_status(self, order.internal_order_id, order.broker_order_id)
-                            order.status = fills.status
+                            if fills is not None:
+                                order.status = fills.status
+                            else:
+                                order.status = OrderStatus.UNDEFINED
                         except Exception as e:
                             trading_logger.log_error(
                                 "Failed to update order status",
@@ -1526,8 +1585,12 @@ class FivePaisa(BrokerBase):
 
             if order.status in [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNDEFINED]:
                 try:
-                    valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-                    if valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d"):
+                    try:
+                        valid_date = parse_datetime(order.remote_order_id[:8])
+                        date_matches = valid_date.strftime("%Y-%m-%d") == dt.datetime.today().strftime("%Y-%m-%d")
+                    except (ValueError, TypeError):
+                        date_matches = False
+                    if date_matches:
                         # Get current order info
                         try:
                             fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
@@ -1552,6 +1615,8 @@ class FivePaisa(BrokerBase):
 
                             # Cancel order with API
                             try:
+                                if self.api is None:
+                                    raise BrokerConnectionError("API client not initialized")
                                 out = self.api.cancel_order(exch_order_id=order.exch_order_id)
                                 self.log_and_return(out)
 
@@ -1594,9 +1659,12 @@ class FivePaisa(BrokerBase):
                                             self, order.internal_order_id, order.broker_order_id, eod=True
                                         )
                                         self.log_and_return(fills)
-                                        order.status = fills.status
-                                        order.quantity = fills.fill_size
-                                        order.price = fills.fill_price
+                                        if fills is not None:
+                                            order.status = fills.status
+                                            order.quantity = fills.fill_size
+                                            order.price = fills.fill_price
+                                        else:
+                                            order.status = OrderStatus.UNDEFINED
                                     except Exception as e:
                                         trading_logger.log_error(
                                             "Failed to update order status",
@@ -1809,8 +1877,12 @@ class FivePaisa(BrokerBase):
                 """Return order info from database for historical orders."""
                 try:
                     order_info = OrderInfo()
-                    valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-                    if valid_date and valid_date != dt.datetime.today().strftime("%Y-%m-%d"):
+                    try:
+                        valid_date = parse_datetime(order.remote_order_id[:8])
+                        date_differs = valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
+                    except (ValueError, TypeError):
+                        date_differs = False
+                    if date_differs:
                         order_info.status = order.status
                     else:
                         order_info.status = OrderStatus.HISTORICAL
@@ -1828,17 +1900,19 @@ class FivePaisa(BrokerBase):
             def get_orderinfo_from_orders(exch_order_id: str, order: Order, broker_order_id: str) -> OrderInfo:
                 """Get order info from order book."""
                 try:
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     orders = pd.DataFrame(self.api.order_book())
                     if len(orders) > 0:
                         fivepaisa_order = orders[orders.BrokerOrderId.astype(str) == str(broker_order_id)]
                         if len(fivepaisa_order) == 1:
-                            if fivepaisa_order.OrderStatus.str.lower().str.contains("rejected").item() is True:
+                            if fivepaisa_order.OrderStatus.str.lower().str.contains("rejected").iloc[0] is True:
                                 # order cancelled by broker before reaching exchange
                                 trading_logger.log_info(
                                     "Order rejected by broker",
-                                    {"broker_order_id": broker_order_id, "reason": str(fivepaisa_order.Reason.item())},
+                                    {"broker_order_id": broker_order_id, "reason": str(fivepaisa_order.Reason.iloc[0])},
                                 )
-                                broker_order_id = str(fivepaisa_order.BrokerOrderId.item())
+                                broker_order_id = str(fivepaisa_order.BrokerOrderId.iloc[0])
                                 try:
                                     internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
                                     if internal_order_id is not None:
@@ -1855,31 +1929,31 @@ class FivePaisa(BrokerBase):
                                     fill_price=0,
                                     status=OrderStatus.REJECTED,
                                     broker_order_id=order.broker_order_id,
-                                    exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                    exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
                                     broker=self.broker,
                                 )
                             else:
-                                fill_size = fivepaisa_order.TradedQty.item()
-                                fill_price = fivepaisa_order.AveragePrice.item()
+                                fill_size = fivepaisa_order.TradedQty.iloc[0]
+                                fill_price = fivepaisa_order.AveragePrice.iloc[0]
                                 status = OrderStatus.UNDEFINED
-                                if "cancel" in fivepaisa_order.OrderStatus.str.lower().item():
+                                if "cancel" in fivepaisa_order.OrderStatus.str.lower().iloc[0]:
                                     status = OrderStatus.CANCELLED
                                 elif fill_size == round(float(order.quantity)):
                                     status = OrderStatus.FILLED
-                                elif fivepaisa_order.ExchOrderID.item() not in [None, "None", 0, "0"]:
+                                elif fivepaisa_order.ExchOrderID.iloc[0] not in [None, "None", 0, "0"]:
                                     status = OrderStatus.OPEN
                                 else:
                                     status = OrderStatus.PENDING
-                                if fivepaisa_order.Exch.item() == "M":
+                                if fivepaisa_order.Exch.iloc[0] == "M":
                                     try:
                                         long_symbol = (
                                             self.get_long_name_from_broker_identifier(
-                                                ScripName=pd.Series[order.long_symbol]
-                                            ).item()
+                                                ScripName=pd.Series([order.long_symbol])
+                                            ).iloc[0]
                                             if order
                                             else self.get_long_name_from_broker_identifier(
                                                 ScripName=fivepaisa_order.ScripName
-                                            ).item()
+                                            ).iloc[0]
                                         )
                                         contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(
                                             long_symbol
@@ -1891,7 +1965,7 @@ class FivePaisa(BrokerBase):
                                             fill_price=fill_price,
                                             status=status,
                                             broker_order_id=order.broker_order_id,
-                                            exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                            exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
                                             broker=self.broker,
                                         )
                                     except Exception as e:
@@ -1909,7 +1983,7 @@ class FivePaisa(BrokerBase):
                                         fill_price=fill_price,
                                         status=status,
                                         broker_order_id=order.broker_order_id,
-                                        exchange_order_id=fivepaisa_order.ExchOrderID.item(),
+                                        exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
                                         broker=self.broker,
                                     )
                         else:
@@ -1921,10 +1995,10 @@ class FivePaisa(BrokerBase):
                             status = OrderStatus.UNDEFINED
                             for index, row in fivepaisa_order.iterrows():
                                 if row["BrokerOrderId"] == int(broker_order_id):
-                                    order_size = row["Qty"]
-                                    order_price = row["Rate"]
-                                    fill_size = order_size - row["PendingQty"]
-                                    fill_price = row["AveragePrice"]
+                                    order_size = int(row["Qty"])
+                                    order_price = float(row["Rate"])
+                                    fill_size = int(order_size - row["PendingQty"])
+                                    fill_price = float(row["AveragePrice"])
                                     if "cancel" in row["OrderStatus"].lower():
                                         status = OrderStatus.CANCELLED
                                     elif "reject" in row["OrderStatus"].lower():
@@ -1944,11 +2018,11 @@ class FivePaisa(BrokerBase):
                                             long_symbol = (
                                                 self.get_long_name_from_broker_identifier(
                                                     ScripName=pd.Series[order.long_symbol]
-                                                ).item()
+                                                ).iloc[0]
                                                 if order.long_symbol is not None
                                                 else self.get_long_name_from_broker_identifier(
-                                                    ScripName=row["ScripName"]
-                                                ).item()
+                                                    ScripName=pd.Series([row["ScripName"]])
+                                                ).iloc[0]
                                             )
                                             contract_size = self.exchange_mappings[order.exchange][
                                                 "contractsize_map"
@@ -2024,12 +2098,16 @@ class FivePaisa(BrokerBase):
                     context = create_error_context(broker_order_id=broker_order_id, error=str(e))
                     raise OrderError(f"Failed to retrieve order from Redis: {str(e)}", context)
 
-            # Check for historical orders
+            # Check for historical orders (only use return_db_as_fills when order is from a past day)
             try:
-                valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-                if (
-                    valid_date
-                    and valid_date != dt.datetime.today().strftime("%Y-%m-%d")
+                try:
+                    valid_date = parse_datetime(order.remote_order_id[:8])
+                    date_valid = True
+                except (ValueError, TypeError):
+                    date_valid = False
+                # Compare as string: valid_date is datetime from parse_datetime; must match pre-refactor logic
+                if date_valid and (
+                    valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
                     or (order.remote_order_id == "" and order.broker != self.broker)
                 ):
                     return return_db_as_fills(order)
@@ -2059,8 +2137,12 @@ class FivePaisa(BrokerBase):
             # Check order date
             remote_order_id = order.remote_order_id
             try:
-                valid_date, _ = valid_datetime(remote_order_id[:8], "%Y-%m-%d")
-                if not (valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d")):
+                try:
+                    valid_date = parse_datetime(remote_order_id[:8])
+                    date_matches_today = valid_date.strftime("%Y-%m-%d") == dt.datetime.today().strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    date_matches_today = False
+                if not date_matches_today:
                     # we cannot update orders that were placed before today
                     return OrderInfo(
                         order_size=order.quantity,
@@ -2088,7 +2170,7 @@ class FivePaisa(BrokerBase):
                         fills.status = OrderStatus.CANCELLED
                     fills.fill_price = 0
                     fills.fill_size = 0
-                    fills.broker = self.broker.name
+                    fills.broker = self.broker
                     fills.broker_order_id = order.broker_order_id
                     fills.order_price = order.price
                     fills.order_size = order.quantity
@@ -2112,13 +2194,15 @@ class FivePaisa(BrokerBase):
                                 "ScripCode": order.scrip_code,
                             }
                         ]
+                        if self.api is None:
+                            raise BrokerConnectionError("API client not initialized")
                         trade_info = self.api.fetch_trade_info(req_list_)
                         if trade_info is None:
                             return get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
-                        trade_details = trade_info["TradeDetail"]
+                        trade_details = cast(List[Dict[str, Any]], trade_info["TradeDetail"])
                         if len(trade_details) > 0:
-                            price = [trade["Qty"] * trade["Rate"] for trade in trade_details]
-                            filled = [trade["Qty"] for trade in trade_details]
+                            price = [cast(float, trade["Qty"]) * cast(float, trade["Rate"]) for trade in trade_details]
+                            filled = [cast(float, trade["Qty"]) for trade in trade_details]
                             price = np.sum(price)
                             fill_size = np.sum(filled)
                             fill_price = price / fill_size
@@ -2147,7 +2231,7 @@ class FivePaisa(BrokerBase):
                                 fill_price=fill_price,
                                 status=status,
                                 broker_order_id=order.broker_order_id,
-                                exchange_order_id=trade_details[0].get("ExchOrderID"),
+                                exchange_order_id=trade_details[0].get("ExchOrderID") or "",
                                 broker=self.broker,
                             )
                         else:
@@ -2184,8 +2268,8 @@ class FivePaisa(BrokerBase):
     @log_execution_time
     @validate_inputs(
         symbols=lambda x: x is not None,
-        date_start=lambda x: valid_datetime(x)[0] is not False,
-        date_end=lambda x: valid_datetime(x)[0] is not False,
+        date_start=lambda x: _validate_datetime_input(x),
+        date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
@@ -2243,51 +2327,57 @@ class FivePaisa(BrokerBase):
             if refresh_mapping:
                 try:
                     # Parse date_end to get YYYYMMDD format
-                    date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
-                    date_end_obj = dt.datetime.strptime(date_end_str, "%Y-%m-%d")
+                    try:
+                        date_end_dt = parse_datetime(date_end)
+                        date_end_str = date_end_dt.strftime("%Y-%m-%d")
+                        date_end_valid = True
+                    except (ValueError, TypeError):
+                        date_end_valid = False
+                    if not date_end_valid:
+                        context = create_error_context(date_end=date_end)
+                        raise ValidationError(f"Invalid date format: {date_end}", context)
+                    date_end_obj = dt.datetime.strptime(str(date_end_str), "%Y-%m-%d")
                     date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
-                    
+
                     # Get symbol codes path from config
                     symbol_codes_path = config.get("FIVEPAISA.SYMBOLCODES")
                     if not symbol_codes_path:
                         context = create_error_context(broker_name=self.broker.name)
                         raise ConfigurationError("FIVEPAISA.SYMBOLCODES path not found in config", context)
-                    
+
                     # Construct path to symbols file
                     symbols_file_path = os.path.join(symbol_codes_path, f"{date_end_yyyymmdd}_symbols.csv")
-                    
+
                     trading_logger.log_debug(
                         "Loading symbol mapping from file",
-                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd}
+                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd},
                     )
-                    
+
                     if not os.path.exists(symbols_file_path):
                         trading_logger.log_warning(
-                            "Symbols file not found for refresh_mapping",
-                            {"symbols_file_path": symbols_file_path}
+                            "Symbols file not found for refresh_mapping", {"symbols_file_path": symbols_file_path}
                         )
                         # Fall back to default mapping
                         refresh_symbol_map = None
                     else:
                         # Load the CSV file
                         codes = pd.read_csv(symbols_file_path)
-                        
+
                         # Create symbol_map and exchangetype_map for each exchange
                         refresh_symbol_map = {}
                         refresh_exchangetype_map = {}
                         for exch, group in codes.groupby("Exch"):
                             refresh_symbol_map[exch] = dict(zip(group["long_symbol"], group["Scripcode"]))
                             refresh_exchangetype_map[exch] = dict(zip(group["long_symbol"], group["ExchType"]))
-                        
+
                         trading_logger.log_debug(
                             "Symbol mapping loaded from file",
-                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)}
+                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)},
                         )
                 except Exception as e:
                     trading_logger.log_warning(
                         "Error loading symbol mapping from file, falling back to default",
                         {"error": str(e)},
-                        exc_info=True
                     )
                     refresh_symbol_map = None
                     refresh_exchangetype_map = None
@@ -2348,8 +2438,10 @@ class FivePaisa(BrokerBase):
                     row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
 
                     try:
-                        date_start_str, _ = valid_datetime(date_start, "%Y-%m-%d")
-                        date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
+                        date_start_dt = parse_datetime(date_start)
+                        date_start_str = date_start_dt.strftime("%Y-%m-%d")
+                        date_end_dt = parse_datetime(date_end)
+                        date_end_str = date_end_dt.strftime("%Y-%m-%d")
                     except Exception as e:
                         trading_logger.log_error(
                             "Error validating dates", e, {"date_start": date_start, "date_end": date_end}
@@ -2357,6 +2449,8 @@ class FivePaisa(BrokerBase):
                         continue
 
                     try:
+                        if self.api is None:
+                            raise BrokerConnectionError("API client not initialized")
                         data = self.api.historical_data(
                             exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
                         )
@@ -2377,6 +2471,7 @@ class FivePaisa(BrokerBase):
 
                     if not (data is None or len(data) == 0):
                         try:
+                            data = cast(pd.DataFrame, data)
                             data.columns = ["date", "open", "high", "low", "close", "volume"]
                             data["date"] = pd.to_datetime(data["date"])
                             data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
@@ -2392,14 +2487,14 @@ class FivePaisa(BrokerBase):
 
                             for _, row in data.iterrows():
                                 historical_data = HistoricalData(
-                                    date=row.get("date"),
-                                    open=row.get("open"),
-                                    high=row.get("high"),
-                                    low=row.get("low"),
-                                    close=row.get("close"),
-                                    volume=row.get("volume"),
-                                    intoi=row.get("intoi"),
-                                    oi=row.get("oi"),
+                                    date=row["date"],
+                                    open=row["open"],
+                                    high=row["high"],
+                                    low=row["low"],
+                                    close=row["close"],
+                                    volume=row["volume"],
+                                    intoi=row.get("intoi", 0),
+                                    oi=row.get("oi", 0),
                                 )
                                 historical_data_list.append(historical_data)
 
@@ -2533,7 +2628,22 @@ class FivePaisa(BrokerBase):
                 if timestamp is None:
                     timestamp = dt.datetime.now()
                 elif isinstance(timestamp, str):
-                    timestamp, _ = valid_datetime(timestamp)
+                    try:
+                        parsed_timestamp = parse_datetime(timestamp)
+                        timestamp_valid = True
+                    except (ValueError, TypeError):
+                        timestamp_valid = False
+                    if not timestamp_valid:
+                        context = create_error_context(timestamp=timestamp)
+                        raise ValidationError(f"Invalid timestamp format: {timestamp}", context)
+                    if isinstance(parsed_timestamp, dt.date) and not isinstance(parsed_timestamp, dt.datetime):
+                        timestamp = dt.datetime.combine(parsed_timestamp, dt.time.min)
+                    elif isinstance(parsed_timestamp, dt.datetime):
+                        timestamp = parsed_timestamp
+                    else:
+                        # parsed_timestamp is a string that couldn't be parsed
+                        context = create_error_context(timestamp=timestamp, parsed=parsed_timestamp)
+                        raise ValidationError(f"Could not convert timestamp to datetime: {parsed_timestamp}", context)
                 cutoff_time = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
             except Exception as e:
                 context = create_error_context(timestamp=timestamp, error=str(e))
@@ -2557,6 +2667,8 @@ class FivePaisa(BrokerBase):
 
             # Fetch historical data
             try:
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 md = self.api.historical_data(
                     exchange,
                     exch_type,
@@ -2748,7 +2860,8 @@ class FivePaisa(BrokerBase):
                 # Treat negative timestamps (e.g. .NET min date) as invalid; substitute current time
                 if timestamp_ms < 0:
                     trading_logger.log_warning(
-                        "Invalid date (negative timestamp)", {"date_string": date_string, "expected_format": "/Date(milliseconds)/"}
+                        "Invalid date (negative timestamp)",
+                        {"date_string": date_string, "expected_format": "/Date(milliseconds)/"},
                     )
                     return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
                 timestamp_s = timestamp_ms / 1000
@@ -2839,6 +2952,8 @@ class FivePaisa(BrokerBase):
 
             try:
                 # Fetch market feed
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 out = self.api.fetch_market_feed_scrip(req_list)
                 if not out or "Data" not in out or len(out["Data"]) == 0:
                     context = create_error_context(
@@ -2852,6 +2967,8 @@ class FivePaisa(BrokerBase):
                 snapshot = out["Data"][0]
 
                 # Fetch market depth
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 out = self.api.fetch_market_depth_by_scrip(
                     Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
                 )
@@ -2865,9 +2982,9 @@ class FivePaisa(BrokerBase):
                     )
                     raise MarketDataError("No market depth data received", context)
 
-                market_depth_data = out["MarketDepthData"]
-                bids = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 66]
-                asks = [entry for entry in market_depth_data if entry["BbBuySellFlag"] == 83]
+                market_depth_data = cast(List[Dict[str, Any]], out["MarketDepthData"])
+                bids = [entry for entry in market_depth_data if cast(int, entry["BbBuySellFlag"]) == 66]
+                asks = [entry for entry in market_depth_data if cast(int, entry["BbBuySellFlag"]) == 83]
 
                 # Get the best bid and best ask
                 best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
@@ -2916,12 +3033,15 @@ class FivePaisa(BrokerBase):
                     },
                 )
 
+            except (ValidationError, MarketDataError, BrokerConnectionError):
+                raise
             except Exception as e:
                 context = create_error_context(
                     long_symbol=long_symbol, mapped_exchange=mapped_exchange, scrip_code=scrip_code, error=str(e)
                 )
                 trading_logger.log_error("Error fetching quote", e, context)
-                raise MarketDataError(f"Error fetching quote for symbol {long_symbol}: {str(e)}", context)
+                msg = getattr(e, "message", str(e))
+                raise MarketDataError(f"Error fetching quote for symbol {long_symbol}: {msg}", context)
 
             return market_feed
 
@@ -2937,7 +3057,7 @@ class FivePaisa(BrokerBase):
         symbols=lambda x: isinstance(x, list) and len(x) > 0,
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
-    def start_quotes_streaming(self, operation: str, symbols=List[str], ext_callback=None, exchange="NSE"):
+    def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE"):
         """
         Start quotes streaming with enhanced error handling.
 
@@ -2995,7 +3115,7 @@ class FivePaisa(BrokerBase):
             def on_message(ws, message):
                 """Handle incoming WebSocket messages."""
                 try:
-                    data_str = message.replace("\/", "/")
+                    data_str = message.replace(r"\/", "/")
                     json_data = json.loads(data_str)
                     if len(json_data) == 1:
                         price = map_to_price(json_data[0])
@@ -3007,7 +3127,7 @@ class FivePaisa(BrokerBase):
             def error_data(ws, err):
                 """Handle WebSocket errors."""
                 try:
-                    trading_logger.log_error("WebSocket error", {"error": str(err)})
+                    trading_logger.log_error("WebSocket error", None, {"error": str(err)})
                     reconnect()
                 except Exception as e:
                     trading_logger.log_error("Error handling WebSocket error", e, {"original_error": str(err)})
@@ -3019,8 +3139,12 @@ class FivePaisa(BrokerBase):
                 try:
                     req_list = expand_symbols_to_request(self.subscribed_symbols)
                     if not req_list:
-                        trading_logger.log_warning("No symbols to reconnect", {"subscribed_symbols": self.subscribed_symbols})
+                        trading_logger.log_warning(
+                            "No symbols to reconnect", {"subscribed_symbols": self.subscribed_symbols}
+                        )
                         return
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     req_data = self.api.Request_Feed("mf", "s", req_list)
                     connect_and_receive(req_data)
                 except Exception as e:
@@ -3030,6 +3154,8 @@ class FivePaisa(BrokerBase):
             def connect_and_receive(req_data):
                 """Connect and receive data."""
                 try:
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     self.api.connect(req_data)
                     self.api.receive_data(on_message)
                     self.api.error_data(error_data)
@@ -3088,6 +3214,8 @@ class FivePaisa(BrokerBase):
                 req_list = expand_symbols_to_request(symbols)
 
                 if req_list is not None and len(req_list) > 0:
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     req_data = self.api.Request_Feed("mf", operation, req_list)
 
                     # Start the connection and receiving data in a separate thread
@@ -3110,18 +3238,17 @@ class FivePaisa(BrokerBase):
                                 {"operation": operation, "symbols_count": len(symbols), "exchange": exchange},
                             )
                             try:
-                                self.api.close_data()
+                                if self.api is not None:
+                                    self.api.close_data()
                             except Exception:
                                 pass
                             self.subscribe_thread = None
                             req_list_full = expand_symbols_to_request(self.subscribed_symbols)
                             if not req_list_full:
-                                context = create_error_context(
-                                    operation=operation, symbols=symbols, exchange=exchange
-                                )
-                                raise MarketDataError(
-                                    "No symbols to reconnect after socket closure", context
-                                )
+                                context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
+                                raise MarketDataError("No symbols to reconnect after socket closure", context)
+                            if self.api is None:
+                                raise BrokerConnectionError("API client not initialized")
                             req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
                             self.subscribe_thread = threading.Thread(
                                 target=connect_and_receive,
@@ -3163,7 +3290,8 @@ class FivePaisa(BrokerBase):
             trading_logger.log_info("Stopping quotes streaming")
 
             try:
-                self.api.close_data()
+                if self.api is not None:
+                    self.api.close_data()
                 trading_logger.log_info("Streaming stopped successfully")
             except Exception as e:
                 context = create_error_context(error=str(e))
@@ -3199,6 +3327,8 @@ class FivePaisa(BrokerBase):
 
             # Get holdings data
             try:
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 holding = pd.DataFrame(self.api.holdings())
                 holding = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(holding) == 0 else holding
                 if len(holding) > 0:
@@ -3215,6 +3345,8 @@ class FivePaisa(BrokerBase):
 
             # Get positions data
             try:
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 position = pd.DataFrame(self.api.positions())
                 position = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(position) == 0 else position
                 if len(position) > 0:
@@ -3262,7 +3394,7 @@ class FivePaisa(BrokerBase):
                         trading_logger.log_debug("No position found for symbol", {"long_symbol": long_symbol})
                         return 0
                     elif len(pos) == 1:
-                        position_value = pos.item()
+                        position_value = pos.iloc[0]
                         trading_logger.log_debug(
                             "Position retrieved for symbol", {"long_symbol": long_symbol, "quantity": position_value}
                         )
@@ -3289,7 +3421,7 @@ class FivePaisa(BrokerBase):
         Get today's orders with enhanced error handling.
 
         Returns:
-            pd.DataFrame: DataFrame containing today's orders or None if no orders
+            pd.DataFrame: DataFrame containing today's orders (empty if none found)
 
         Raises:
             MarketDataError: If order retrieval fails
@@ -3299,6 +3431,8 @@ class FivePaisa(BrokerBase):
             trading_logger.log_debug("Getting orders for today")
 
             try:
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 orders = self.api.order_book()
                 orders = pd.DataFrame.from_dict(orders)
 
@@ -3310,11 +3444,11 @@ class FivePaisa(BrokerBase):
                         trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(orders)})
                         return orders
                     except Exception as e:
-                        trading_logger.log_error("Error processing orders data", e, {"order_count": len(orders)})
-                        return None
+                        context = create_error_context(error=str(e), order_count=len(orders))
+                        raise MarketDataError(f"Error processing orders data: {str(e)}", context)
                 else:
                     trading_logger.log_debug("No orders found for today")
-                    return None
+                    return pd.DataFrame()  # Return empty DataFrame instead of None
 
             except Exception as e:
                 context = create_error_context(error=str(e))
@@ -3333,7 +3467,7 @@ class FivePaisa(BrokerBase):
         Get today's trades with enhanced error handling.
 
         Returns:
-            pd.DataFrame: DataFrame containing today's trades or None if no trades
+            pd.DataFrame: DataFrame containing today's trades (empty if none found)
 
         Raises:
             MarketDataError: If trade retrieval fails
@@ -3343,6 +3477,8 @@ class FivePaisa(BrokerBase):
             trading_logger.log_debug("Getting trades for today")
 
             try:
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 trades = self.api.get_tradebook()
                 trades = pd.DataFrame.from_dict(trades)
 
@@ -3350,7 +3486,7 @@ class FivePaisa(BrokerBase):
                     try:
                         trades = trades.loc[trades.Status == 0, "TradeBookDetail"]
                         trades = pd.DataFrame([trade for trade in trades])
-                        trades.ExchangeTradeTime = trades.ExchangeTradeTime.apply(self._convert_date_string)
+                        trades["ExchangeTradeTime"] = trades["ExchangeTradeTime"].apply(self._convert_date_string)
                         trades = trades.assign(
                             long_symbol=self.get_long_name_from_broker_identifier(ScripName=trades.ScripName)
                         )
@@ -3358,11 +3494,11 @@ class FivePaisa(BrokerBase):
                         trading_logger.log_debug("Trades retrieved successfully", {"trade_count": len(trades)})
                         return trades
                     except Exception as e:
-                        trading_logger.log_error("Error processing trades data", e, {"trade_count": len(trades)})
-                        return None
+                        context = create_error_context(error=str(e), trade_count=len(trades))
+                        raise MarketDataError(f"Error processing trades data: {str(e)}", context)
                 else:
                     trading_logger.log_debug("No trades found for today")
-                    return None
+                    return pd.DataFrame()  # Return empty DataFrame instead of None
 
             except Exception as e:
                 context = create_error_context(error=str(e))
@@ -3490,10 +3626,13 @@ class FivePaisa(BrokerBase):
                 return None
 
             req_list = [{"Exch": exchange, "RemoteOrderID": remote_order_id}]
+            if self.api is None:
+                raise BrokerConnectionError("API client not initialized")
             status = self.api.fetch_order_status(req_list)
 
             if status is not None and len(status.get("OrdStatusResLst", [])) > 0:
-                for sub_status in status["OrdStatusResLst"]:
+                ord_status_list = cast(List[Dict[str, Any]], status["OrdStatusResLst"])
+                for sub_status in ord_status_list:
                     if str(sub_status.get("ScripCode")) == str(scrip_code):
                         trading_logger.log_info(
                             "Found existing order with same remote_order_id",
@@ -3539,10 +3678,12 @@ class FivePaisa(BrokerBase):
             def get_exchange_order_id_from_orders(broker_order_id: str) -> str:
                 """Get exchange order ID from order book."""
                 try:
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     orders = pd.DataFrame(self.api.order_book())
                     fivepaisa_order = orders[orders.BrokerOrderId == int(broker_order_id)]
                     if len(fivepaisa_order) == 1:
-                        exch_order_id = str(fivepaisa_order.ExchOrderID.item())
+                        exch_order_id = str(fivepaisa_order.ExchOrderID.iloc[0])
                         trading_logger.log_debug(
                             "Exchange order ID found in order book",
                             {"broker_order_id": broker_order_id, "exch_order_id": exch_order_id},
@@ -3591,10 +3732,13 @@ class FivePaisa(BrokerBase):
                         remote_order_id = broker_order_id
 
                     req_list_ = [{"Exch": exch, "RemoteOrderID": remote_order_id}]
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     status = self.api.fetch_order_status(req_list_)
 
                     if status is not None and len(status.get("OrdStatusResLst", [])) > 0:
-                        for sub_status in status["OrdStatusResLst"]:
+                        ord_status_list = cast(List[Dict[str, Any]], status["OrdStatusResLst"])
+                        for sub_status in ord_status_list:
                             if str(sub_status.get("ScripCode")) == str(order.scrip_code):
                                 exch_order_id = str(sub_status.get("ExchOrderID") or "")
                                 trading_logger.log_info(
@@ -3629,11 +3773,12 @@ class FivePaisa(BrokerBase):
                     if delete:
                         try:
                             internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
-                            trading_logger.log_info(
-                                "Deleting broker order ID",
-                                {"broker_order_id": broker_order_id, "internal_order_id": internal_order_id},
-                            )
-                            delete_broker_order_id(self, internal_order_id, broker_order_id)
+                            if internal_order_id is not None:
+                                trading_logger.log_info(
+                                    "Deleting broker order ID",
+                                    {"broker_order_id": broker_order_id, "internal_order_id": internal_order_id},
+                                )
+                                delete_broker_order_id(self, str(internal_order_id), broker_order_id)
                         except Exception as e:
                             trading_logger.log_error(
                                 "Error deleting broker order ID", e, {"broker_order_id": broker_order_id}
@@ -3742,12 +3887,18 @@ class FivePaisa(BrokerBase):
 
             if code is not None:
                 try:
-                    lot_size = self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
+                    lot_size_result = self.codes.loc[self.codes.Scripcode == code, "LotSize"]
+                    # Handle both Series (multiple matches) and scalar (single match) cases
+                    if isinstance(lot_size_result, pd.Series):
+                        lot_size = cast(float, lot_size_result.iloc[0])
+                    else:
+                        # Single match returns scalar
+                        lot_size = cast(float, lot_size_result)
                     trading_logger.log_debug(
                         "Lot size retrieved successfully",
                         {"long_symbol": long_symbol, "exchange": exchange, "code": code, "lot_size": lot_size},
                     )
-                    return lot_size
+                    return int(lot_size)
                 except Exception as e:
                     trading_logger.log_warning(
                         "Error retrieving lot size from codes",

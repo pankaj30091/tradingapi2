@@ -630,6 +630,7 @@ def get_pnl_table(
                 if refresh_status:
                     try:
                         for exit_key in exit_keys:
+                            order = Order(**cast(dict, broker.redis_o.hgetall(exit_key)))
                             broker_order_id = order.broker_order_id
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:

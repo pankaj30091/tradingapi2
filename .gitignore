@@ -32,3 +32,4 @@ tests/
 setup.cfg
 tradingapi/testing.py
 tradingapi/config/config_prod.yaml
+tradingapi/icicidirect.py

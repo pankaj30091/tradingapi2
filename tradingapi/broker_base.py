@@ -119,33 +119,33 @@ class Order:
         self,
         long_symbol: str = "",
         order_type: str = "",
-        price_type: float = 0.0,
-        quantity: int = 0,
+        price_type: Union[float, str] = 0.0,
+        quantity: Union[int, str] = 0,
         exchange: str = "",
         exchange_segment: str = "",
-        price: float = float("nan"),
-        is_intraday: bool = True,
+        price: Union[float, str] = float("nan"),
+        is_intraday: Union[bool, str] = True,
         internal_order_id: str = "",
         remote_order_id: str = "",
-        scrip_code: int = 0,
+        scrip_code: Union[int, str] = 0,
         exch_order_id: str = "0",
         broker_order_id: str = "0",
-        stoploss_price: float = 0.0,
-        trigger_price: float = float("nan"),
-        is_stoploss_order: bool = False,
-        ioc_order: bool = False,
+        stoploss_price: Union[float, str] = 0.0,
+        trigger_price: Union[float, str] = float("nan"),
+        is_stoploss_order: Union[bool, str] = False,
+        ioc_order: Union[bool, str] = False,
         scripdata: str = "",
         orderRef: str = "",
-        order_id: int = 0,
-        local_order_id: int = 0,
-        disqty: int = 0,
+        order_id: Union[int, str] = 0,
+        local_order_id: Union[int, str] = 0,
+        disqty: Union[int, str] = 0,
         message: str = "",
         status: str = "UNDEFINED",
         vtd: str = f"/Date({NEXT_DAY_TIMESTAMP})/",
         ahplaced: str = "N",
-        IsGTCOrder: bool = False,
-        IsEOSOrder: bool = False,
-        paper: bool = True,
+        IsGTCOrder: Union[bool, str] = False,
+        IsEOSOrder: Union[bool, str] = False,
+        paper: Union[bool, str] = True,
         broker: str = "UNDEFINED",
         additional_info: str = "",
         **kwargs: Any,
@@ -190,7 +190,16 @@ class Order:
             ValidationError: If input parameters are invalid
         """
         self.long_symbol = long_symbol
-        self.price_type = price_type
+        # Handle price_type: preserve lists, keep strings as-is, convert numbers to float
+        if isinstance(price_type, list):
+            if len(price_type) == 1 and not isinstance(price_type[0], list):
+                self.price_type = price_type[0]
+            else:
+                self.price_type = price_type
+        elif isinstance(price_type, str) and price_type.strip():
+            self.price_type = price_type.strip()
+        else:
+            self.price_type = self._convert_to_float(price_type, "price_type")
         self.order_type = order_type
         self.quantity = self._convert_to_int(quantity, "quantity")
         self.price = self._convert_to_float(price, "price")
@@ -538,16 +547,22 @@ class Price:
                 return float("nan")
             return a + b
 
+        def safe_add_volume(a, b):
+            # For volume fields, return 0 if either value is NaN
+            if math.isnan(a) or math.isnan(b):
+                return 0
+            return a + b
+
         return Price(
             bid=safe_add(self.bid, other.bid),
             ask=safe_add(self.ask, other.ask),
-            bid_volume=safe_add(self.bid_volume, other.bid_volume),
-            ask_volume=safe_add(self.ask_volume, other.ask_volume),
+            bid_volume=safe_add_volume(self.bid_volume, other.bid_volume),
+            ask_volume=safe_add_volume(self.ask_volume, other.ask_volume),
             prior_close=safe_add(self.prior_close, other.prior_close),
             last=safe_add(self.last, other.last),
             high=safe_add(self.high, other.high),
             low=safe_add(self.low, other.low),
-            volume=safe_add(self.volume, other.volume),
+            volume=safe_add_volume(self.volume, other.volume),
         )
         # dont change symbol
 

@@ -14,7 +14,9 @@ import threading
 import time
 import traceback
 import zipfile
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, TypeVar, Union, cast
+
+T = TypeVar("T")
 
 import numpy as np
 import pandas as pd
@@ -22,7 +24,16 @@ import pyotp
 import pytz
 import redis
 import requests
-from chameli.dateutils import valid_datetime, get_expiry
+from chameli.dateutils import parse_datetime, get_expiry
+
+
+def _validate_datetime_input(date_input):
+    """Helper function to validate datetime input for decorators. Returns True if valid, False if invalid."""
+    try:
+        parse_datetime(date_input)
+        return True
+    except (ValueError, TypeError):
+        return False
 from NorenRestApiPy.NorenApi import NorenApi
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
@@ -48,10 +59,10 @@ logger = logging.getLogger(__name__)
 
 
 # Exception handler
-def my_handler(typ, value, trace):
+def my_handler(typ, value, trace) -> None:
     trading_logger.log_error(
         "Unhandled exception",
-        {
+        context={
             "exception_type": typ.__name__,
             "exception_value": str(value),
             "traceback": "".join(traceback.format_tb(trace)),
@@ -74,8 +85,8 @@ class ShoonyaApiPy(NorenApi):
 
 @log_execution_time
 @retry_on_error(max_retries=3, delay=2.0, backoff_factor=2.0)
-def save_symbol_data(saveToFolder: bool = True):
-    def merge_without_last(lst):
+def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
+    def merge_without_last(lst) -> str:
         if len(lst) > 1:
             return "-".join(lst[:-1])
         else:
@@ -114,7 +125,7 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes = codes[(codes.Instrument.isin(["EQ", "BE", "XX", "BZ", "RR", "IV", "INDEX"]))]
                 codes["long_symbol"] = None
 
-                def process_row(row):
+                def process_row(row) -> str:
                     symbol = row["Symbol"]
                     if row["Instrument"] == "INDEX":
                         return f"{symbol}_IND___".upper()
@@ -168,7 +179,7 @@ def save_symbol_data(saveToFolder: bool = True):
                 ]
                 codes["long_symbol"] = None
 
-                def process_row(row):
+                def process_row(row) -> str:
                     symbol = row["Symbol"]
                     if row["Instrument"] == "INDEX":
                         return f"{symbol}_IND___".upper()
@@ -237,7 +248,7 @@ def save_symbol_data(saveToFolder: bool = True):
                 # Fallback: if no match, keep entire TradingSymbol as Symbol
                 codes_fno["Symbol"] = codes_fno["Symbol"].fillna(codes_fno["TradingSymbol"])
 
-                def process_row(row):
+                def process_row(row) -> str:
                     symbol = row["Symbol"]
                     if row["Instrument"].startswith("OPT"):
                         return f"{symbol}_OPT_{row['Expiry']}_{'CALL' if row['OptionType']=='CE' else 'PUT'}_{row['StrikePrice']:g}".upper()
@@ -288,7 +299,7 @@ def save_symbol_data(saveToFolder: bool = True):
                     expand=True,
                 )
 
-                def process_row(row):
+                def process_row(row) -> str:
                     symbol = row["Symbol"]
                     if row["Instrument"].startswith("OPT"):
                         return f"{symbol}_OPT_{row['Expiry']}_{'CALL' if row['OptionType']=='CE' else 'PUT'}_{row['StrikePrice']:g}".upper()
@@ -334,7 +345,7 @@ class Shoonya(BrokerBase):
         self.subscribed_symbols = []
         self.socket_opened = False
 
-    def _get_adjusted_expiry_date(self, year, month):
+    def _get_adjusted_expiry_date(self, year, month) -> dt.datetime:
         """
         Finds the last Friday or the nearest preceding business day, considering up to three consecutive weekday holidays.
         Assumes weekends (Saturday, Sunday) are non-business days.
@@ -357,7 +368,7 @@ class Shoonya(BrokerBase):
         raise ValueError("Could not determine a valid expiry day within expected range.")
 
     def _get_tradingsymbol_from_longname(self, long_name: str, exchange: str) -> str:
-        def reverse_split_fno(long_name, exchange):
+        def reverse_split_fno(long_name: str, exchange: str) -> str:
             if exchange in ["NSE", "NFO"]:
                 parts = long_name.split("_")
                 part1 = parts[0]
@@ -370,9 +381,11 @@ class Shoonya(BrokerBase):
                 if trading_symbol is not None:
                     return trading_symbol
                 else:
-                    return pd.NA
+                    return ""  # Return empty string for missing symbols
+            else:
+                return ""  # Return empty string for unsupported exchanges
 
-        def reverse_split_cash(long_name, exchange):
+        def reverse_split_cash(long_name: str, exchange: str) -> str:
             if exchange in ["NSE", "NFO"]:
                 parts = long_name.split("_")
                 # part1 = '-'.join(parts[0].split('-')[:-1]) if '-' in parts[0] else parts[0]
@@ -383,7 +396,7 @@ class Shoonya(BrokerBase):
                 part1 = parts[0]
                 return f"{part1}"
             else:
-                return pd.NA
+                return ""  # Return empty string for unsupported exchanges
 
         if "FUT" in long_name or "OPT" in long_name:
             return reverse_split_fno(long_name, exchange).upper()
@@ -392,7 +405,7 @@ class Shoonya(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
-    def connect(self, redis_db: int):
+    def connect(self, redis_db: int) -> bool:
         """
         Connect to Shoonya trading platform with enhanced session management.
 
@@ -403,7 +416,7 @@ class Shoonya(BrokerBase):
             ValueError: If configuration is missing or connection fails
         """
 
-        def _fresh_login(susertoken_path):
+        def _fresh_login(susertoken_path) -> None:
             """Perform fresh login with TOTP retry logic."""
             try:
                 trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
@@ -428,7 +441,8 @@ class Shoonya(BrokerBase):
                         missing_configs.append("TOKEN")
 
                     trading_logger.log_error(
-                        "Missing required configuration", {"broker": self.broker.name, "missing_configs": missing_configs}
+                        "Missing required configuration",
+                        context={"broker": self.broker.name, "missing_configs": missing_configs},
                     )
                     raise ValueError(f"Missing required configuration: {', '.join(missing_configs)}")
 
@@ -466,7 +480,7 @@ class Shoonya(BrokerBase):
                             else:
                                 trading_logger.log_error(
                                     "Login failed after all attempts",
-                                    {"broker": self.broker.name, "max_attempts": max_attempts},
+                                    context={"broker": self.broker.name, "max_attempts": max_attempts},
                                 )
                                 raise ValueError("Login failed - invalid response from broker after all attempts")
 
@@ -478,7 +492,9 @@ class Shoonya(BrokerBase):
                         with open(susertoken_path, "w") as file:
                             file.write(susertoken)
 
-                        trading_logger.log_info("Fresh login successful", {"broker": self.broker.name, "attempt": attempt})
+                        trading_logger.log_info(
+                            "Fresh login successful", {"broker": self.broker.name, "attempt": attempt}
+                        )
                         return  # Success, exit retry loop
 
                     except Exception as e:
@@ -501,11 +517,11 @@ class Shoonya(BrokerBase):
                 trading_logger.log_error("Error in _fresh_login", e, context)
                 raise AuthenticationError(f"Error in _fresh_login: {str(e)}", context)
 
-        def _verify_session(self):
+        def _verify_session(self) -> bool:
             """Verify if the current session is valid using existing is_connected method."""
             return self.is_connected()
 
-        def _restore_session_from_token(susertoken_path):
+        def _restore_session_from_token(susertoken_path) -> bool:
             """Attempt to restore session from existing token."""
             try:
                 user = config.get(f"{self.broker.name}.USER")
@@ -536,15 +552,15 @@ class Shoonya(BrokerBase):
                     return False
 
             except Exception as e:
-                trading_logger.log_warning("Failed to restore session", e, {"broker": self.broker.name})
+                trading_logger.log_error("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
-        def get_connected():
+        def get_connected() -> bool:
             """Main connection logic with robust session management."""
             susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
 
             if not susertoken_path:
-                trading_logger.log_error("USERTOKEN path not configured", {"broker": self.broker.name})
+                trading_logger.log_error("USERTOKEN path not configured", context={"broker": self.broker.name})
                 raise ValueError("USERTOKEN path not configured")
 
             # Check if we can use existing token
@@ -580,7 +596,7 @@ class Shoonya(BrokerBase):
                         return True
 
                 except Exception as e:
-                    trading_logger.log_warning(
+                    trading_logger.log_error(
                         "Error checking token file, performing fresh login",
                         e,
                         {"broker": self.broker.name, "susertoken_path": susertoken_path},
@@ -597,7 +613,7 @@ class Shoonya(BrokerBase):
 
             if config.get(f"{self.broker.name}") == {}:
                 context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
-                trading_logger.log_error("Configuration file not found or empty", context)
+                trading_logger.log_error("Configuration file not found or empty", context=context)
                 raise ValueError("Configuration file not found or empty")
 
             try:
@@ -646,7 +662,7 @@ class Shoonya(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
-    def is_connected(self):
+    def is_connected(self) -> bool:
         try:
             # Check if API object exists
             if not hasattr(self, "api") or self.api is None:
@@ -718,6 +734,9 @@ class Shoonya(BrokerBase):
             if not self.is_connected():
                 raise BrokerConnectionError("Shoonya broker is not connected")
 
+            if self.api is None:
+                raise BrokerConnectionError("Shoonya API is not initialized")
+
             limits = self.api.get_limits()
             if not limits:
                 raise MarketDataError("No limits data available")
@@ -727,11 +746,19 @@ class Shoonya(BrokerBase):
                 raise MarketDataError("No cash information in limits")
 
             cash_float = float(cash)
-            
+
             # Try to get collateral value (field name may vary)
             collateral = 0.0
-            collateral_fields = ["collateral", "Collateral", "collateralvalue", "CollateralValue",
-                               "holdingvalue", "HoldingValue", "securityvalue", "SecurityValue"]
+            collateral_fields = [
+                "collateral",
+                "Collateral",
+                "collateralvalue",
+                "CollateralValue",
+                "holdingvalue",
+                "HoldingValue",
+                "securityvalue",
+                "SecurityValue",
+            ]
             for field in collateral_fields:
                 if field in limits:
                     try:
@@ -742,7 +769,12 @@ class Shoonya(BrokerBase):
 
             trading_logger.log_debug(
                 "Available capital retrieved",
-                {"cash": cash_float, "collateral": collateral, "total_capital": cash_float + collateral, "broker": self.broker.name},
+                {
+                    "cash": cash_float,
+                    "collateral": collateral,
+                    "total_capital": cash_float + collateral,
+                    "broker": self.broker.name,
+                },
             )
             return {"cash": cash_float, "collateral": collateral}
 
@@ -753,7 +785,7 @@ class Shoonya(BrokerBase):
             trading_logger.log_error("Error getting available capital", e, context)
             raise MarketDataError(f"Failed to get available capital: {str(e)}", context)
 
-    def disconnect(self):
+    def disconnect(self) -> bool:
         """
         Disconnect from the Shoonya trading platform.
 
@@ -784,7 +816,7 @@ class Shoonya(BrokerBase):
             trading_logger.log_error("Failed to disconnect from Shoonya", e, context)
             raise BrokerConnectionError(f"Failed to disconnect from Shoonya: {str(e)}", context)
 
-    def update_symbology(self, **kwargs):
+    def update_symbology(self, **kwargs) -> pd.DataFrame:
         dt_today = get_tradingapi_now().strftime("%Y%m%d")
         symbols_path = os.path.join(config.get(f"{self.broker.name}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
         if not os.path.exists(symbols_path):
@@ -818,7 +850,7 @@ class Shoonya(BrokerBase):
 
         return codes
 
-    def log_and_return(self, any_object):
+    def log_and_return(self, any_object: T) -> T:
         """
         Log and return an object with enhanced error handling.
 
@@ -845,10 +877,11 @@ class Shoonya(BrokerBase):
                 if hasattr(any_object, "to_dict"):
                     # Try to get the object's __dict__
                     try:
-                        log_object = any_object.to_dict()  # Use the object's attributes as a dictionary
+                        log_object = getattr(any_object, "to_dict")()  # Use the object's attributes as a dictionary
                     except Exception as e:
                         trading_logger.log_warning(
-                            "Error converting object to dict", {"error": str(e), "object_type": type(any_object).__name__}
+                            "Error converting object to dict",
+                            {"error": str(e), "object_type": type(any_object).__name__},
                         )
                         log_object = {"error": f"Error accessing to_dict: {str(e)}"}
                 else:
@@ -856,7 +889,11 @@ class Shoonya(BrokerBase):
                     log_object = any_object
 
                 # Add the calling function name to the log
-                log_entry = {"caller": caller_function, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "object": log_object}
+                log_entry = {
+                    "caller": caller_function,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "object": log_object,
+                }
 
                 # Log the entry to Redis
                 try:
@@ -875,7 +912,9 @@ class Shoonya(BrokerBase):
 
             except Exception as e:
                 context = create_error_context(object_type=type(any_object).__name__, error=str(e))
-                trading_logger.log_warning("Error logging object to Redis", {"error": str(e), "object_type": type(any_object).__name__})
+                trading_logger.log_warning(
+                    "Error logging object to Redis", {"error": str(e), "object_type": type(any_object).__name__}
+                )
                 return any_object  # Return object even if logging fails
 
         except (ValidationError, RedisError):
@@ -896,13 +935,16 @@ class Shoonya(BrokerBase):
     )
     def place_order(self, order: Order, **kwargs) -> Order:
         try:
+            if self.api is None:
+                raise BrokerConnectionError("Shoonya API is not initialized")
+
             order.broker = self.broker
 
             # Validate exchange mapping exists
             if order.exchange not in self.exchange_mappings:
                 trading_logger.log_error(
                     "Exchange not found in mappings",
-                    {"exchange": order.exchange, "available_exchanges": list(self.exchange_mappings.keys())},
+                    context={"exchange": order.exchange, "available_exchanges": list(self.exchange_mappings.keys())},
                 )
                 return order
 
@@ -916,7 +958,7 @@ class Shoonya(BrokerBase):
                     order.order_type = "S"
                 else:
                     trading_logger.log_error(
-                        "Invalid order type", {"order_type": order.order_type, "long_symbol": order.long_symbol}
+                        "Invalid order type", context={"order_type": order.order_type, "long_symbol": order.long_symbol}
                     )
                     return order
                 order.remote_order_id = get_tradingapi_now().strftime("%Y%m%d%H%M%S%f")[:-4]
@@ -934,7 +976,7 @@ class Shoonya(BrokerBase):
                         if not trading_symbol:
                             trading_logger.log_error(
                                 "Failed to get trading symbol",
-                                {"long_symbol": order.long_symbol, "exchange": order.exchange},
+                                context={"long_symbol": order.long_symbol, "exchange": order.exchange},
                             )
                             return order
 
@@ -953,13 +995,22 @@ class Shoonya(BrokerBase):
                         )
 
                         trading_logger.log_info(
-                            "Shoonya order info", {"order_info": json.dumps(out, indent=4, default=str), "long_symbol": order.long_symbol, "broker_order_id": order.broker_order_id if hasattr(order, 'broker_order_id') else None}
+                            "Shoonya order info",
+                            {
+                                "order_info": json.dumps(out, indent=4, default=str),
+                                "long_symbol": order.long_symbol,
+                                "broker_order_id": order.broker_order_id if hasattr(order, "broker_order_id") else None,
+                            },
                         )
 
                         if not out:
                             trading_logger.log_error(
                                 "Empty response from broker",
-                                {"order": str(order), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                context={
+                                    "order": str(order),
+                                    "long_symbol": order.long_symbol,
+                                    "internal_order_id": order.internal_order_id,
+                                },
                             )
                             order.status = OrderStatus.REJECTED
                             order.message = "Empty response from broker"
@@ -968,7 +1019,12 @@ class Shoonya(BrokerBase):
                         if out.get("stat") is None:
                             trading_logger.log_error(
                                 "Error placing order",
-                                {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                context={
+                                    "order": str(order),
+                                    "response": str(out),
+                                    "long_symbol": order.long_symbol,
+                                    "internal_order_id": order.internal_order_id,
+                                },
                             )
                             order.status = OrderStatus.REJECTED
                             order.message = "Invalid response from broker"
@@ -983,7 +1039,12 @@ class Shoonya(BrokerBase):
                             if not order.broker_order_id:
                                 trading_logger.log_error(
                                     "No broker order ID in response",
-                                    {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                    context={
+                                        "order": str(order),
+                                        "response": str(out),
+                                        "long_symbol": order.long_symbol,
+                                        "internal_order_id": order.internal_order_id,
+                                    },
                                 )
                                 order.status = OrderStatus.REJECTED
                                 order.message = "No broker order ID in response"
@@ -1010,12 +1071,17 @@ class Shoonya(BrokerBase):
                             if order.price == 0:
                                 if fills.fill_price > 0 and order.price == 0:
                                     order.price = fills.fill_price
-                            
+
                             trading_logger.log_info("Placed Order", {"order": str(order)})
                         else:
                             trading_logger.log_error(
                                 "Order placement failed",
-                                {"order": str(order), "response": str(out), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                                context={
+                                    "order": str(order),
+                                    "response": str(out),
+                                    "long_symbol": order.long_symbol,
+                                    "internal_order_id": order.internal_order_id,
+                                },
                             )
                             order.status = OrderStatus.REJECTED
                             order.message = out.get("emsg", "Order placement failed")
@@ -1025,7 +1091,11 @@ class Shoonya(BrokerBase):
                         trading_logger.log_error(
                             "Exception during order placement",
                             e,
-                            {"order": str(order), "long_symbol": order.long_symbol, "internal_order_id": order.internal_order_id}
+                            {
+                                "order": str(order),
+                                "long_symbol": order.long_symbol,
+                                "internal_order_id": order.internal_order_id,
+                            },
                         )
                         order.status = OrderStatus.REJECTED
                         order.message = f"Exception during order placement: {str(e)}"
@@ -1069,8 +1139,16 @@ class Shoonya(BrokerBase):
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
         broker_order_id = kwargs.get("broker_order_id")
+        if broker_order_id is None:
+            raise ValueError("broker_order_id is required")
         new_price = float(kwargs.get("new_price", 0.0))
         new_quantity = int(kwargs.get("new_quantity", 0))
+
+        # Check connection before proceeding
+        if not self.is_connected():
+            raise BrokerConnectionError("Shoonya broker is not connected")
+
+        assert self.api is not None  # Type checker assurance after connection check
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.broker_order_id != "0":
             fills = self.get_order_info(broker_order_id=broker_order_id)
@@ -1178,21 +1256,30 @@ class Shoonya(BrokerBase):
 
     @log_execution_time
     @validate_inputs(broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0)
-    def cancel_order(self, **kwargs):
+    def cancel_order(self, **kwargs) -> Order:
         """
         mandatory_keys = ['broker_order_id']
 
         """
+        if self.api is None:
+            raise BrokerConnectionError("Shoonya API is not initialized")
+
         mandatory_keys = ["broker_order_id"]
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
         if missing_keys:
             raise ValueError(f"Missing mandatory keys: {', '.join(missing_keys)}")
         broker_order_id = kwargs.get("broker_order_id")
+        if broker_order_id is None:
+            raise ValueError("broker_order_id is required")
 
         order = Order(**self.redis_o.hgetall(broker_order_id))
         if order.status in [OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.UNDEFINED]:
-            valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-            if valid_date and valid_date == dt.datetime.today().strftime("%Y-%m-%d"):
+            try:
+                valid_date = parse_datetime(order.remote_order_id[:8])
+                date_matches = valid_date.strftime("%Y-%m-%d") == dt.datetime.today().strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                date_matches = False
+            if date_matches:
                 fills = self.get_order_info(broker_order_id=broker_order_id)
                 if fills.fill_size < round(float(order.quantity)):
                     trading_logger.log_info(
@@ -1208,9 +1295,10 @@ class Shoonya(BrokerBase):
                     self.log_and_return(out)
                     fills = update_order_status(self, order.internal_order_id, broker_order_id, eod=True)
                     self.log_and_return(fills)
-                    order.status = fills.status
-                    order.quantity = fills.fill_size
-                    order.price = fills.fill_price
+                    if fills is not None:
+                        order.status = fills.status
+                        order.quantity = fills.fill_size
+                        order.price = fills.fill_price
                     self.log_and_return(order)
                     return order
         self.log_and_return(order)
@@ -1224,12 +1312,19 @@ class Shoonya(BrokerBase):
         mandatory_keys = ['broker_order_id']
 
         """
+        if self.api is None:
+            raise BrokerConnectionError("Shoonya API is not initialized")
+
         trading_logger.log_debug("Getting order info", {"broker_order_id": kwargs.get("broker_order_id")})
 
-        def return_db_as_fills(order: Order):
+        def return_db_as_fills(order: Order) -> OrderInfo:
             order_info = OrderInfo()
-            valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-            if valid_date and valid_date != dt.datetime.today().strftime("%Y-%m-%d"):
+            try:
+                valid_date = parse_datetime(order.remote_order_id[:8])
+                date_differs = valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                date_differs = False
+            if date_differs:
                 order_info.status = order.status
             else:
                 order_info.status = OrderStatus.HISTORICAL
@@ -1269,10 +1364,14 @@ class Shoonya(BrokerBase):
                 broker=self.broker,
             )
 
-        valid_date, _ = valid_datetime(order.remote_order_id[:8], "%Y-%m-%d")
-        if (
-            valid_date
-            and valid_date != dt.datetime.today().strftime("%Y-%m-%d")
+        try:
+            valid_date = parse_datetime(order.remote_order_id[:8])
+            date_valid = True
+        except (ValueError, TypeError):
+            date_valid = False
+        # Compare as string: valid_date is datetime from parse_datetime; only use return_db_as_fills for past days
+        if date_valid and (
+            valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
             or (order.remote_order_id != "" and order.broker != self.broker)
         ):
             return return_db_as_fills(order)
@@ -1307,8 +1406,8 @@ class Shoonya(BrokerBase):
     @log_execution_time
     @validate_inputs(
         symbols=lambda x: x is not None and (isinstance(x, str) or isinstance(x, dict) or isinstance(x, pd.DataFrame)),
-        date_start=lambda x: valid_datetime(x)[0] is not False,
-        date_end=lambda x: valid_datetime(x)[0] is not False,
+        date_start=lambda x: _validate_datetime_input(x),
+        date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
@@ -1341,6 +1440,9 @@ class Shoonya(BrokerBase):
             Dict[str, List[HistoricalData]]: Dictionary with historical data for each symbol.
         """
         try:
+            if self.api is None:
+                raise BrokerConnectionError("Shoonya API is not initialized")
+
             trading_logger.log_debug(
                 "Getting historical data",
                 {
@@ -1366,51 +1468,58 @@ class Shoonya(BrokerBase):
             if refresh_mapping:
                 try:
                     # Parse date_end to get YYYYMMDD format
-                    date_end_str, _ = valid_datetime(date_end, "%Y-%m-%d")
-                    date_end_obj = dt.datetime.strptime(date_end_str, "%Y-%m-%d")
+                    try:
+                        date_end_dt = parse_datetime(date_end)
+                        date_end_str = date_end_dt.strftime("%Y-%m-%d")
+                        date_end_valid = True
+                    except (ValueError, TypeError):
+                        date_end_valid = False
+                    if not date_end_valid:
+                        raise ValueError(f"Invalid date_end format: {date_end}")
+                    date_end_obj = dt.datetime.strptime(str(date_end_str), "%Y-%m-%d")
                     date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
-                    
+
                     # Get symbol codes path from config
                     symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
                     if not symbol_codes_path:
                         context = create_error_context(broker_name=self.broker.name)
-                        raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.broker.name}", context)
-                    
+                        raise ConfigurationError(
+                            f"SYMBOLCODES path not found in config for {self.broker.name}", context
+                        )
+
                     # Construct path to symbols file
                     symbols_file_path = os.path.join(symbol_codes_path, f"{date_end_yyyymmdd}_symbols.csv")
-                    
+
                     trading_logger.log_debug(
                         "Loading symbol mapping from file",
-                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd}
+                        {"symbols_file_path": symbols_file_path, "date": date_end_yyyymmdd},
                     )
-                    
+
                     if not os.path.exists(symbols_file_path):
                         trading_logger.log_warning(
-                            "Symbols file not found for refresh_mapping",
-                            {"symbols_file_path": symbols_file_path}
+                            "Symbols file not found for refresh_mapping", {"symbols_file_path": symbols_file_path}
                         )
                         # Fall back to default mapping
                         refresh_symbol_map = None
                     else:
                         # Load the CSV file
                         codes = pd.read_csv(symbols_file_path)
-                        
+
                         # Create symbol_map and exchangetype_map for each exchange
                         refresh_symbol_map = {}
                         refresh_exchangetype_map = {}
                         for exch, group in codes.groupby("Exch"):
                             refresh_symbol_map[exch] = dict(zip(group["long_symbol"], group["Scripcode"]))
                             refresh_exchangetype_map[exch] = dict(zip(group["long_symbol"], group["ExchType"]))
-                        
+
                         trading_logger.log_debug(
                             "Symbol mapping loaded from file",
-                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)}
+                            {"exchanges": list(refresh_symbol_map.keys()), "total_symbols": len(codes)},
                         )
                 except Exception as e:
                     trading_logger.log_warning(
                         "Error loading symbol mapping from file, falling back to default",
                         {"error": str(e)},
-                        exc_info=True
                     )
                     refresh_symbol_map = None
                     refresh_exchangetype_map = None
@@ -1428,7 +1537,7 @@ class Shoonya(BrokerBase):
                     symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
                 else:
                     trading_logger.log_error(
-                        "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "string"}
+                        "Did not get ScripCode for symbols", context={"symbols": symbols, "symbol_type": "string"}
                     )
                     return {}
             elif isinstance(symbols, dict):
@@ -1437,7 +1546,7 @@ class Shoonya(BrokerBase):
                     symbols_pd = pd.DataFrame([{"long_symbol": symbols.get("long_symbol"), "Scripcode": scripCode}])
                 else:
                     trading_logger.log_error(
-                        "Did not get ScripCode for symbols", {"symbols": symbols, "symbol_type": "dict"}
+                        "Did not get ScripCode for symbols", context={"symbols": symbols, "symbol_type": "dict"}
                     )
                     return {}
             else:
@@ -1458,14 +1567,43 @@ class Shoonya(BrokerBase):
                 # we do the above remapping for downloading permin data to database for legacy reasons.
                 # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
 
-                date_start_dt, _ = valid_datetime(date_start, None)
-                date_end, _ = valid_datetime(date_end, "%Y%m%d")
-                date_end_dt, _ = valid_datetime(date_end + " " + market_close_time, None)
-                if isinstance(date_start_dt, dt.date) and not isinstance(date_start_dt, dt.datetime):
-                    date_start_dt = dt.datetime.combine(date_start_dt, dt.datetime.min.time())
-                if isinstance(date_end_dt, dt.date) and not isinstance(date_end_dt, dt.datetime):
-                    date_end_dt = dt.datetime.combine(date_end_dt, dt.datetime.min.time())
+                # Parse date_start (accepts datetime, date, or string) -> datetime for API
                 try:
+                    date_start_parsed = parse_datetime(date_start)
+                    date_start_valid = True
+                except (ValueError, TypeError):
+                    date_start_valid = False
+                if (
+                    not date_start_valid
+                    or date_start_parsed is None
+                    or not isinstance(date_start_parsed, (dt.datetime, dt.date))
+                ):
+                    raise ValueError(f"Invalid date_start format: {date_start}")
+                date_start_dt = dt.datetime.strptime(
+                    date_start_parsed.strftime("%Y-%m-%d") + " " + market_open_time,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+
+                # Parse date_end (accepts datetime, date, or string) -> datetime for API
+                try:
+                    date_end_parsed = parse_datetime(date_end)
+                    date_end_valid = True
+                except (ValueError, TypeError):
+                    date_end_valid = False
+                if (
+                    not date_end_valid
+                    or date_end_parsed is None
+                    or not isinstance(date_end_parsed, (dt.datetime, dt.date))
+                ):
+                    raise ValueError(f"Invalid date_end format: {date_end}")
+                date_end_dt = dt.datetime.strptime(
+                    date_end_parsed.strftime("%Y-%m-%d") + " " + market_close_time,
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                data: Optional[List] = None
+                try:
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
                     if periodicity.endswith("m"):
                         data = self.api.get_time_price_series(
                             exchange=exch,
@@ -1477,16 +1615,17 @@ class Shoonya(BrokerBase):
                     elif periodicity == "1d":
                         if row_outer["long_symbol"] == "NSENIFTY_IND___":
                             row_outer["long_symbol"] = "NIFTY_IND___"
-                        trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(row_outer["long_symbol"])
+                        trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(
+                            row_outer["long_symbol"]
+                        )
 
-                        def _timeout_handler(signum, frame):
+                        def _timeout_handler(signum, frame) -> None:
                             raise TimeoutError("daily_price_series call timed out")
 
                         signal.signal(signal.SIGALRM, _timeout_handler)  # Install the handler
 
                         attempts = 3
                         wait_seconds = 2
-                        data = None
 
                         for attempt in range(attempts):
                             start_time = time.time()
@@ -1525,31 +1664,36 @@ class Shoonya(BrokerBase):
                     )
                     data = None
 
-                if not (data is None or len(data) == 0):
-                    market_open = pd.to_datetime(market_open_time).time()
-                    market_close = pd.to_datetime(market_close_time).time()
-                    for d in data:
-                        if isinstance(d, str):
-                            d = json.loads(d)
-                        if periodicity.endswith("m"):
-                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S")))
-                            # Filter by market open/close time for intraday
-                            if not (market_open <= date.time() < market_close):
-                                continue
-                        elif periodicity == "1d":
-                            date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
-                        historical_data = HistoricalData(
-                            date=date,
-                            open=float(d.get("into", "nan")),
-                            high=float(d.get("inth", "nan")),
-                            low=float(d.get("intl", "nan")),
-                            close=float(d.get("intc", "nan")),
-                            volume=int(float((d.get("intv", 0)))),
-                            intoi=int(float(d.get("intoi", 0))),
-                            oi=int(float(d.get("oi", 0))),
-                        )
-                        historical_data_list.append(historical_data)
+                # Process data if available
+                if data is not None and isinstance(data, list):  # type: ignore[reportUnreachable]
+                    if len(data) > 0:
+                        market_open = pd.to_datetime(market_open_time).time()
+                        market_close = pd.to_datetime(market_close_time).time()
+                        for d in data:
+                            if isinstance(d, str):
+                                d = json.loads(d)
+                            if periodicity.endswith("m"):
+                                date = pd.Timestamp(
+                                    timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S"))
+                                )
+                                # Filter by market open/close time for intraday
+                                if not (market_open <= date.time() < market_close):
+                                    continue
+                            elif periodicity == "1d":
+                                date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
+                            historical_data = HistoricalData(
+                                date=date,
+                                open=float(d.get("into", "nan")),
+                                high=float(d.get("inth", "nan")),
+                                low=float(d.get("intl", "nan")),
+                                close=float(d.get("intc", "nan")),
+                                volume=int(float((d.get("intv", 0)))),
+                                intoi=int(float(d.get("intoi", 0))),
+                                oi=int(float(d.get("oi", 0))),
+                            )
+                            historical_data_list.append(historical_data)
                 else:
+                    # data is None or empty list
                     trading_logger.log_debug("No data found for symbol", {"long_symbol": row_outer["long_symbol"]})
                     historical_data_list.append(
                         HistoricalData(
@@ -1583,7 +1727,9 @@ class Shoonya(BrokerBase):
                         )
                     except Exception as e:
                         trading_logger.log_error(
-                            "Error in get_time_price_series for intraday data", e, {"long_symbol": row_outer["long_symbol"]}
+                            "Error in get_time_price_series for intraday data",
+                            e,
+                            {"long_symbol": row_outer["long_symbol"]},
                         )
                         intraday_data = None
 
@@ -1612,10 +1758,10 @@ class Shoonya(BrokerBase):
                         date_start = timezone.localize(date_start_dt)
                         date_end = timezone.localize(date_end_dt)
                         for _, row in df_intraday.iterrows():
-                            date = pd.Timestamp(row.name).tz_localize(timezone)
+                            date = pd.Timestamp(row.name).tz_localize(timezone)  # type: ignore
                             if date_start <= date <= date_end:
                                 historical_data = HistoricalData(
-                                    date=pd.Timestamp(row.name).tz_localize(timezone),
+                                    date=date,
                                     open=row["into"],
                                     high=row["inth"],
                                     low=row["intl"],
@@ -1641,7 +1787,7 @@ class Shoonya(BrokerBase):
             )
             return {}
 
-    def map_exchange_for_api(self, long_symbol, exchange):
+    def map_exchange_for_api(self, long_symbol, exchange) -> str:
         """
         Map the exchange for API based on the long symbol and exchange.
 
@@ -1667,7 +1813,7 @@ class Shoonya(BrokerBase):
             }
 
             # Return mapped exchange if "N" or "B", otherwise default to the given exchange
-            result = exchange_map.get(exchange, exchange)
+            result = cast(str, exchange_map.get(exchange, exchange))
 
             trading_logger.log_debug(
                 "Exchange mapped for API",
@@ -1683,7 +1829,7 @@ class Shoonya(BrokerBase):
             context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
             raise ValidationError(f"Unexpected error mapping exchange for API: {str(e)}", context)
 
-    def map_exchange_for_db(self, long_symbol, exchange):
+    def map_exchange_for_db(self, long_symbol, exchange) -> str:
         """
         Map the exchange for the database based on the exchange's starting letter.
 
@@ -1722,7 +1868,7 @@ class Shoonya(BrokerBase):
             context = create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e))
             raise ValidationError(f"Unexpected error mapping exchange for DB: {str(e)}", context)
 
-    def convert_ft_to_ist(self, ft: int):
+    def convert_ft_to_ist(self, ft: int) -> str:
         """
         Convert a timestamp to IST date and time.
 
@@ -1769,6 +1915,8 @@ class Shoonya(BrokerBase):
             Price: Quote details.
         """
         try:
+            if self.api is None:
+                raise BrokerConnectionError("Shoonya API is not initialized")
             trading_logger.log_debug("Fetching quote", {"long_symbol": long_symbol, "exchange": exchange})
             mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
             market_feed = Price()  # Initialize with default values
@@ -1779,14 +1927,18 @@ class Shoonya(BrokerBase):
             if mapped_exchange not in self.exchange_mappings:
                 trading_logger.log_error(
                     "Exchange mapping not found",
-                    {"mapped_exchange": mapped_exchange, "available_exchanges": list(self.exchange_mappings.keys())},
+                    context={
+                        "mapped_exchange": mapped_exchange,
+                        "available_exchanges": list(self.exchange_mappings.keys()),
+                    },
                 )
                 return market_feed
 
             token = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
             if token is None:
                 trading_logger.log_error(
-                    "No token found for symbol", {"long_symbol": long_symbol, "mapped_exchange": mapped_exchange}
+                    "No token found for symbol",
+                    context={"long_symbol": long_symbol, "mapped_exchange": mapped_exchange},
                 )
                 return market_feed  # Return default Price object if no token is found
 
@@ -1801,7 +1953,7 @@ class Shoonya(BrokerBase):
                     return market_feed
 
                 # Safely extract and convert values with validation
-                def safe_float(value, default=float("nan")):
+                def safe_float(value, default=float("nan")) -> float:
                     """Safely convert value to float with validation."""
                     if value in [None, 0, "0", "0.00", float("nan"), ""]:
                         return default
@@ -1810,7 +1962,7 @@ class Shoonya(BrokerBase):
                     except (ValueError, TypeError):
                         return default
 
-                def safe_int(value, default=0):
+                def safe_int(value, default=0) -> int:
                     """Safely convert value to int with validation."""
                     if value in [None, 0, "0", float("nan"), ""]:
                         return default
@@ -1833,7 +1985,7 @@ class Shoonya(BrokerBase):
                 try:
                     market_feed.exchange = self.map_exchange_for_db(long_symbol, tick_data.get("exch"))
                 except Exception as e:
-                    trading_logger.log_warning(
+                    trading_logger.log_error(
                         "Failed to map exchange for DB", e, {"long_symbol": long_symbol, "exch": tick_data.get("exch")}
                     )
                     market_feed.exchange = mapped_exchange
@@ -1846,7 +1998,7 @@ class Shoonya(BrokerBase):
                     else:
                         market_feed.timestamp = dt.datetime.now()
                 except Exception as e:
-                    trading_logger.log_warning(
+                    trading_logger.log_error(
                         "Failed to convert timestamp", e, {"long_symbol": long_symbol, "lut": tick_data.get("lut")}
                     )
                     market_feed.timestamp = dt.datetime.now()
@@ -1884,7 +2036,7 @@ class Shoonya(BrokerBase):
         symbols=lambda x: isinstance(x, list) and len(x) > 0,
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
-    def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE"):
+    def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE") -> None:
         """
         Start streaming quotes for the given symbols.
 
@@ -1894,6 +2046,9 @@ class Shoonya(BrokerBase):
             ext_callback (function): External callback function for processing price updates.
             exchange (str): Exchange name (default: 'NSE').
         """
+        if self.api is None:
+            raise BrokerConnectionError("Shoonya API is not initialized")
+
         try:
             trading_logger.log_info(
                 "Starting quotes streaming",
@@ -1901,14 +2056,16 @@ class Shoonya(BrokerBase):
             )
 
             if not symbols or len(symbols) == 0:
-                trading_logger.log_error("Symbols list cannot be empty", {"operation": operation, "exchange": exchange})
+                trading_logger.log_error(
+                    "Symbols list cannot be empty", context={"operation": operation, "exchange": exchange}
+                )
                 return
 
-            prices = {}
+            prices: Dict[str, Price] = {}
             mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
 
             # Function to map JSON data to a Price object
-            def map_to_price(json_data):
+            def map_to_price(json_data) -> Price:
                 price = Price()
                 price.src = "sh"
                 price.bid = (
@@ -1922,10 +2079,14 @@ class Shoonya(BrokerBase):
                     else float(json_data.get("sp1"))
                 )
                 price.bid_volume = (
-                    float("nan") if json_data.get("bq1") in [None, 0, "0", float("nan")] else float(json_data.get("bq1"))
+                    float("nan")
+                    if json_data.get("bq1") in [None, 0, "0", float("nan")]
+                    else float(json_data.get("bq1"))
                 )
                 price.ask_volume = (
-                    float("nan") if json_data.get("sq1") in [None, 0, "0", float("nan")] else float(json_data.get("sq1"))
+                    float("nan")
+                    if json_data.get("sq1") in [None, 0, "0", float("nan")]
+                    else float(json_data.get("sq1"))
                 )
                 price.prior_close = (
                     float("nan")
@@ -1955,7 +2116,7 @@ class Shoonya(BrokerBase):
                 return price
 
             # Function to handle incoming WebSocket messages
-            def on_message(message):
+            def on_message(message) -> None:
                 if message.get("t") == "tk":
                     price = map_to_price(message)
                     prices[message.get("tk")] = price
@@ -1972,55 +2133,58 @@ class Shoonya(BrokerBase):
                     required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l"}
                     if required_keys & message.keys():
                         price = prices.get(message.get("tk"))
-                        if message.get("bp1"):
-                            price.bid = float(message.get("bp1"))
-                        if message.get("sp1"):
-                            price.ask = float(message.get("sp1"))
-                        if message.get("bq1"):
-                            price.bid_volume = float(message.get("bq1"))
-                        if message.get("sq1"):
-                            price.ask_volume = float(message.get("sq1"))
-                        if message.get("c"):
-                            price.prior_close = float(message.get("c"))
-                        if message.get("lp"):
-                            price.last = float(message.get("lp"))
-                        if message.get("h"):
-                            price.high = float(message.get("h"))
-                        if message.get("l"):
-                            price.low = float(message.get("l"))
-                        if message.get("v"):
-                            price.volume = float(message.get("v"))
-                        price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
-                        prices[message.get("tk")] = price
-                        if ext_callback is not None:
-                            try:
-                                ext_callback(price)
-                            except Exception as e:
-                                trading_logger.log_error(
-                                    "Error in external price callback",
-                                    e,
-                                    {"symbol": price.symbol, "src": price.src},
-                                )
+                        if price is not None:
+                            if message.get("bp1"):
+                                price.bid = float(message.get("bp1"))
+                            if message.get("sp1"):
+                                price.ask = float(message.get("sp1"))
+                            if message.get("bq1"):
+                                price.bid_volume = float(message.get("bq1"))
+                            if message.get("sq1"):
+                                price.ask_volume = float(message.get("sq1"))
+                            if message.get("c"):
+                                price.prior_close = float(message.get("c"))
+                            if message.get("lp"):
+                                price.last = float(message.get("lp"))
+                            if message.get("h"):
+                                price.high = float(message.get("h"))
+                            if message.get("l"):
+                                price.low = float(message.get("l"))
+                            if message.get("v"):
+                                price.volume = float(message.get("v"))
+                            price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
+                            prices[message.get("tk")] = price
+                            if ext_callback is not None:
+                                try:
+                                    ext_callback(price)
+                                except Exception as e:
+                                    trading_logger.log_error(
+                                        "Error in external price callback",
+                                        e,
+                                        {"symbol": price.symbol, "src": price.src},
+                                    )
 
             # Function to handle WebSocket errors
-            def handle_socket_error(error=None):
+            def handle_socket_error(error=None) -> None:
                 if error:
-                    trading_logger.log_error("WebSocket error", {"error": str(error)})
+                    trading_logger.log_error("WebSocket error", context={"error": str(error)})
                 else:
                     trading_logger.log_error("WebSocket error. Connection to remote host was lost.")
 
-            def handle_socket_close(close_code=None, close_msg=None):
+            def handle_socket_close(close_code=None, close_msg=None) -> None:
                 if close_msg:
-                    trading_logger.log_error("WebSocket closed", {"close_msg": str(close_msg)})
+                    trading_logger.log_error("WebSocket closed", context={"close_msg": str(close_msg)})
                     initiate_reconnect()
 
-            def initiate_reconnect(max_retries=5, retry_delay=5):
+            def initiate_reconnect(max_retries=5, retry_delay=5) -> None:
                 """
                 Attempt to reconnect the WebSocket connection.
                 """
                 for attempt in range(max_retries):
                     try:
-                        trading_logger.log_info("Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries})
+                        trading_logger.log_info(
+                            "Reconnect attempt", {"attempt": attempt + 1, "max_retries": max_retries}
+                        )
 
                         # Close the existing WebSocket connection if open
                         if hasattr(self, "api") and self.api and hasattr(self, "socket_opened") and self.socket_opened:
@@ -2029,7 +2193,14 @@ class Shoonya(BrokerBase):
                                 self.socket_opened = False
                                 trading_logger.log_info("Closed existing WebSocket connection")
                             except Exception as e:
-                                trading_logger.log_warning("Failed to close existing WebSocket", e)
+                                trading_logger.log_warning(
+                                    "Failed to close existing WebSocket", context={"error": str(e)}
+                                )
+
+                        # Ensure API is initialized before attempting reconnection
+                        if self.api is None:
+                            trading_logger.log_error("Cannot reconnect: Shoonya API is not initialized")
+                            continue
 
                         # Reinitialize the WebSocket connection
                         connect_and_subscribe()
@@ -2044,7 +2215,9 @@ class Shoonya(BrokerBase):
                             trading_logger.log_info("WebSocket reconnected successfully.")
                             try:
                                 # Rebuild subscription list from all currently subscribed symbols
-                                active_symbols = list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
+                                active_symbols = (
+                                    list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
+                                )
                                 if active_symbols:
                                     reconnect_req_list = expand_symbols_to_request(active_symbols)
                                     trading_logger.log_info(
@@ -2071,7 +2244,9 @@ class Shoonya(BrokerBase):
 
                         # Wait before the next retry with exponential backoff
                         wait_time = retry_delay * (2**attempt)
-                        trading_logger.log_info("Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1})
+                        trading_logger.log_info(
+                            "Waiting before next retry", {"wait_time": wait_time, "attempt": attempt + 1}
+                        )
                         time.sleep(wait_time)
 
                 trading_logger.log_error("Max reconnect attempts reached. Unable to reconnect the WebSocket.")
@@ -2080,12 +2255,16 @@ class Shoonya(BrokerBase):
                     self.socket_opened = False
 
             # Function to handle WebSocket connection opening
-            def on_socket_open():
+            def on_socket_open() -> None:
                 trading_logger.log_info("WebSocket connection opened")
                 self.socket_opened = True
 
             # Function to establish WebSocket connection and subscribe
-            def connect_and_subscribe():
+            def connect_and_subscribe() -> None:
+                if self.api is None:
+                    trading_logger.log_error("Cannot start websocket: Shoonya API is not initialized")
+                    return
+
                 self.api.start_websocket(
                     subscribe_callback=on_message,
                     socket_close_callback=handle_socket_close,
@@ -2096,18 +2275,18 @@ class Shoonya(BrokerBase):
                     time.sleep(1)
 
             # Function to expand symbols into request format
-            def expand_symbols_to_request(symbol_list):
+            def expand_symbols_to_request(symbol_list) -> List[str]:
                 req_list = []
                 for symbol in symbol_list:
                     scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(symbol)
                     if scrip_code:
                         req_list.append(f"{mapped_exchange}|{scrip_code}")
                     else:
-                        trading_logger.log_error("Did not find scrip_code for symbol", {"symbol": symbol})
+                        trading_logger.log_error("Did not find scrip_code for symbol", context={"symbol": symbol})
                 return req_list
 
             # Function to update the subscription list
-            def update_subscription_list(operation, symbols):
+            def update_subscription_list(operation, symbols) -> None:
                 if operation == "s":
                     self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
                 elif operation == "u":
@@ -2144,7 +2323,10 @@ class Shoonya(BrokerBase):
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0))
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_position(self, long_symbol: str = ""):
+    def get_position(self, long_symbol: str = "") -> Union[float, pd.DataFrame, int]:
+        if self.api is None:
+            raise BrokerConnectionError("Shoonya API is not initialized")
+
         try:
             trading_logger.log_debug("Getting position", {"long_symbol": long_symbol if long_symbol else "all"})
 
@@ -2155,24 +2337,36 @@ class Shoonya(BrokerBase):
                 try:
                     raw_holding = get_holdings_fn()
                     holding = (
-                        pd.DataFrame(raw_holding)
+                        pd.DataFrame(raw_holding if isinstance(raw_holding, (list, dict)) else [])
                         if raw_holding
-                        else pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
-                    )
+                        else pd.DataFrame(columns=["long_symbol", "quantity"])
+                    ).astype({"quantity": float})
                     if len(holding) > 0:
                         try:
                             # Extract tsym from each row's exch_tsym list
                             holding["tsym"] = holding["exch_tsym"].apply(
-                                lambda x: x[0]["tsym"] if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) else None
+                                lambda x: (
+                                    x[0]["tsym"]
+                                    if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict)
+                                    else None
+                                )
                             )
-                            holding["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=holding["tsym"])
+                            holding["long_symbol"] = self.get_long_name_from_broker_identifier(
+                                ScripName=holding["tsym"]
+                            )
                             qty_col = "brkcolqty"
                             holding = holding.loc[:, ["long_symbol", qty_col]]
                             holding.columns = ["long_symbol", "quantity"]
                             holding["quantity"] = pd.to_numeric(holding["quantity"], errors="coerce").fillna(0)
                         except Exception as e:
-                            trading_logger.log_error("Error processing holdings data", e, {"holdings_count": len(holding)})
-                            holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float}).astype({"quantity": float})
+                            trading_logger.log_error(
+                                "Error processing holdings data", e, {"holdings_count": len(holding)}
+                            )
+                            holding = (
+                                pd.DataFrame(columns=["long_symbol", "quantity"])
+                                .astype({"quantity": float})
+                                .astype({"quantity": float})
+                            )
                 except Exception as e:
                     trading_logger.log_debug("Holdings not available, using positions only", {"error": str(e)})
                     holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
@@ -2197,9 +2391,7 @@ class Shoonya(BrokerBase):
             for col in ["quantity_x", "quantity_y"]:
                 if col in merged.columns:
                     merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(float)
-            result = merged.groupby("long_symbol", as_index=False).agg(
-                {"quantity_x": "sum", "quantity_y": "sum"}
-            )
+            result = merged.groupby("long_symbol", as_index=False).agg({"quantity_x": "sum", "quantity_y": "sum"})
             # Force numeric again after groupby (defensive for any dtype issues)
             qty_x = pd.to_numeric(result["quantity_x"], errors="coerce").fillna(0).astype(float)
             qty_y = pd.to_numeric(result["quantity_y"], errors="coerce").fillna(0).astype(float)
@@ -2228,7 +2420,7 @@ class Shoonya(BrokerBase):
                 else:
                     trading_logger.log_error(
                         "Multiple positions found for symbol",
-                        {"long_symbol": long_symbol, "position_count": len(pos_filtered)},
+                        context={"long_symbol": long_symbol, "position_count": len(pos_filtered)},
                     )
                     raise MarketDataError(f"Multiple positions found for symbol: {long_symbol}")
 
@@ -2241,7 +2433,7 @@ class Shoonya(BrokerBase):
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_orders_today(self, **kwargs):
+    def get_orders_today(self, **kwargs) -> pd.DataFrame:
         try:
             trading_logger.log_debug("Getting orders for today")
             result = super().get_orders_today(**kwargs)
@@ -2257,7 +2449,7 @@ class Shoonya(BrokerBase):
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_trades_today(self, **kwargs):
+    def get_trades_today(self, **kwargs) -> pd.DataFrame:
         try:
             trading_logger.log_debug("Getting trades for today")
             result = super().get_trades_today(**kwargs)
@@ -2273,7 +2465,7 @@ class Shoonya(BrokerBase):
 
     @log_execution_time
     @validate_inputs(ScripName=lambda x: isinstance(x, pd.Series) and len(x) > 0)
-    def get_long_name_from_broker_identifier(self, **kwargs):
+    def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
         """Generates Long Name
 
         Args:
@@ -2300,7 +2492,7 @@ class Shoonya(BrokerBase):
                 )
                 raise ValidationError("ScripName must be a non-empty pandas Series", context)
 
-            def split_fno(fno_symbol):
+            def split_fno(fno_symbol) -> str:
                 # Check if it's SENSEX format (ends with CE/PE)
                 if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
                     # Extract symbol
@@ -2352,9 +2544,11 @@ class Shoonya(BrokerBase):
                                 # We need to find the last working Tuesday of the month
                                 # For now, we'll use a placeholder day (25th)
                                 day = "25"  # Placeholder - should be calculated as last working Tuesday
-                                first_dom = f"01-{month}-{year}"
+                                # Create datetime object for the first day of the month
+                                first_dom = dt.datetime(int(year), int(month), 1)
                                 expiry = get_expiry(first_dom, weekly=0, day_of_week=2, exchange="BSE")
-                                day = expiry[:2]
+                                expiry_str = expiry.strftime("%d-%m-%Y")
+                                day = expiry_str[:2]
                                 # Extract strike (remaining digits after month abbreviation)
                                 strike = remaining[3:]
 
@@ -2363,6 +2557,18 @@ class Shoonya(BrokerBase):
                                 part4 = strike
 
                                 return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
+                            else:
+                                # Fallback for unrecognized month abbreviation
+                                trading_logger.log_warning(
+                                    "Unrecognized month abbreviation in SENSEX format",
+                                    {
+                                        "fno_symbol": fno_symbol,
+                                        "month_abbr": month_abbr,
+                                        "middle_part": middle_part,
+                                        "remaining": remaining,
+                                    },
+                                )
+                                return "____"
 
                         # Check if next character is a digit (single digit month)
                         elif remaining[0].isdigit():
@@ -2424,18 +2630,25 @@ class Shoonya(BrokerBase):
 
                 else:
                     # Original NIFTY format: NIFTY07AUG25C25050
-                    part1 = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol).group()
+                    part1_match = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol)
                     date_match = re.search(r"\d{2}[A-Z]{3}\d{2}", fno_symbol)
+                    part3_match = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol)
+                    part4_match = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol)
+
+                    if not part1_match or not date_match or not part3_match or not part4_match:
+                        return fno_symbol  # Return original if parsing fails
+
+                    part1 = part1_match.group()
                     part2 = dt.datetime.strptime(date_match.group(), "%d%b%y").date().strftime("%Y%m%d")
-                    part3 = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol).group(1)
-                    part4 = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol).group(1)
+                    part3 = part3_match.group(1)
+                    part4 = part4_match.group(1)
                     return f"{part1}_{'FUT' if part3 == 'F' else 'OPT'}_{part2}_{'CALL' if part3=='C' else 'PUT' if part3 =='P' else ''}_{part4}"
 
-            def split_cash(cash_symbol):
+            def split_cash(cash_symbol) -> str:
                 # Remove common equity suffixes like -EQ, -BE, -BZ, etc.
                 # Pattern: SYMBOL-EQ, SYMBOL-BE, etc.
-                cash_symbol = re.sub(r'-[A-Z]{2}$', '', cash_symbol)
-                
+                cash_symbol = re.sub(r"-[A-Z]{2}$", "", cash_symbol)
+
                 lst = cash_symbol.split("_")
                 if len(lst) > 1:
                     return "-".join(lst[:-1]) + "_STK___"
@@ -2467,7 +2680,7 @@ class Shoonya(BrokerBase):
         long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     )
-    def get_min_lot_size(self, long_symbol, exchange="NSE"):
+    def get_min_lot_size(self, long_symbol, exchange="NSE") -> Union[int, float]:
         try:
             trading_logger.log_debug("Getting minimum lot size", {"long_symbol": long_symbol, "exchange": exchange})
 
@@ -2487,7 +2700,18 @@ class Shoonya(BrokerBase):
 
             if code is not None:
                 try:
-                    lot_size = self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
+                    lot_size_result = self.codes.loc[self.codes.Scripcode == code, "LotSize"]
+                    # Handle both Series (multiple matches) and scalar (single match) cases
+                    if isinstance(lot_size_result, pd.Series):
+                        lot_size_raw = lot_size_result.iloc[0] if len(lot_size_result) > 0 else 1
+                    else:
+                        # Single match returns scalar
+                        lot_size_raw = lot_size_result
+                    # Handle potential complex numbers by taking real part
+                    if isinstance(lot_size_raw, complex):
+                        lot_size = float(lot_size_raw.real)
+                    else:
+                        lot_size = float(lot_size_raw)  # type: ignore[arg-type]
                     trading_logger.log_debug(
                         "Lot size retrieved successfully",
                         {"long_symbol": long_symbol, "exchange": exchange, "code": code, "lot_size": lot_size},
