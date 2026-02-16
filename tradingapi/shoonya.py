@@ -795,13 +795,22 @@ class Shoonya(BrokerBase):
         try:
             trading_logger.log_info("Disconnecting from Shoonya", {"broker_type": self.broker.name})
 
-            # Stop streaming if active
+            # Stop websocket if active
+            try:
+                if hasattr(self, "api") and self.api and hasattr(self, "socket_opened") and self.socket_opened:
+                    self.api.close_websocket()
+                    self.socket_opened = False
+                    trading_logger.log_info("Closed WebSocket connection", {"broker_type": self.broker.name})
+            except Exception as e:
+                trading_logger.log_warning("Failed to close WebSocket during disconnect", {"error": str(e)})
+
+            # Stop streaming thread if active
             try:
                 if hasattr(self, "subscribe_thread") and self.subscribe_thread and self.subscribe_thread.is_alive():
                     trading_logger.log_info("Stopping streaming thread", {"broker_type": self.broker.name})
                     # Note: The actual streaming stop logic would be in the streaming method
             except Exception as e:
-                trading_logger.log_warning("Failed to stop streaming during disconnect", {"error": str(e)})
+                trading_logger.log_warning("Failed to stop streaming thread during disconnect", {"error": str(e)})
 
             # Clear API reference
             if self.api:
