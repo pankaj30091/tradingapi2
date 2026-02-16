@@ -3163,23 +3163,32 @@ class FivePaisa(BrokerBase):
                     trading_logger.log_error("Error in connect_and_receive", e, {"req_data": req_data})
                     raise
 
+            def resolve_exchange_from_symbology(long_symbol: str):
+                """Resolve API exchange code for a symbol from symbology (which exchange's symbol_map contains it)."""
+                for exch in self.exchange_mappings:
+                    if long_symbol in self.exchange_mappings[exch]["symbol_map"]:
+                        return exch
+                return None
+
             def expand_symbols_to_request(symbols: list):
-                """Expand symbols to request format."""
+                """Expand symbols to request format. Uses symbology to resolve exchange per symbol so reconnect
+                works correctly when subscribed_symbols contains both NSE and BSE symbols."""
                 try:
                     req_list = []
                     for long_symbol in symbols:
-                        market_feed = Price()
-                        market_feed.src = "fp"
-                        market_feed.symbol = long_symbol
-                        exch_type = self.exchange_mappings[mapped_exchange]["exchangetype_map"].get(long_symbol)
-                        scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
+                        # Resolve exchange from symbology so reconnect uses correct exchange per symbol (e.g. B for SENSEX)
+                        exch_for_symbol = resolve_exchange_from_symbology(long_symbol)
+                        if exch_for_symbol is None:
+                            exch_for_symbol = mapped_exchange
+                        exch_type = self.exchange_mappings[exch_for_symbol]["exchangetype_map"].get(long_symbol)
+                        scrip_code = self.exchange_mappings[exch_for_symbol]["symbol_map"].get(long_symbol)
                         if scrip_code is None:
                             trading_logger.log_warning(
                                 "Scrip code not found for symbol",
-                                {"long_symbol": long_symbol, "mapped_exchange": mapped_exchange},
+                                {"long_symbol": long_symbol, "mapped_exchange": exch_for_symbol},
                             )
                             continue
-                        req_list.append({"Exch": mapped_exchange, "ExchType": exch_type, "ScripCode": scrip_code})
+                        req_list.append({"Exch": exch_for_symbol, "ExchType": exch_type, "ScripCode": scrip_code})
                     return req_list
                 except Exception as e:
                     trading_logger.log_error(

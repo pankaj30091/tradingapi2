@@ -2300,8 +2300,21 @@ class FlatTrade(BrokerBase):
                         if self.socket_opened:
                             trading_logger.log_info("WebSocket reconnected successfully.")
                             try:
-                                self.api.subscribe(req_list)
-                                trading_logger.log_info("Resubscribed to symbols after reconnection")
+                                active_symbols = (
+                                    list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
+                                )
+                                if active_symbols:
+                                    reconnect_req_list = expand_symbols_to_request(active_symbols)
+                                    trading_logger.log_info(
+                                        "Resubscribing to symbols after reconnection",
+                                        {"symbols_count": len(active_symbols), "req_list": reconnect_req_list},
+                                    )
+                                    self.api.subscribe(reconnect_req_list)
+                                else:
+                                    trading_logger.log_warning(
+                                        "No active symbols found in subscribed_symbols during reconnection; "
+                                        "skipping resubscribe."
+                                    )
                                 return
                             except Exception as e:
                                 trading_logger.log_error("Failed to resubscribe after reconnection", e)
@@ -2339,13 +2352,24 @@ class FlatTrade(BrokerBase):
                 while not self.socket_opened:
                     time.sleep(1)
 
+            def resolve_exchange_from_symbology(long_symbol: str):
+                """Resolve API exchange for a symbol from symbology (which exchange's symbol_map contains it)."""
+                for exch in self.exchange_mappings:
+                    if long_symbol in self.exchange_mappings[exch]["symbol_map"]:
+                        return exch
+                return None
+
             # Function to expand symbols into request format
             def expand_symbols_to_request(symbol_list):
+                """Uses symbology to resolve exchange per symbol so reconnect works for mixed NSE/BSE symbols."""
                 req_list = []
                 for symbol in symbol_list:
-                    scrip_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(symbol)
+                    exch_for_symbol = resolve_exchange_from_symbology(symbol)
+                    if exch_for_symbol is None:
+                        exch_for_symbol = mapped_exchange
+                    scrip_code = self.exchange_mappings[exch_for_symbol]["symbol_map"].get(symbol)
                     if scrip_code:
-                        req_list.append(f"{mapped_exchange}|{scrip_code}")
+                        req_list.append(f"{exch_for_symbol}|{scrip_code}")
                     else:
                         trading_logger.log_error("Did not find scrip_code for symbol", None, {"symbol": symbol})
                 return req_list
