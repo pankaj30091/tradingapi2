@@ -14,7 +14,7 @@ import threading
 import time
 import traceback
 import zipfile
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union, cast
 from urllib.parse import parse_qs, urlparse
 import hashlib
 import httpx
@@ -39,7 +39,7 @@ from NorenRestApiPy.NorenApi import NorenApi
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
 from .config import get_config
-from .utils import set_starting_internal_ids_int, update_order_status
+from .utils import parse_combo_symbol, set_starting_internal_ids_int, update_order_status
 from .globals import get_tradingapi_now
 from . import trading_logger
 from .error_handling import validate_inputs, log_execution_time, retry_on_error
@@ -2098,7 +2098,8 @@ class FlatTrade(BrokerBase):
                     market_feed.exchange = self.map_exchange_for_db(long_symbol, tick_data.get("exch"))
                 except Exception as e:
                     trading_logger.log_warning(
-                        "Failed to map exchange for DB", e, {"long_symbol": long_symbol, "exch": tick_data.get("exch")}
+                        "Failed to map exchange for DB",
+                        {"long_symbol": long_symbol, "exch": tick_data.get("exch"), "error": str(e)},
                     )
                     market_feed.exchange = mapped_exchange
 
@@ -2111,7 +2112,8 @@ class FlatTrade(BrokerBase):
                         market_feed.timestamp = dt.datetime.now()
                 except Exception as e:
                     trading_logger.log_warning(
-                        "Failed to convert timestamp", e, {"long_symbol": long_symbol, "lut": tick_data.get("lut")}
+                        "Failed to convert timestamp",
+                        {"long_symbol": long_symbol, "lut": tick_data.get("lut"), "error": str(e)},
                     )
                     market_feed.timestamp = dt.datetime.now()
 
@@ -2230,7 +2232,8 @@ class FlatTrade(BrokerBase):
                 if message.get("t") == "tk":
                     price = map_to_price(message)
                     prices[message.get("tk")] = price
-                    ext_callback(price)
+                    if ext_callback:
+                        ext_callback(price)
                 elif message.get("t") == "tf":
                     required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l"}
                     if required_keys & message.keys():
@@ -2255,7 +2258,8 @@ class FlatTrade(BrokerBase):
                             price.volume = float(message.get("v"))
                         price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
                         prices[message.get("tk")] = price
-                        ext_callback(price)
+                        if ext_callback:
+                            ext_callback(price)
 
             # Function to handle WebSocket errors
             def handle_socket_error(error=None):
@@ -2309,7 +2313,8 @@ class FlatTrade(BrokerBase):
                                         "Resubscribing to symbols after reconnection",
                                         {"symbols_count": len(active_symbols), "req_list": reconnect_req_list},
                                     )
-                                    self.api.subscribe(reconnect_req_list)
+                                    if self.api is not None:
+                                        self.api.subscribe(reconnect_req_list)
                                 else:
                                     trading_logger.log_warning(
                                         "No active symbols found in subscribed_symbols during reconnection; "
@@ -2343,6 +2348,8 @@ class FlatTrade(BrokerBase):
 
             # Function to establish WebSocket connection and subscribe
             def connect_and_subscribe():
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
                 self.api.start_websocket(
                     subscribe_callback=on_message,
                     socket_close_callback=handle_socket_close,
@@ -2361,17 +2368,40 @@ class FlatTrade(BrokerBase):
 
             # Function to expand symbols into request format
             def expand_symbols_to_request(symbol_list):
-                """Uses symbology to resolve exchange per symbol so reconnect works for mixed NSE/BSE symbols."""
+                """Uses symbology to resolve exchange per symbol so reconnect works for mixed NSE/BSE symbols.
+                Combo symbols (format SYM1?qty1:SYM2?qty2) are expanded into their legs; each leg is looked up."""
                 req_list = []
-                for symbol in symbol_list:
-                    exch_for_symbol = resolve_exchange_from_symbology(symbol)
+                added = set()  # "exch|scrip_code" already added, to avoid duplicate subscriptions
+
+                def add_symbol(long_symbol):
+                    exch_for_symbol = resolve_exchange_from_symbology(long_symbol)
                     if exch_for_symbol is None:
                         exch_for_symbol = mapped_exchange
-                    scrip_code = self.exchange_mappings[exch_for_symbol]["symbol_map"].get(symbol)
+                    scrip_code = self.exchange_mappings[exch_for_symbol]["symbol_map"].get(long_symbol)
                     if scrip_code:
-                        req_list.append(f"{exch_for_symbol}|{scrip_code}")
+                        token = f"{exch_for_symbol}|{scrip_code}"
+                        if token not in added:
+                            added.add(token)
+                            req_list.append(token)
                     else:
-                        trading_logger.log_error("Did not find scrip_code for symbol", None, {"symbol": symbol})
+                        trading_logger.log_error(
+                            "Did not find scrip_code for symbol", None, {"symbol": long_symbol}
+                        )
+
+                for symbol in symbol_list:
+                    if ":" in symbol and "?" in symbol:
+                        try:
+                            legs = parse_combo_symbol(symbol)
+                            for leg_symbol in legs:
+                                add_symbol(leg_symbol)
+                        except SymbolError:
+                            trading_logger.log_error(
+                                "Did not find scrip_code for symbol", None, {"symbol": symbol}
+                            )
+                    else:
+                        # Single symbol; strip trailing ?qty if present (e.g. NIFTY_OPT_..._PUT_25700?65)
+                        long_symbol = symbol.split("?", 1)[0].strip() if "?" in symbol else symbol
+                        add_symbol(long_symbol)
                 return req_list
 
             # Function to update the subscription list
@@ -2702,7 +2732,11 @@ class FlatTrade(BrokerBase):
 
             if code is not None:
                 try:
-                    lot_size = self.codes.loc[self.codes.Scripcode == code, "LotSize"].item()
+                    series = cast(pd.Series, self.codes.loc[self.codes.Scripcode == code, "LotSize"])
+                    if len(series) > 0:
+                        lot_size = int(series.iloc[0])
+                    else:
+                        lot_size = 0
                     trading_logger.log_debug(
                         "Lot size retrieved successfully",
                         {"long_symbol": long_symbol, "exchange": exchange, "code": code, "lot_size": lot_size},

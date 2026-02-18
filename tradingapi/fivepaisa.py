@@ -32,7 +32,12 @@ from py5paisa import FivePaisaClient
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
 from .config import get_config
-from .utils import delete_broker_order_id, set_starting_internal_ids_int, update_order_status
+from .utils import (
+    delete_broker_order_id,
+    parse_combo_symbol,
+    set_starting_internal_ids_int,
+    update_order_status,
+)
 from .exceptions import (
     ConfigurationError,
     DataError,
@@ -3172,11 +3177,13 @@ class FivePaisa(BrokerBase):
 
             def expand_symbols_to_request(symbols: list):
                 """Expand symbols to request format. Uses symbology to resolve exchange per symbol so reconnect
-                works correctly when subscribed_symbols contains both NSE and BSE symbols."""
+                works correctly when subscribed_symbols contains both NSE and BSE symbols.
+                Combo symbols (format SYM1?qty1:SYM2?qty2) are expanded into their legs; each leg is looked up."""
                 try:
                     req_list = []
-                    for long_symbol in symbols:
-                        # Resolve exchange from symbology so reconnect uses correct exchange per symbol (e.g. B for SENSEX)
+                    added = set()  # (exch, scrip_code) already added, to avoid duplicate subscriptions
+
+                    def add_symbol(long_symbol: str) -> None:
                         exch_for_symbol = resolve_exchange_from_symbology(long_symbol)
                         if exch_for_symbol is None:
                             exch_for_symbol = mapped_exchange
@@ -3187,8 +3194,27 @@ class FivePaisa(BrokerBase):
                                 "Scrip code not found for symbol",
                                 {"long_symbol": long_symbol, "mapped_exchange": exch_for_symbol},
                             )
-                            continue
-                        req_list.append({"Exch": exch_for_symbol, "ExchType": exch_type, "ScripCode": scrip_code})
+                            return
+                        key = (exch_for_symbol, scrip_code)
+                        if key not in added:
+                            added.add(key)
+                            req_list.append({"Exch": exch_for_symbol, "ExchType": exch_type, "ScripCode": scrip_code})
+
+                    for symbol in symbols:
+                        if ":" in symbol and "?" in symbol:
+                            try:
+                                legs = parse_combo_symbol(symbol)
+                                for leg_symbol in legs:
+                                    add_symbol(leg_symbol)
+                            except SymbolError:
+                                trading_logger.log_warning(
+                                    "Scrip code not found for symbol",
+                                    {"long_symbol": symbol, "mapped_exchange": mapped_exchange},
+                                )
+                        else:
+                            # Single symbol; strip trailing ?qty if present (e.g. NIFTY_OPT_..._PUT_25700?65)
+                            long_symbol = symbol.split("?", 1)[0].strip() if "?" in symbol else symbol
+                            add_symbol(long_symbol)
                     return req_list
                 except Exception as e:
                     trading_logger.log_error(

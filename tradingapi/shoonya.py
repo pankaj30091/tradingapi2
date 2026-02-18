@@ -38,7 +38,7 @@ from NorenRestApiPy.NorenApi import NorenApi
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
 from .config import get_config
-from .utils import set_starting_internal_ids_int, update_order_status
+from .utils import parse_combo_symbol, set_starting_internal_ids_int, update_order_status
 from .exceptions import (
     BrokerConnectionError,
     AuthenticationError,
@@ -2292,17 +2292,40 @@ class Shoonya(BrokerBase):
 
             # Function to expand symbols into request format
             def expand_symbols_to_request(symbol_list) -> List[str]:
-                """Uses symbology to resolve exchange per symbol so reconnect works for mixed NSE/BSE symbols."""
+                """Uses symbology to resolve exchange per symbol so reconnect works for mixed NSE/BSE symbols.
+                Combo symbols (format SYM1?qty1:SYM2?qty2) are expanded into their legs; each leg is looked up."""
                 req_list = []
-                for symbol in symbol_list:
-                    exch_for_symbol = resolve_exchange_from_symbology(symbol)
+                added = set()  # "exch|scrip_code" already added, to avoid duplicate subscriptions
+
+                def add_symbol(long_symbol: str) -> None:
+                    exch_for_symbol = resolve_exchange_from_symbology(long_symbol)
                     if exch_for_symbol is None:
                         exch_for_symbol = mapped_exchange
-                    scrip_code = self.exchange_mappings[exch_for_symbol]["symbol_map"].get(symbol)
+                    scrip_code = self.exchange_mappings[exch_for_symbol]["symbol_map"].get(long_symbol)
                     if scrip_code:
-                        req_list.append(f"{exch_for_symbol}|{scrip_code}")
+                        token = f"{exch_for_symbol}|{scrip_code}"
+                        if token not in added:
+                            added.add(token)
+                            req_list.append(token)
                     else:
-                        trading_logger.log_error("Did not find scrip_code for symbol", context={"symbol": symbol})
+                        trading_logger.log_error(
+                            "Did not find scrip_code for symbol", context={"symbol": long_symbol}
+                        )
+
+                for symbol in symbol_list:
+                    if ":" in symbol and "?" in symbol:
+                        try:
+                            legs = parse_combo_symbol(symbol)
+                            for leg_symbol in legs:
+                                add_symbol(leg_symbol)
+                        except SymbolError:
+                            trading_logger.log_error(
+                                "Did not find scrip_code for symbol", context={"symbol": symbol}
+                            )
+                    else:
+                        # Single symbol; strip trailing ?qty if present (e.g. NIFTY_OPT_..._PUT_25700?65)
+                        long_symbol = symbol.split("?", 1)[0].strip() if "?" in symbol else symbol
+                        add_symbol(long_symbol)
                 return req_list
 
             # Function to update the subscription list
