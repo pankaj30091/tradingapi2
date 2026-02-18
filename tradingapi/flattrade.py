@@ -39,7 +39,7 @@ from NorenRestApiPy.NorenApi import NorenApi
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
 from .config import get_config
-from .utils import parse_combo_symbol, set_starting_internal_ids_int, update_order_status
+from .utils import json_serializer_default, parse_combo_symbol, set_starting_internal_ids_int, update_order_status
 from .globals import get_tradingapi_now
 from . import trading_logger
 from .error_handling import validate_inputs, log_execution_time, retry_on_error
@@ -1013,7 +1013,10 @@ class FlatTrade(BrokerBase):
 
                 # Log the entry to Redis
                 try:
-                    self.redis_o.zadd(f"{self.broker.name.upper()}:LOG", {json.dumps(log_entry): time.time()})
+                    self.redis_o.zadd(
+                        f"{self.broker.name.upper()}:LOG",
+                        {json.dumps(log_entry, default=json_serializer_default): time.time()},
+                    )
                     trading_logger.log_debug(
                         "Object logged to Redis successfully",
                         {"caller_function": caller_function, "object_type": type(any_object).__name__},

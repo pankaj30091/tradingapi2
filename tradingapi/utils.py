@@ -47,6 +47,25 @@ logger = logging.getLogger(__name__)
 r = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 
 
+def json_serializer_default(obj):
+    """Convert numpy/pandas types to native Python for JSON serialization.
+    Use as default= in json.dumps when logging Order or other objects that may contain numpy types.
+    """
+    if hasattr(obj, "item"):  # numpy scalar (int64, float64, etc.)
+        return obj.item()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if type(obj).__name__ == "bool_" and type(obj).__module__.startswith("numpy"):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if pd.isna(obj):
+        return None
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 # Enhanced exception handler with structured logging
 def my_handler(typ, value, trace):
     context = create_error_context(

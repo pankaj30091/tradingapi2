@@ -34,6 +34,7 @@ from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, 
 from .config import get_config
 from .utils import (
     delete_broker_order_id,
+    json_serializer_default,
     parse_combo_symbol,
     set_starting_internal_ids_int,
     update_order_status,
@@ -297,7 +298,10 @@ class FivePaisa(BrokerBase):
 
                 # Log the entry to Redis
                 try:
-                    self.redis_o.zadd("FIVEPAISA:LOG", {json.dumps(log_entry): time.time()})
+                    self.redis_o.zadd(
+                        "FIVEPAISA:LOG",
+                        {json.dumps(log_entry, default=json_serializer_default): time.time()},
+                    )
                     trading_logger.log_debug(
                         "Object logged to Redis successfully",
                         {"caller_function": caller_function, "object_type": type(any_object).__name__},

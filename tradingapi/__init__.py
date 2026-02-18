@@ -183,15 +183,24 @@ class TradingAPILogger:
     def log_error(
         self, message: str, error: Optional[Exception] = None, context: Optional[dict] = None, exc_info: bool = True
     ):
-        """Log an error with structured context."""
+        """Log an error with structured context. Extra values are sanitized to single-line so
+        parse_log_errors.py can reliably match the ERROR line (same format as other tradingapi logs).
+        """
         extra = context or {}
         if error:
             extra["error_type"] = type(error).__name__
-            extra["error_message"] = str(error)
+            # Keep error_message single-line so the log line matches parse_log_errors structured format
+            err_msg = str(error).replace("\n", " ").replace("\r", " ").strip()
+            extra["error_message"] = err_msg[:500] if len(err_msg) > 500 else err_msg
 
         # Add caller information
         caller_info = self._get_caller_info()
         extra.update(caller_info)
+
+        # Sanitize any other extra values that might contain newlines (e.g. from create_error_context)
+        for key, value in list(extra.items()):
+            if isinstance(value, str) and ("\n" in value or "\r" in value):
+                extra[key] = value.replace("\n", " ").replace("\r", " ").strip()[:500]
 
         self.logger.error(message, extra=extra, exc_info=exc_info)
 
