@@ -225,11 +225,18 @@ def log_execution_time(func: Callable) -> Callable:
             return result
         except Exception as e:
             execution_time = time.time() - start_time
-            trading_logger.log_error(
-                f"Function {func.__name__} failed",
-                e,
-                {"function": func.__name__, "execution_time": execution_time, "success": False},
-            )
+            context = {
+                "function": func.__name__,
+                "execution_time": execution_time,
+                "success": False,
+            }
+            # Include broker name when the decorated function is a broker instance method
+            if args and hasattr(args[0], "broker"):
+                broker = getattr(args[0], "broker", None)
+                broker_name = getattr(broker, "name", str(broker)) if broker is not None else None
+                if broker_name:
+                    context["broker"] = broker_name
+            trading_logger.log_error(f"Function {func.__name__} failed", e, context)
             raise
 
     return wrapper
