@@ -18,7 +18,7 @@ import pandas as pd
 import pyotp
 import redis
 import requests
-from chameli.dateutils import parse_datetime
+from chameli.dateutils import format_datetime, parse_datetime
 
 
 def _validate_datetime_input(date_input):
@@ -1956,12 +1956,11 @@ class FivePaisa(BrokerBase):
                                 if fivepaisa_order.Exch.iloc[0] == "M":
                                     try:
                                         long_symbol = (
-                                            self.get_long_name_from_broker_identifier(
-                                                ScripName=pd.Series([order.long_symbol])
-                                            ).iloc[0]
-                                            if order
+                                            order.long_symbol
+                                            if order and order.long_symbol
                                             else self.get_long_name_from_broker_identifier(
-                                                ScripName=fivepaisa_order.ScripName
+                                                Scripcode=fivepaisa_order["ScripCode"],
+                                                Exchange=fivepaisa_order["Exch"],
                                             ).iloc[0]
                                         )
                                         contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(
@@ -2025,12 +2024,11 @@ class FivePaisa(BrokerBase):
                                     if order.exchange == "M":
                                         try:
                                             long_symbol = (
-                                                self.get_long_name_from_broker_identifier(
-                                                    ScripName=pd.Series[order.long_symbol]
-                                                ).iloc[0]
+                                                order.long_symbol
                                                 if order.long_symbol is not None
                                                 else self.get_long_name_from_broker_identifier(
-                                                    ScripName=pd.Series([row["ScripName"]])
+                                                    Scripcode=pd.Series([row["ScripCode"]]),
+                                                    Exchange=pd.Series([row["Exch"]]),
                                                 ).iloc[0]
                                             )
                                             contract_size = self.exchange_mappings[order.exchange][
@@ -3372,7 +3370,23 @@ class FivePaisa(BrokerBase):
                 holding = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(holding) == 0 else holding
                 if len(holding) > 0:
                     try:
-                        holding["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=holding.Symbol)
+                        # FivePaisa Holdings API returns NseCode, BseCode, Exch (no ScripCode). Derive ScripCode.
+                        if "Exch" not in holding.columns:
+                            raise ValidationError("Holdings require 'Exch' column for mapping")
+                        if "ScripCode" not in holding.columns:
+                            if "NseCode" in holding.columns and "BseCode" in holding.columns:
+                                holding["ScripCode"] = holding.apply(
+                                    lambda r: r["NseCode"] if r["Exch"] == "N" else (r["BseCode"] if r["Exch"] == "B" else None),
+                                    axis=1,
+                                )
+                            else:
+                                raise ValidationError(
+                                    "Holdings require 'ScripCode' or ('NseCode' and 'BseCode') for mapping"
+                                )
+                        holding["long_symbol"] = self.get_long_name_from_broker_identifier(
+                            Scripcode=holding["ScripCode"],
+                            Exchange=holding["Exch"],
+                        )
                         holding = holding.loc[:, ["long_symbol", "Quantity"]]
                         holding.columns = ["long_symbol", "quantity"]
                     except Exception as e:
@@ -3390,8 +3404,10 @@ class FivePaisa(BrokerBase):
                 position = pd.DataFrame(columns=["long_symbol", "quantity"]) if len(position) == 0 else position
                 if len(position) > 0:
                     try:
+                        # FivePaisa API: ScripCode, Exch (capitalization)
                         position["long_symbol"] = self.get_long_name_from_broker_identifier(
-                            ScripName=position.ScripName
+                            Scripcode=position["ScripCode"],
+                            Exchange=position["Exch"],
                         )
                         position = position.loc[:, ["long_symbol", "NetQty"]]
                         position.columns = ["long_symbol", "quantity"]
@@ -3456,47 +3472,105 @@ class FivePaisa(BrokerBase):
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_orders_today(self, **kwargs) -> pd.DataFrame:
-        """
-        Get today's orders with enhanced error handling.
+        """Get today's orders from FivePaisa order book (ScripCode, Exch).
 
-        Returns:
-            pd.DataFrame: DataFrame containing today's orders (empty if none found)
+        Same output schema as Shoonya/FlatTrade when all_columns=False: long_symbol,
+        internal_order_id, order_time, side, broker_order_id, exchange_order_id,
+        ordered, filled, price_type, order_price, fill_price, status.
 
-        Raises:
-            MarketDataError: If order retrieval fails
-            BrokerConnectionError: If broker connection issues
+        Args:
+            all_columns (bool): If False (default), return a subset of columns with renamed
+                and formatted fields. If True, return as-is dump: all FivePaisa columns
+                plus long_symbol, no renaming or reordering.
         """
         try:
+            all_columns = kwargs.get("all_columns", False)
             trading_logger.log_debug("Getting orders for today")
-
+            if self.api is None:
+                raise BrokerConnectionError("API client not initialized")
+            raw = self.api.order_book()
+            # FivePaisa may return list of dicts or dict with OrderBookDetail
+            if isinstance(raw, list):
+                orders = pd.DataFrame(raw)
+            elif isinstance(raw, dict) and "OrderBookDetail" in raw:
+                orders = pd.DataFrame(raw["OrderBookDetail"])
+            else:
+                orders = pd.DataFrame.from_dict(raw) if raw else pd.DataFrame()
+            if len(orders) == 0:
+                trading_logger.log_debug("No orders found for today")
+                return orders
             try:
-                if self.api is None:
-                    raise BrokerConnectionError("API client not initialized")
-                orders = self.api.order_book()
-                orders = pd.DataFrame.from_dict(orders)
+                # Resolve long_symbol from mappings (FivePaisa: ScripCode, Exch)
+                orders["long_symbol"] = self.get_long_name_from_broker_identifier(
+                    Scripcode=orders["ScripCode"],
+                    Exchange=orders["Exch"],
+                )
+                if not all_columns:
+                    # order_time: FivePaisa BrokerOrderTime can be /Date(epochms+0530)/ or epoch (via chameli format_datetime)
+                    def _format_order_time(ts):
+                        if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+                            return ""
+                        try:
+                            s = str(ts).strip()
+                            if not s:
+                                return ""
+                            # /Date(1707279047230+0530)/ -> extract ms
+                            m = re.search(r"(\d+)", s)
+                            if m:
+                                ms = int(m.group(1))
+                                sec = ms / 1000.0 if ms > 1e12 else ms
+                                d = dt.datetime.fromtimestamp(sec)
+                                return format_datetime(d, "%Y-%m-%d %H:%M:%S") + f".{d.microsecond // 1000:03d}"
+                            return ""
+                        except (TypeError, ValueError, OSError):
+                            return ""
 
-                if len(orders.index) > 0:
-                    try:
-                        orders = orders.assign(
-                            long_symbol=self.get_long_name_from_broker_identifier(ScripName=orders.ScripName)
-                        )
-                        trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(orders)})
-                        return orders
-                    except Exception as e:
-                        context = create_error_context(error=str(e), order_count=len(orders))
-                        raise MarketDataError(f"Error processing orders data: {str(e)}", context)
-                else:
-                    trading_logger.log_debug("No orders found for today")
-                    return pd.DataFrame()  # Return empty DataFrame instead of None
-
+                    if "BrokerOrderTime" in orders.columns:
+                        orders["order_time"] = orders["BrokerOrderTime"].apply(_format_order_time)
+                    else:
+                        orders["order_time"] = ""
+                    # side: BuySell B -> Buy, S -> Sell
+                    if "BuySell" in orders.columns:
+                        side_map = {"B": "Buy", "S": "Sell"}
+                        orders["side"] = orders["BuySell"].map(side_map).fillna(orders["BuySell"])
+                    else:
+                        orders["side"] = ""
+                    # price_type: AtMarket Y -> MKT, N -> LMT
+                    if "AtMarket" in orders.columns:
+                        orders["price_type"] = orders["AtMarket"].map({"Y": "MKT", "N": "LMT"}).fillna(orders["AtMarket"])
+                    else:
+                        orders["price_type"] = ""
+                    # order_price = Rate (limit price). AveragePrice = fill_price (average fill price).
+                    # Same output columns as Shoonya (order_price, fill_price)
+                    orders = orders.rename(columns={
+                        "RemoteOrderID": "internal_order_id",
+                        "BrokerOrderId": "broker_order_id",
+                        "ExchOrderID": "exchange_order_id",
+                        "Qty": "ordered",
+                        "TradedQty": "filled",
+                        "Rate": "order_price",
+                        "AveragePrice": "fill_price",
+                        "OrderStatus": "status",
+                    })
+                    if "order_price" not in orders.columns and "OrderRate" in orders.columns:
+                        orders["order_price"] = orders["OrderRate"]
+                    elif "order_price" not in orders.columns:
+                        orders["order_price"] = np.nan
+                    keep = [
+                        "long_symbol", "internal_order_id", "order_time", "side", "broker_order_id", "exchange_order_id",
+                        "ordered", "filled", "price_type", "order_price", "fill_price", "status",
+                    ]
+                    orders = orders.reindex(columns=[c for c in keep if c in orders.columns], copy=False)
+                trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(orders)})
+                return orders
             except Exception as e:
-                context = create_error_context(error=str(e))
-                raise MarketDataError(f"Failed to retrieve orders: {str(e)}", context)
-
-        except (MarketDataError, BrokerConnectionError):
+                trading_logger.log_error("Error processing orders data", e, {"orders_count": len(orders)})
+                raise MarketDataError(f"Error processing orders data: {str(e)}", create_error_context(error=str(e)))
+        except (BrokerConnectionError, MarketDataError):
             raise
         except Exception as e:
             context = create_error_context(error=str(e))
+            trading_logger.log_error("Unexpected error getting orders", e, context)
             raise MarketDataError(f"Unexpected error getting orders: {str(e)}", context)
 
     @log_execution_time
@@ -3526,8 +3600,12 @@ class FivePaisa(BrokerBase):
                         trades = trades.loc[trades.Status == 0, "TradeBookDetail"]
                         trades = pd.DataFrame([trade for trade in trades])
                         trades["ExchangeTradeTime"] = trades["ExchangeTradeTime"].apply(self._convert_date_string)
+                        # FivePaisa API: ScripCode, Exch
                         trades = trades.assign(
-                            long_symbol=self.get_long_name_from_broker_identifier(ScripName=trades.ScripName)
+                            long_symbol=self.get_long_name_from_broker_identifier(
+                                Scripcode=trades["ScripCode"],
+                                Exchange=trades["Exch"],
+                            )
                         )
 
                         trading_logger.log_debug("Trades retrieved successfully", {"trade_count": len(trades)})
@@ -3550,99 +3628,69 @@ class FivePaisa(BrokerBase):
             raise MarketDataError(f"Unexpected error getting trades: {str(e)}", context)
 
     @log_execution_time
-    @validate_inputs(ScripName=lambda x: isinstance(x, pd.Series) and len(x) > 0)
     def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
-        """
-        Generates Long Name with enhanced error handling.
+        """Resolve broker Scripcode + Exchange to long_symbol via mappings.
+
+        FivePaisa API uses column names ScripCode and Exch (note capitalization).
 
         Args:
-            kwargs: Arbitrary keyword arguments. Expected key:
-                - ScripName (pd.Series): position.ScripName from 5paisa position.
+            Scripcode (pd.Series): Broker scrip codes (e.g. position["ScripCode"]).
+            Exchange (pd.Series): Exchange per row (e.g. position["Exch"]).
 
         Returns:
-            pd.Series: Long name.
-
-        Raises:
-            ValidationError: If parameters are invalid
-            DataError: If data processing fails
+            pd.Series: long_symbol per row. None where lookup fails.
         """
         try:
+            scripcode = kwargs.get("Scripcode")
+            exchange = kwargs.get("Exchange")
+
+            if scripcode is None or exchange is None:
+                context = create_error_context(
+                    available_keys=list(kwargs.keys()),
+                    message="Scripcode and Exchange are required",
+                )
+                raise ValidationError("Missing required arguments: Scripcode and Exchange", context)
+            if not isinstance(scripcode, pd.Series) or not isinstance(exchange, pd.Series) or len(scripcode) == 0:
+                context = create_error_context(
+                    scripcode_type=type(scripcode),
+                    exchange_type=type(exchange),
+                    len_scripcode=len(scripcode) if hasattr(scripcode, "__len__") else None,
+                )
+                raise ValidationError("Scripcode and Exchange must be non-empty pandas Series", context)
+
             trading_logger.log_debug(
-                "Generating long name from broker identifier",
-                {"scrip_name_count": len(kwargs.get("ScripName", pd.Series()))},
+                "Resolving long name from mappings (Scripcode + Exchange)",
+                {"row_count": len(scripcode)},
             )
 
-            ScripName = kwargs.get("ScripName")
-            if ScripName is None:
-                context = create_error_context(available_keys=list(kwargs.keys()))
-                raise ValidationError("Missing required argument: 'ScripName'", context)
+            def lookup(scripcode_val, exchange_val):
+                try:
+                    exch_map = self.exchange_mappings.get(exchange_val, {})
+                    rev = exch_map.get("symbol_map_reversed", {})
+                    code = int(scripcode_val) if scripcode_val is not None else None
+                    if code is None:
+                        return None
+                    return rev.get(code) or rev.get(scripcode_val)
+                except (TypeError, ValueError, KeyError):
+                    return None
 
-            if not isinstance(ScripName, pd.Series) or len(ScripName) == 0:
-                context = create_error_context(
-                    scrip_name_type=type(ScripName),
-                    scrip_name_length=len(ScripName) if hasattr(ScripName, "__len__") else None,
+            result = pd.Series(
+                [lookup(scripcode.iloc[i], exchange.iloc[i]) for i in range(len(scripcode))],
+                index=scripcode.index,
+            )
+            missing = result.isna().sum()
+            if missing > 0:
+                trading_logger.log_warning(
+                    "Some rows had no mapping for Scripcode+Exchange",
+                    {"missing_count": int(missing), "total": len(result)},
                 )
-                raise ValidationError("ScripName must be a non-empty pandas Series", context)
-
-            try:
-                ScripName = ScripName.reset_index(drop=True)
-                symbol = ScripName.str.split().str[0]
-                sec_type = pd.Series("", index=np.arange(len(ScripName)))
-                expiry = pd.Series("", index=np.arange(len(ScripName)))
-                right = pd.Series("", index=np.arange(len(ScripName)))
-                strike = pd.Series("", index=np.arange(len(ScripName)))
-
-                type_map = {
-                    6: "OPT",
-                    4: "FUT",
-                    1: "STK",
-                }
-                sec_types = ScripName.str.split().str.len().map(type_map)
-
-                for idx, sec_type in enumerate(sec_types):
-                    try:
-                        if sec_type == "OPT":
-                            expiry.iloc[idx] = pd.to_datetime(("-").join(ScripName[idx].split()[1:4])).strftime(
-                                "%Y%m%d"
-                            )
-                            right_map = {
-                                "PE": "PUT",
-                                "CE": "CALL",
-                            }
-                            right.iloc[idx] = right_map.get(ScripName[idx].split()[4])
-                            strike.iloc[idx] = ScripName[idx].split()[5].strip("0").strip(".")
-                        elif sec_type == "FUT":
-                            expiry.iloc[idx] = pd.to_datetime(("-").join(ScripName[idx].split()[1:4])).strftime(
-                                "%Y%m%d"
-                            )
-                    except Exception as e:
-                        trading_logger.log_warning(
-                            "Error processing scrip name",
-                            {
-                                "index": idx,
-                                "scrip_name": ScripName[idx] if idx < len(ScripName) else None,
-                                "error": str(e),
-                            },
-                        )
-
-                result = symbol + "_" + sec_types + "_" + expiry + "_" + right + "_" + strike
-
-                trading_logger.log_debug(
-                    "Long name generated successfully", {"input_count": len(ScripName), "output_count": len(result)}
-                )
-
-                return result
-
-            except Exception as e:
-                context = create_error_context(
-                    scrip_name_sample=ScripName.head(3).tolist() if len(ScripName) > 0 else None, error=str(e)
-                )
-                raise DataError(f"Error processing scrip names: {str(e)}", context)
+            return result
 
         except (ValidationError, DataError):
             raise
         except Exception as e:
             context = create_error_context(kwargs=kwargs, error=str(e))
+            trading_logger.log_error("Unexpected error generating long name", e, context)
             raise DataError(f"Unexpected error generating long name: {str(e)}", context)
 
     @log_execution_time

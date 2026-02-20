@@ -24,7 +24,7 @@ import pyotp
 import pytz
 import redis
 import requests
-from chameli.dateutils import parse_datetime, get_expiry
+from chameli.dateutils import format_datetime, get_expiry, parse_datetime
 
 
 def _validate_datetime_input(date_input):
@@ -2389,16 +2389,25 @@ class Shoonya(BrokerBase):
                     ).astype({"quantity": float})
                     if len(holding) > 0:
                         try:
-                            # Extract tsym from each row's exch_tsym list
-                            holding["tsym"] = holding["exch_tsym"].apply(
-                                lambda x: (
-                                    x[0]["tsym"]
-                                    if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict)
-                                    else None
+                            # Resolve long_symbol from mappings using Scripcode + Exchange
+                            if "token" not in holding.columns:
+                                raise ValidationError("Holdings require 'token' column for mapping")
+                            if "exch" not in holding.columns and "exch_tsym" not in holding.columns:
+                                raise ValidationError("Holdings require 'exch' or 'exch_tsym' for mapping")
+                            scripcode_col = holding["token"]
+                            if "exch" in holding.columns:
+                                exchange_col = holding["exch"]
+                            else:
+                                exchange_col = holding["exch_tsym"].apply(
+                                    lambda x: (
+                                        x[0].get("exch")
+                                        if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict)
+                                        else None
+                                    )
                                 )
-                            )
                             holding["long_symbol"] = self.get_long_name_from_broker_identifier(
-                                ScripName=holding["tsym"]
+                                Scripcode=scripcode_col,
+                                Exchange=exchange_col,
                             )
                             qty_col = "brkcolqty"
                             holding = holding.loc[:, ["long_symbol", qty_col]]
@@ -2423,7 +2432,11 @@ class Shoonya(BrokerBase):
                 position = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
             if len(position) > 0:
                 try:
-                    position["long_symbol"] = self.get_long_name_from_broker_identifier(ScripName=position["tsym"])
+                    # Resolve long_symbol from mappings using Scripcode + Exchange (columns: token, exch)
+                    position["long_symbol"] = self.get_long_name_from_broker_identifier(
+                        Scripcode=position["token"],
+                        Exchange=position["exch"],
+                    )
                     position = position.loc[:, ["long_symbol", "netqty"]]
                     position.columns = ["long_symbol", "quantity"]
                     position["quantity"] = pd.to_numeric(position["quantity"], errors="coerce").fillna(0)
@@ -2480,18 +2493,84 @@ class Shoonya(BrokerBase):
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_orders_today(self, **kwargs) -> pd.DataFrame:
+        """Get today's orders from Shoonya order book (token, exch).
+
+        Args:
+            all_columns (bool): If False (default), return a subset of columns with renamed
+                and formatted fields (long_symbol, internal_order_id, order_time, side, broker_order_id, order_price, fill_price, etc.).
+                If True, return as-is dump: all Noren columns plus long_symbol, no renaming
+                or reordering.
+        """
         try:
+            all_columns = kwargs.get("all_columns", False)
             trading_logger.log_debug("Getting orders for today")
-            result = super().get_orders_today(**kwargs)
-            if result is not None and len(result) > 0:
-                trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(result)})
-            else:
+            if self.api is None:
+                raise BrokerConnectionError("API client not initialized")
+            raw = self.api.get_order_book()
+            # Noren returns a list of dicts (each dict is an order)
+            orders = pd.DataFrame(raw if isinstance(raw, list) else [])
+            if len(orders) == 0:
                 trading_logger.log_debug("No orders found for today")
-            return result
+                return orders
+            try:
+                # Resolve long_symbol from mappings (columns: token, exch)
+                orders["long_symbol"] = self.get_long_name_from_broker_identifier(
+                    Scripcode=orders["token"],
+                    Exchange=orders["exch"],
+                )
+                if not all_columns:
+                    # ordenttm: epoch (seconds or ms) -> human readable yyyy-mm-dd HH:MM:SS.ss (via chameli format_datetime)
+                    def _format_ordenttm(ts):
+                        try:
+                            t = float(ts) if ts not in (None, "") else None
+                            if t is None:
+                                return ""
+                            # Epoch: treat as seconds; if > 1e12 assume milliseconds
+                            sec = t / 1000.0 if t > 1e12 else t
+                            d = dt.datetime.fromtimestamp(sec)
+                            return format_datetime(d, "%Y-%m-%d %H:%M:%S") + f".{d.microsecond // 1000:03d}"
+                        except (TypeError, ValueError, OSError):
+                            return "" if pd.isna(ts) else str(ts)
+
+                    # Column may be ordenttm or different casing from Noren
+                    ts_col = next((c for c in orders.columns if str(c).lower() == "ordenttm"), "ordenttm")
+                    if ts_col in orders.columns:
+                        orders["ordenttm"] = orders[ts_col].apply(_format_ordenttm)
+                    else:
+                        orders["ordenttm"] = ""
+                    # trantype: B -> Buy, S -> Sell
+                    trantype_map = {"B": "Buy", "S": "Sell"}
+                    orders["trantype"] = orders["trantype"].map(trantype_map).fillna(orders["trantype"])
+                    # order_price = prc (limit price; 0 for MKT). avgprc = fill_price (average fill price).
+                    # Column order: ... filled, price_type, order_price, fill_price, status
+                    keep = [
+                        "long_symbol", "remarks", "ordenttm", "trantype", "norenordno", "exchordid", "qty", "fillshares",
+                        "prctyp", "prc", "avgprc", "status",
+                    ]
+                    orders = orders.reindex(columns=[c for c in keep if c in orders.columns], copy=False)
+                    orders = orders.rename(columns={
+                        "norenordno": "broker_order_id",
+                        "exchordid": "exchange_order_id",
+                        "qty": "ordered",
+                        "ordenttm": "order_time",
+                        "trantype": "side",
+                        "prc": "order_price",
+                        "prctyp": "price_type",
+                        "fillshares": "filled",
+                        "avgprc": "fill_price",
+                        "remarks": "internal_order_id",
+                    })
+                trading_logger.log_debug("Orders retrieved successfully", {"order_count": len(orders)})
+                return orders
+            except Exception as e:
+                trading_logger.log_error("Error processing orders data", e, {"orders_count": len(orders)})
+                raise MarketDataError(f"Error processing orders data: {str(e)}", create_error_context(error=str(e)))
+        except (BrokerConnectionError, MarketDataError):
+            raise
         except Exception as e:
             context = create_error_context(error=str(e))
             trading_logger.log_error("Unexpected error getting orders", e, context)
-            raise
+            raise MarketDataError(f"Unexpected error getting orders: {str(e)}", context)
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
@@ -2510,203 +2589,60 @@ class Shoonya(BrokerBase):
             raise
 
     @log_execution_time
-    @validate_inputs(ScripName=lambda x: isinstance(x, pd.Series) and len(x) > 0)
     def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
-        """Generates Long Name
+        """Resolve broker Scripcode + Exchange to long_symbol via mappings.
 
         Args:
-            ScripName (pd.Series): position.ScripName from 5paisa position
+            Scripcode (pd.Series): Broker scrip codes (e.g. position["token"]).
+            Exchange (pd.Series): Exchange per row (e.g. position["exch"]).
 
         Returns:
-            pd.series: long name
+            pd.Series: long_symbol per row. None where lookup fails.
         """
         try:
-            trading_logger.log_debug(
-                "Generating long name from broker identifier",
-                {"scrip_name_count": len(kwargs.get("ScripName", pd.Series()))},
-            )
+            scripcode = kwargs.get("Scripcode")
+            exchange = kwargs.get("Exchange")
 
-            ScripName = kwargs.get("ScripName")
-            if ScripName is None:
-                context = create_error_context(available_keys=list(kwargs.keys()))
-                raise ValidationError("Missing required argument: 'ScripName'", context)
-
-            if not isinstance(ScripName, pd.Series) or len(ScripName) == 0:
+            if scripcode is None or exchange is None:
                 context = create_error_context(
-                    scrip_name_type=type(ScripName),
-                    scrip_name_length=len(ScripName) if hasattr(ScripName, "__len__") else None,
+                    available_keys=list(kwargs.keys()),
+                    message="Scripcode and Exchange are required",
                 )
-                raise ValidationError("ScripName must be a non-empty pandas Series", context)
-
-            def split_fno(fno_symbol) -> str:
-                # Check if it's SENSEX format (ends with CE/PE)
-                if fno_symbol.startswith("SENSEX") and (fno_symbol.endswith("CE") or fno_symbol.endswith("PE")):
-                    # Extract symbol
-                    if fno_symbol.startswith("SENSEX50"):
-                        symbol = "SENSEX50"
-                    else:
-                        symbol = "SENSEX"
-
-                    # Extract option type (last 2 characters)
-                    option_type = fno_symbol[-2:]  # CE or PE
-                    part3 = "C" if option_type == "CE" else "P"
-
-                    # Extract the part after SENSEX and before CE/PE
-                    middle_part = fno_symbol[6:-2]  # e.g., "25SEP91600", "25DEC89000", "2580591600"
-
-                    # Try to parse different SENSEX formats
-                    try:
-                        # Extract year (first 2 digits)
-                        year = "20" + middle_part[:2]
-
-                        # Extract the remaining part after year
-                        remaining = middle_part[2:]
-
-                        # Check if next 3 characters are letters (month abbreviation) - check this FIRST
-                        if len(remaining) >= 3 and remaining[:3].isalpha():
-                            # Month abbreviation format (3 letters)
-                            month_abbr = remaining[:3]
-
-                            # Convert month abbreviation to number
-                            month_map = {
-                                "JAN": "01",
-                                "FEB": "02",
-                                "MAR": "03",
-                                "APR": "04",
-                                "MAY": "05",
-                                "JUN": "06",
-                                "JUL": "07",
-                                "AUG": "08",
-                                "SEP": "09",
-                                "OCT": "10",
-                                "NOV": "11",
-                                "DEC": "12",
-                            }
-
-                            if month_abbr in month_map:
-                                month = month_map[month_abbr]
-
-                                # For 3-letter month format, no day is given
-                                # We need to find the last working Tuesday of the month
-                                # For now, we'll use a placeholder day (25th)
-                                day = "25"  # Placeholder - should be calculated as last working Tuesday
-                                # Create datetime object for the first day of the month
-                                first_dom = dt.datetime(int(year), int(month), 1)
-                                expiry = get_expiry(first_dom, weekly=0, day_of_week=2, exchange="BSE")
-                                expiry_str = expiry.strftime("%d-%m-%Y")
-                                day = expiry_str[:2]
-                                # Extract strike (remaining digits after month abbreviation)
-                                strike = remaining[3:]
-
-                                # Construct date string
-                                part2 = f"{year}{month}{day}"
-                                part4 = strike
-
-                                return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-                            else:
-                                # Fallback for unrecognized month abbreviation
-                                trading_logger.log_warning(
-                                    "Unrecognized month abbreviation in SENSEX format",
-                                    {
-                                        "fno_symbol": fno_symbol,
-                                        "month_abbr": month_abbr,
-                                        "middle_part": middle_part,
-                                        "remaining": remaining,
-                                    },
-                                )
-                                return "____"
-
-                        # Check if next character is a digit (single digit month)
-                        elif remaining[0].isdigit():
-                            # Single digit month format
-                            month_digit = remaining[0]
-                            month = month_digit.zfill(2)  # 8 -> 08 (August)
-
-                            # Extract day (next 2 digits)
-                            day = remaining[1:3]
-
-                            # Extract strike (remaining digits before CE/PE)
-                            strike = remaining[3:]
-
-                            # Construct date string
-                            part2 = f"{year}{month}{day}"
-                            part4 = strike
-
-                            return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-
-                        # Check if next character is O, N, or D (single letter month)
-                        elif remaining[0] in ["O", "N", "D"]:
-                            # Single letter month format
-                            month_letter = remaining[0]
-
-                            # Map single letters to months: O=October, N=November, D=December
-                            month_map = {"O": "10", "N": "11", "D": "12"}  # October  # November  # December
-
-                            month = month_map[month_letter]
-
-                            # Extract day (next 2 digits)
-                            day = remaining[1:3]
-
-                            # Extract strike (remaining digits before CE/PE)
-                            strike = remaining[3:]
-
-                            # Construct date string
-                            part2 = f"{year}{month}{day}"
-                            part4 = strike
-
-                            return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-
-                        # Fallback for unexpected formats
-                        else:
-                            trading_logger.log_warning(
-                                "Unexpected SENSEX format",
-                                {"fno_symbol": fno_symbol, "middle_part": middle_part, "remaining": remaining},
-                            )
-                            part2 = "20250101"
-                            part4 = middle_part[2:]  # Use remaining part as strike
-                            return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-
-                    except Exception as e:
-                        trading_logger.log_error(
-                            "Error parsing SENSEX symbol", e, {"fno_symbol": fno_symbol, "middle_part": middle_part}
-                        )
-                        part2 = "20250101"
-                        part4 = middle_part
-                        return f"{symbol}_OPT_{part2}_{'CALL' if part3=='C' else 'PUT'}_{part4}"
-
-                else:
-                    # Original NIFTY format: NIFTY07AUG25C25050
-                    part1_match = re.search(r"^.*?(?=\d{2}[A-Z]{3}\d{2})", fno_symbol)
-                    date_match = re.search(r"\d{2}[A-Z]{3}\d{2}", fno_symbol)
-                    part3_match = re.search(r"(?<=\d{2}[A-Z]{3}\d{2}).*?([A-Z])", fno_symbol)
-                    part4_match = re.search(r"\d{2}[A-Z]{3}\d{2}\D(.*)", fno_symbol)
-
-                    if not part1_match or not date_match or not part3_match or not part4_match:
-                        return fno_symbol  # Return original if parsing fails
-
-                    part1 = part1_match.group()
-                    part2 = dt.datetime.strptime(date_match.group(), "%d%b%y").date().strftime("%Y%m%d")
-                    part3 = part3_match.group(1)
-                    part4 = part4_match.group(1)
-                    return f"{part1}_{'FUT' if part3 == 'F' else 'OPT'}_{part2}_{'CALL' if part3=='C' else 'PUT' if part3 =='P' else ''}_{part4}"
-
-            def split_cash(cash_symbol) -> str:
-                # Remove common equity suffixes like -EQ, -BE, -BZ, etc.
-                # Pattern: SYMBOL-EQ, SYMBOL-BE, etc.
-                cash_symbol = re.sub(r"-[A-Z]{2}$", "", cash_symbol)
-
-                lst = cash_symbol.split("_")
-                if len(lst) > 1:
-                    return "-".join(lst[:-1]) + "_STK___"
-                else:
-                    return lst[0] + "_STK___"
-
-            result = ScripName.apply(lambda x: split_cash(x) if x[-3] == "-" else split_fno(x))
+                raise ValidationError("Missing required arguments: Scripcode and Exchange", context)
+            if not isinstance(scripcode, pd.Series) or not isinstance(exchange, pd.Series) or len(scripcode) == 0:
+                context = create_error_context(
+                    scripcode_type=type(scripcode),
+                    exchange_type=type(exchange),
+                    len_scripcode=len(scripcode) if hasattr(scripcode, "__len__") else None,
+                )
+                raise ValidationError("Scripcode and Exchange must be non-empty pandas Series", context)
 
             trading_logger.log_debug(
-                "Long name generated successfully", {"input_count": len(ScripName), "output_count": len(result)}
+                "Resolving long name from mappings (Scripcode + Exchange)",
+                {"row_count": len(scripcode)},
             )
 
+            def lookup(scripcode_val, exchange_val):
+                try:
+                    exch_map = self.exchange_mappings.get(exchange_val, {})
+                    rev = exch_map.get("symbol_map_reversed", {})
+                    code = int(scripcode_val) if scripcode_val is not None else None
+                    if code is None:
+                        return None
+                    return rev.get(code) or rev.get(scripcode_val)
+                except (TypeError, ValueError, KeyError):
+                    return None
+
+            result = pd.Series(
+                [lookup(scripcode.iloc[i], exchange.iloc[i]) for i in range(len(scripcode))],
+                index=scripcode.index,
+            )
+            missing = result.isna().sum()
+            if missing > 0:
+                trading_logger.log_warning(
+                    "Some rows had no mapping for Scripcode+Exchange",
+                    {"missing_count": int(missing), "total": len(result)},
+                )
             return result
 
         except (ValidationError, DataError):
