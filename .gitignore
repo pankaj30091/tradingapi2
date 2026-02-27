@@ -24,6 +24,7 @@ temp/
 dist/
 build/
 docs/
+!docs/ATTRIBUTION_REFACTOR_DESIGN.md
 examples/
 tradingapi.egg-info/
 tests/
