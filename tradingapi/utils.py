@@ -2937,6 +2937,22 @@ def find_option_with_delta(
     best_index = -1  # Default to -1 if no valid option is found
     best_delta = float("-inf") if return_lower_delta else float("inf")  # Best delta found so far
 
+    def _strike(sym: str) -> float:
+        return float(sym.split("_")[4]) if "_" in sym and len(sym.split("_")) > 4 else float("nan")
+
+    chain_strikes = [_strike(s) for s in option_chain] if option_chain else []
+    strike_lo = min(chain_strikes) if chain_strikes else float("nan")
+    strike_hi = max(chain_strikes) if chain_strikes else float("nan")
+    logger.debug(
+        "find_option_with_delta: price_f=%s target_delta=%s return_lower_delta=%s chain_len=%s strike_range=[%s, %s]",
+        price_f,
+        target_delta,
+        return_lower_delta,
+        len(option_chain),
+        strike_lo,
+        strike_hi,
+    )
+
     # Determine if delta is increasing or decreasing
     mid = (left + right) // 2
     delta_1, delta_2 = float("nan"), float("nan")
@@ -2955,9 +2971,23 @@ def find_option_with_delta(
 
     # If we cannot determine a valid direction, return -1
     if math.isnan(delta_1) or math.isnan(delta_2):
+        logger.debug(
+            "find_option_with_delta: early return nan delta_1=%s delta_2=%s mid_strike=%s",
+            delta_1,
+            delta_2,
+            _strike(option_chain[mid]) if option_chain and mid < len(option_chain) else None,
+        )
         return best_index
 
     increasing = abs(delta_2) > abs(delta_1)  # True if deltas increase with strike price
+    logger.debug(
+        "find_option_with_delta: direction mid=%s mid_strike=%s delta_1=%s delta_2=%s increasing=%s",
+        mid,
+        _strike(option_chain[mid]) if option_chain and mid < len(option_chain) else None,
+        delta_1,
+        delta_2,
+        increasing,
+    )
     # if delta is nan, we need to decide if the search range is to the left or right of the present strike
     # and use delta_2's position vis_a-vis target_delta to determine the direction of move to identity next best delta.
     move_right_on_nan_delta = True
@@ -2976,11 +3006,18 @@ def find_option_with_delta(
         delta = abs(delta)  # always select an option using the absolute value of delta.
 
         if math.isnan(delta):
-            # Skip NaN values by moving in the correct direction
-            if move_right_on_nan_delta:
-                left = mid + 1  # Move right
+            # Don't exclude the range containing current best (where target delta likely is).
+            # Otherwise e.g. NaN at mid=59 leads to right=58 and we exclude [59,119], losing index 110.
+            if best_index >= 0:
+                if mid < best_index:
+                    left = mid + 1  # Keep [mid+1, right] so we don't drop best_index
+                else:
+                    right = mid - 1  # Keep [left, mid-1]
             else:
-                right = mid - 1  # Move right
+                if move_right_on_nan_delta:
+                    left = mid + 1
+                else:
+                    right = mid - 1
             continue
 
         # Update best index if this delta is a better fit
@@ -2988,10 +3025,22 @@ def find_option_with_delta(
             if delta <= target_delta and delta > best_delta:
                 best_delta = delta
                 best_index = mid
+                logger.debug(
+                    "find_option_with_delta: best update mid=%s strike=%s delta=%s",
+                    mid,
+                    _strike(option_chain[mid]),
+                    delta,
+                )
         else:
             if delta >= target_delta and delta < best_delta:
                 best_delta = delta
                 best_index = mid
+                logger.debug(
+                    "find_option_with_delta: best update mid=%s strike=%s delta=%s",
+                    mid,
+                    _strike(option_chain[mid]),
+                    delta,
+                )
 
         # Adjust binary search range based on delta trend
         if increasing:
@@ -3005,6 +3054,16 @@ def find_option_with_delta(
             else:
                 right = mid - 1  # Search lower strikes for bigger deltas
 
+    if best_index >= 0 and option_chain:
+        logger.debug(
+            "find_option_with_delta: return best_index=%s strike=%s symbol=%s best_delta=%s",
+            best_index,
+            _strike(option_chain[best_index]),
+            option_chain[best_index],
+            best_delta,
+        )
+    else:
+        logger.debug("find_option_with_delta: return best_index=%s (no valid option)", best_index)
     return best_index
 
 
