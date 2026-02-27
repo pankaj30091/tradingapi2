@@ -860,6 +860,7 @@ class BrokerBase(ABC):
         exchange: str = "N",
         periodicity: str = "1m",
         market_close_time: str = "15:30:00",
+        refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
         Get historical data for symbols.
@@ -871,6 +872,7 @@ class BrokerBase(ABC):
             exchange: Exchange name
             periodicity: Data periodicity
             market_close_time: Market close time
+            refresh_mapping: If True, load symbol mapping from date_end's symbols CSV instead of cached mapping.
 
         Returns:
             Dict[str, List[HistoricalData]]: Historical data for each symbol

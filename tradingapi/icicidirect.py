@@ -539,6 +539,7 @@ class IciciDirect(BrokerBase):
         exchange: str = "N",
         periodicity: str = "1m",
         market_close_time: str = "15:30:00",
+        refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
         TODO: Implement using Breeze historical APIs.
