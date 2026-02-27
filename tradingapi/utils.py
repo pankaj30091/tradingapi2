@@ -3140,8 +3140,10 @@ def get_delta_strike(
         price_f = get_option_underlying_price(
             brokers, underlying_symbol, opt_expiry, fut_expiry, exchange=exchange, mds=mds
         )
+        logger.debug("get_delta_strike: price_f from get_option_underlying_price=%s", price_f)
     else:
         price_f = get_price(brokers, underlying_symbol, checks=["last"], exchange=exchange, mds=mds).last
+        logger.debug("get_delta_strike: price_f from get_price(underlying).last=%s", price_f)
     option_chain = get_linked_options(brokers[0], underlying_symbol, opt_expiry, exchange)
     # option_chain = get_opt_chain(broker, underlying_symbol.split("_")[0], opt_expiry_yyyy_mm_dd)
     option_chain = [opt for opt in option_chain if f"_{option_type}_" in opt]
@@ -3160,6 +3162,7 @@ def get_delta_strike(
     if index >= 0:
         return option_chain[index]
     else:
+        logger.debug("get_delta_strike: no option found (index=%s)", index)
         return None
 
 
