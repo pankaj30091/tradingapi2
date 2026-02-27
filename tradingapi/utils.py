@@ -2712,7 +2712,49 @@ def get_price(
     return out
 
 
-def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds: Optional[str] = None, last=False):
+def _get_historical_close_at_time(
+    broker: BrokerBase,
+    symbol: str,
+    exchange: str,
+    as_of: dt.datetime,
+) -> float:
+    """Get historical close price at or just before as_of. Returns float('nan') on failure."""
+    try:
+        date_str = as_of.strftime("%Y-%m-%d")
+        hist = broker.get_historical(
+            symbols=symbol,
+            date_start=date_str,
+            date_end=date_str,
+            exchange=exchange,
+            periodicity="1m",
+            market_close_time="15:30:00",
+            refresh_mapping=False,
+        )
+        if symbol.startswith("NIFTY_"):
+            keys_to_replace = [k for k in hist if k.startswith("NSENIFTY_")]
+            for old_key in keys_to_replace:
+                new_key = old_key.replace("NSENIFTY_", "NIFTY_", 1)
+                hist[new_key] = hist.pop(old_key)
+        data = hist.get(symbol, [])
+        if not data:
+            return float("nan")
+        data = sorted(data, key=lambda x: x.date)
+        target_naive = as_of.replace(tzinfo=None) if as_of.tzinfo else as_of
+        candidates = []
+        for x in data:
+            x_naive = x.date
+            if getattr(x_naive, "tzinfo", None) is not None:
+                x_naive = x_naive.replace(tzinfo=None)  # type: ignore[union-attr]
+            if x_naive <= target_naive:
+                candidates.append((x_naive, x))
+        if candidates:
+            return float(candidates[-1][1].close)
+        return float(data[0].close)
+    except Exception:
+        return float("nan")
+
+
+def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds: Optional[str] = None, last=True):
     if isinstance(brokers, BrokerBase):
         brokers = [brokers]
     try:
@@ -2740,46 +2782,104 @@ def get_option_underlying_price(
     fut_expiry: Optional[str] = "",
     exchange="NSE",
     mds: Optional[str] = None,
-    last=False,
+    last=True,
+    as_of: Optional[dt.datetime] = None,
 ) -> float:
-    """Retrieve underlying price for a symbol and interpolates, if if needed
+    """Retrieve underlying price for a symbol; interpolates for index options when fut_expiry given.
+
+    When as_of is None: uses current mid (or last) price and now() for interpolation.
+    When as_of is set: uses historical close at as_of (1m bar close at or before as_of) and
+    as_of for interpolation; index options use IND + FUT close and t_o/t_f from as_of.
 
     Args:
-        symbol (str): sybol name. Should be atleast of form symbol_type___
-        opt_expiry (str): expiry date of option. The expiry is NOT picked from symbol
-        fut_expiry (str, optional): expiry date of underlying future. Defaults to None.
+        symbol: Symbol name (e.g. NIFTY_OPT_... or BASE_FUT_...).
+        opt_expiry: Expiry date of option (yyyymmdd). Not parsed from symbol.
+        fut_expiry: Expiry of underlying future (yyyymmdd). Empty for index => IND only; for index with fut => interpolate.
+        exchange: Exchange (NSE/BSE).
+        mds: Optional MDS.
+        last: If True, use last price when mid not available (current path only).
+        as_of: If set, use historical close at this time; else current prices and now().
 
     Returns:
-        float: price of underlying
+        Price of underlying (float); nan on failure.
     """
+    base = symbol.split("_")[0]
+    is_index = "NIFTY" in symbol or "SENSEX" in symbol
+
+    if as_of is not None:
+        # Historical path: use close at as_of (via 1m bars)
+        broker = brokers[0] if brokers else None
+        if broker is None:
+            return float("nan")
+        if is_index and fut_expiry:
+            underlying_ind = f"{base}_IND___"
+            underlying_fut = f"{base}_FUT_{fut_expiry}__"
+            price_u = _get_historical_close_at_time(broker, underlying_ind, exchange, as_of)
+            price_f = _get_historical_close_at_time(broker, underlying_fut, exchange, as_of)
+            if math.isnan(price_u) or math.isnan(price_f):
+                return float("nan")
+            t_o = calc_fractional_business_days(
+                as_of, dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+            )
+            t_f = calc_fractional_business_days(
+                as_of, dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+            )
+            if t_f and t_f > 0:
+                price_f = price_u + (price_f - price_u) * t_o / t_f
+            return price_f
+        if is_index and not fut_expiry:
+            underlying_ind = f"{base}_IND___"
+            return _get_historical_close_at_time(broker, underlying_ind, exchange, as_of)
+        # Non-index: FUT with expiry = option expiry
+        underlying_fut = f"{base}_FUT_{opt_expiry}__"
+        return _get_historical_close_at_time(broker, underlying_fut, exchange, as_of)
+
+    # Current path: mid (or last) and now()
     if not fut_expiry:
         underlying = (
-            symbol.split("_")[0] + "_IND___"
-            if "NIFTY" in symbol or "SENSEX" in symbol
-            else symbol.split("_")[0] + "_STK___"
+            base + "_IND___"
+            if is_index
+            else base + "_STK___"
         )
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
+        logger.debug(
+            "get_option_underlying_price: no fut_expiry underlying=%s price_f=%s",
+            underlying,
+            price_f,
+        )
     else:
-        underlying = symbol.split("_")[0] + "_FUT" + "_" + fut_expiry + "__"
+        underlying = base + "_FUT_" + fut_expiry + "__"
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
         if math.isnan(price_f):
             return float("nan")
+        logger.debug(
+            "get_option_underlying_price: fut_expiry=%s underlying=%s price_f (fut)=%s",
+            fut_expiry,
+            underlying,
+            price_f,
+        )
 
-    # Interpolate for index options if needed
-    if ("NIFTY" in symbol or "SENSEX" in symbol) and fut_expiry:
+    if is_index and fut_expiry:
         t_o = calc_fractional_business_days(
             dt.datetime.now(), dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
         )
         t_f = calc_fractional_business_days(
             dt.datetime.now(), dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
         )
-        underlying_ind = f'{symbol.split("_")[0]}_IND___'
+        underlying_ind = f"{base}_IND___"
         last_price = get_mid_price(brokers, underlying_ind, exchange=exchange, mds=mds, last=True)
         if not math.isnan(last_price):
             price_u = last_price
         else:
             price_u = get_price(brokers, underlying_ind, checks=["prior_close"], exchange=exchange, mds=mds).prior_close
         price_f = price_u + (price_f - price_u) * t_o / t_f
+        logger.debug(
+            "get_option_underlying_price: index interpolated price_u=%s t_o=%s t_f=%s price_f=%s",
+            price_u,
+            t_o,
+            t_f,
+            price_f,
+        )
     return price_f
 
 
