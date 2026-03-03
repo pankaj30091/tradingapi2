@@ -30,7 +30,7 @@ def _validate_datetime_input(date_input):
         return False
 from py5paisa import FivePaisaClient
 
-from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
+from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
 from .config import get_config
 from .utils import (
     delete_broker_order_id,
@@ -61,6 +61,7 @@ except ImportError:
 
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from . import trading_logger
+from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
 
 logger = logging.getLogger(__name__)
@@ -459,18 +460,23 @@ class FivePaisa(BrokerBase):
 
     @log_execution_time
     @validate_inputs(redis_db=lambda x: isinstance(x, int) and x >= 0)
-    def connect(self, redis_db: int):
+    def connect(self, redis_db: int, as_of_date=None):
         """
         Connect to FivePaisa trading platform with enhanced session management.
 
         Args:
             redis_db: Redis database number
+            as_of_date: Optional date (date, datetime, or str YYYYMMDD/YYYY-MM-DD).
+                If provided, the broker loads the symbol file for that date.
 
         Raises:
             ValidationError: If redis_db is invalid
             BrokerConnectionError: If connection fails
             AuthenticationError: If authentication fails
         """
+        normalized = _normalize_as_of_date(as_of_date)
+        if normalized is not None:
+            tradingapi_globals.TRADINGAPI_NOW = normalized
 
         def extract_credentials():
             """Extract credentials from config with validation."""

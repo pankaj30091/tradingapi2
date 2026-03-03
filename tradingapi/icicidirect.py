@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 import zipfile
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 import redis
@@ -24,6 +24,7 @@ from .broker_base import (
     OrderStatus,
     Position,
     Price,
+    _normalize_as_of_date,
 )
 from .config import get_config
 from .utils import set_starting_internal_ids_int, update_order_status
@@ -41,6 +42,7 @@ from .exceptions import (
 )
 from .error_handling import retry_on_error, safe_execute, log_execution_time, validate_inputs
 from . import trading_logger
+from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
 
 logger = logging.getLogger(__name__)
@@ -333,10 +335,22 @@ class IciciDirect(BrokerBase):
 
     @log_execution_time
     @retry_on_error(max_retries=3, delay=2.0, backoff_factor=2.0)
-    def connect(self, redis_db: int):
+    def connect(
+        self,
+        redis_db: int,
+        as_of_date: Optional[Union[dt.date, dt.datetime, str]] = None,
+    ):
         """
         Initialize BreezeConnect session and internal Redis state.
+
+        Args:
+            redis_db: Redis database number
+            as_of_date: Optional date (date, datetime, or str YYYYMMDD/YYYY-MM-DD).
+                If provided, TRADINGAPI_NOW is set so the broker behaves as if on that date.
         """
+        normalized = _normalize_as_of_date(as_of_date)
+        if normalized is not None:
+            tradingapi_globals.TRADINGAPI_NOW = normalized
         try:
             api_key = config.get("ICICIDIRECT.API_KEY")
             api_secret = config.get("ICICIDIRECT.API_SECRET")

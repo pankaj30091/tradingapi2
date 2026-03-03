@@ -5,10 +5,13 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 from .globals import get_tradingapi_now
 import pandas as pd
+import pytz
 import redis
+
+from chameli.dateutils import parse_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,31 @@ from .error_handling import retry_on_error, safe_execute, log_execution_time, ha
 # Removed trading_logger import to avoid circular import issues
 
 NEXT_DAY_TIMESTAMP = int((get_tradingapi_now() + dt.timedelta(days=1)).timestamp())
+
+
+def _normalize_as_of_date(
+    as_of_date: Optional[Union[dt.date, dt.datetime, str]],
+) -> Optional[dt.datetime]:
+    """
+    Normalize as_of_date to a timezone-aware datetime (start of day Asia/Kolkata).
+    Returns None if as_of_date is None.
+    """
+    if as_of_date is None:
+        return None
+    if isinstance(as_of_date, str):
+        parsed = parse_datetime(as_of_date)
+        if isinstance(parsed, dt.datetime):
+            dt_obj = parsed
+        else:
+            dt_obj = dt.datetime.combine(parsed, dt.time.min)
+    elif isinstance(as_of_date, dt.datetime):
+        dt_obj = as_of_date
+    else:
+        dt_obj = dt.datetime.combine(as_of_date, dt.time.min)
+    if dt_obj.tzinfo is None:
+        tz = pytz.timezone("Asia/Kolkata")
+        dt_obj = tz.localize(dt_obj)
+    return dt_obj
 
 
 class Brokers(Enum):
@@ -741,12 +769,16 @@ class BrokerBase(ABC):
         pass
 
     @abstractmethod
-    def connect(self, redis_db: int):
+    def connect(self, redis_db: int, as_of_date: Optional[Union[dt.date, dt.datetime, str]] = None):
         """
         Connect to the broker's trading platform.
 
         Args:
             redis_db: Redis database number
+            as_of_date: Optional date (date, datetime, or str YYYYMMDD/YYYY-MM-DD).
+                If provided, the broker loads the symbol file for that date and
+                TRADINGAPI_NOW is set so the broker behaves as if on that date.
+                If None, current date is used (default behaviour).
 
         Raises:
             ValidationError: If redis_db is invalid
