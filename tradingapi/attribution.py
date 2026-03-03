@@ -32,6 +32,7 @@ from tradingapi.utils import (
     historical_to_dataframes,
     parse_combo_symbol,
     parse_datetime,
+    _get_historical_close_at_time,
 )
 
 from chameli.dateutils import advance_by_biz_days, format_datetime, get_expiry, get_naive_dt
@@ -278,6 +279,73 @@ def _get_month_end_fut_expiry(opt_expiry_yyyymmdd: str, exchange: str) -> str:
         return expiry_date.strftime("%Y%m%d")
     except Exception:
         return opt_expiry_yyyymmdd
+
+
+def get_greeks_at_time(
+    row: Union[pd.Series, Dict[str, Any]],
+    current_time: dt.datetime,
+    broker: Optional[object],
+    greeks_list: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    For a trade row (combo or single leg), compute greeks at current_time for each option leg.
+    Uses broker for option price and underlying at current_time (historical close at time),
+    then chameli calc_greeks. Returns dict: leg_symbol -> {delta, gamma, theta, vega, vol}
+    or {error: str} on failure. Used by scalping vol-attrib logging and notebooks (e.g. test_attribution).
+    """
+    if greeks_list is None:
+        greeks_list = ["delta", "gamma", "theta", "vega"]
+    combo = row.get("symbol", "")
+    legs = _parse_combo_symbol(combo)
+    out: Dict[str, Any] = {}
+    for leg_symbol in legs:
+        if not is_options_symbol(leg_symbol):
+            continue
+        exchange = get_exchange(leg_symbol)
+        parts = leg_symbol.split("_")
+        if len(parts) < 5:
+            continue
+        opt_expiry = parts[2]
+        fut_expiry = _get_month_end_fut_expiry(opt_expiry, exchange)
+        if broker is None:
+            continue
+        try:
+            opt_price = _get_historical_close_at_time(
+                cast(BrokerBase, broker), leg_symbol, exchange, current_time
+            )
+            if opt_price is None or (
+                isinstance(opt_price, float) and (opt_price != opt_price)
+            ):
+                continue
+            underlying = get_option_underlying_price(
+                [cast(BrokerBase, broker)],
+                leg_symbol,
+                opt_expiry,
+                fut_expiry=fut_expiry,
+                exchange=exchange,
+                as_of=current_time,
+            )
+            if underlying is None or (
+                isinstance(underlying, float) and (underlying != underlying)
+            ):
+                continue
+            g = calc_greeks(
+                long_symbol=leg_symbol,
+                opt_price=float(opt_price),
+                underlying=float(underlying),
+                calc_time=current_time,
+                greeks=greeks_list + ["vol"],
+                risk_free_rate=0,
+                exchange=exchange,
+            )
+            out[leg_symbol] = {
+                k: getattr(g, k, g.get(k))
+                for k in (greeks_list + ["vol"])
+                if k in (greeks_list + ["vol"])
+            }
+        except Exception as e:
+            out[leg_symbol] = {"error": str(e)}
+    return out
 
 
 # ============================================================================
