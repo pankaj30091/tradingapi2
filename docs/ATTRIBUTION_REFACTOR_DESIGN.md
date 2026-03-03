@@ -161,37 +161,29 @@ So when `leg_prices` is None we need **broker** for multi-leg (Redis + optional 
 
 The core API `calculate_attribution_for_trade` can be slow when called repeatedly (e.g. over many trades) because it triggers multiple broker/ohlcutils lookups with no cross-call reuse. The following changes are proposed to improve latency and reduce redundant I/O.
 
-### 9.1 Expose `historical_cache` in the public API
+### 9.1 Expose `historical_cache` in the public API — Implemented
 
-- **Current:** `mtm_entry_price` and `mtm_exit_price` accept an optional `historical_cache: Optional[Dict[Tuple[str, str], Optional[float]]]` (key: `(symbol, date_str)` → EOD close). `calculate_attribution_for_trade` always passes `None`, so every day-level call can trigger `get_historical_close_price` (and thus ohlcutils or broker historical).
-- **Proposed:** Add optional parameter to the public API:
-  ```text
-  historical_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None
-  ```
-  When `day=True`, pass this cache into `mtm_entry_price` and `mtm_exit_price`. Callers that loop over many trades (e.g. scalping, batch PnL) should create one dict per batch and pass it in so each `(symbol, date_str)` is fetched once and reused.
+- **Implemented:** `calculate_attribution_for_trade(..., historical_cache=None)` and when `day=True` pass it to `mtm_entry_price` / `mtm_exit_price`. Callers that loop over many trades can pass a single dict so each `(symbol, date_str)` is fetched once and reused.
 
-### 9.2 Batch API (optional)
+### 9.2 Batch API — Implemented
 
-- **Proposed:** Add `calculate_attribution_for_trades(rows, broker, ..., historical_cache=None)` (or have callers pass a shared `historical_cache` into a loop of `calculate_attribution_for_trade`). A dedicated batch function could pre-populate `historical_cache` for all required (symbol, date) pairs (e.g. from a single broker/ohlcutils pass) then run single-trade logic per row. This reduces duplicate `get_historical_close_price` and optional spot/IV work when many trades share underlyings and dates.
+- **Implemented:** `calculate_attribution_for_trades(rows, broker, ..., historical_cache=None)` uses a shared `historical_cache` across all rows. No separate pre-population; cache is filled on demand and reused.
 
-### 9.3 Caching of “spot at time” / historical bars
+### 9.3 Caching of “spot at time” / historical bars — Implemented
 
-- **Current:** Options path uses `get_option_underlying_price(..., as_of=time)`, which calls `utils._get_historical_close_at_time` — **no cache**; each call does `broker.get_historical(1m)` for that symbol/date. `get_spot_price_at_time` uses `_price_cache` with 60s TTL; historical (past) times are cached with the same short TTL.
-- **Proposed:**
-  - **In `utils`:** Add a cache for `_get_historical_close_at_time` keyed by e.g. `(symbol, exchange, date_str, time_key)` (e.g. `time_key = as_of.strftime("%Y%m%d_%H%M")`). For past dates, cache indefinitely or with long TTL.
-  - **In attribution:** For `_price_cache`, when the requested time is in the past (`at_time < now`), do not expire after 60s (or use a long TTL / no TTL). Only “current” or near-current keys need short TTL.
-  - **Unified “1m bars” cache (optional):** One fetch per `(symbol, exchange, date_str)` for 1m bars; both `get_spot_price_at_time` (past) and `get_option_underlying_price(as_of=...)` could consume from this cache to avoid duplicate `broker.get_historical(1m)` for the same day.
+- **utils:** `_get_historical_close_at_time` uses a module-level cache keyed by `(symbol, exchange, date_str, time_key)`. **TTL only for “current” (within 60s of now);** all other times are kept in cache indefinitely.
+- **attribution `_price_cache`:** Same policy: if `at_time` is not within 60s of now, cache entry is kept indefinitely; only “current” keys use a 60s TTL.
+- **Unified “1m bars” cache:** Not implemented (optional future improvement).
 
-### 9.4 IV and price cache TTLs
+### 9.4 IV and price cache TTLs — Implemented
 
-- **Current:** `_iv_cache` uses `_IV_CACHE_TTL_SECONDS = 30`. IV for the same (symbol, price, spot, time) is deterministic.
-- **Proposed:** For past times (`at_time < now - 1 minute`), cache IV indefinitely or with long TTL. Optionally increase `_IV_CACHE_TTL_SECONDS` for real-time keys (e.g. 300s) if acceptable for live dashboards.
+- **attribution `_iv_cache`:** For past times (`at_time < now - 60s`), entries are kept indefinitely; only near-now keys use `_IV_CACHE_TTL_SECONDS` (30s). Aligns with "TTL only for current (within 60s)."
 
-### 9.5 Prefer passing `spot_prices` and `leg_prices` when available
+### 9.5 Prefer passing `spot_prices` and `leg_prices` — Documented
 
-- When the caller has already fetched spot and per-leg prices (e.g. from a batch or UI), passing `spot_prices=` and `leg_prices=` avoids all broker/Redis lookups for those. Document this as the fast path for loops (e.g. “for batch attribution, build once: `{(symbol, exchange, time): price}` and `{leg: (entry, exit)}`, then call `calculate_attribution_for_trade(row, ..., spot_prices=spot_dict, leg_prices=leg_dict)`”).
+- Module docstring describes the fast path: pass `spot_prices=` / `leg_prices=` when available, or use `calculate_attribution_for_trades` with shared `historical_cache`.
 
-### 9.6 Other
+### 9.6 Other — Partially implemented
 
-- **`get_historical_close_price`:** Uses `refresh_mapping=True` on broker historical call; consider `refresh_mapping=False` for repeated (symbol, date) use or make it configurable to reduce overhead.
-- **Redis leg prices:** `_get_leg_price_from_broker_row` does one or more Redis `hget` per key; batching (e.g. pipeline) could reduce round-trips when a row has many keys (lower priority than historical/spot caching).
+- **`get_historical_close_price`:** **Implemented.** Optional `refresh_mapping: bool = True`. Threaded through `calculate_attribution_for_trade(..., refresh_mapping=False)`, `mtm_entry_price`, `mtm_exit_price`, `calculate_attribution_for_trades`, and `mtm_df`. Default `False` in the attribution API so batch use does not refresh mapping on each historical fetch.
+- **Redis leg prices:** Batching (e.g. pipeline) not implemented; lower priority.
