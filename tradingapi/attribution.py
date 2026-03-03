@@ -976,6 +976,10 @@ def calculate_attribution_for_trade(
             entry_dt = mtm_entry_time
             exit_dt = mtm_exit_time
 
+        # Minute-align entry/exit for all spot/IV lookups and performance_attribution (historical data is 1m only)
+        entry_dt = entry_dt.replace(second=0, microsecond=0)
+        exit_dt = exit_dt.replace(second=0, microsecond=0)
+
         legs = _parse_combo_symbol(combo_symbol)
         if len(legs) == 0:
             return result
