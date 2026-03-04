@@ -11,7 +11,7 @@ import time
 import traceback
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Dict, List, Optional, Union, cast, Sequence
+from typing import Dict, List, Optional, Tuple, Union, cast, Sequence
 
 import numpy as np
 import pandas as pd
@@ -79,25 +79,27 @@ config = get_config()
 mds_history = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 pubsub = mds_history.pubsub()
 
-empty_trades = pd.DataFrame({
-    "symbol": pd.Series(dtype="object"),
-    "side": pd.Series(dtype="object"),
-    "entry_time": pd.Series(dtype="string"),
-    "entry_quantity": pd.Series(dtype="float64"),
-    "entry_price": pd.Series(dtype="float64"),
-    "exit_time": pd.Series(dtype="string"),
-    "exit_quantity": pd.Series(dtype="float64"),
-    "exit_price": pd.Series(dtype="float64"),
-    "commission": pd.Series(dtype="int64"),
-    "int_order_id": pd.Series(dtype="object"),
-    "entry_keys": pd.Series(dtype="object"),
-    "exit_keys": pd.Series(dtype="object"),
-    "additional_info": pd.Series(dtype="object"),
-    "realized_pnl": pd.Series(dtype="float64"),
-    "gross_pnl": pd.Series(dtype="float64"),
-    "mtm": pd.Series(dtype="float64"),
-    "pnl": pd.Series(dtype="float64"),
-})
+empty_trades = pd.DataFrame(
+    {
+        "symbol": pd.Series(dtype="object"),
+        "side": pd.Series(dtype="object"),
+        "entry_time": pd.Series(dtype="string"),
+        "entry_quantity": pd.Series(dtype="float64"),
+        "entry_price": pd.Series(dtype="float64"),
+        "exit_time": pd.Series(dtype="string"),
+        "exit_quantity": pd.Series(dtype="float64"),
+        "exit_price": pd.Series(dtype="float64"),
+        "commission": pd.Series(dtype="int64"),
+        "int_order_id": pd.Series(dtype="object"),
+        "entry_keys": pd.Series(dtype="object"),
+        "exit_keys": pd.Series(dtype="object"),
+        "additional_info": pd.Series(dtype="object"),
+        "realized_pnl": pd.Series(dtype="float64"),
+        "gross_pnl": pd.Series(dtype="float64"),
+        "mtm": pd.Series(dtype="float64"),
+        "pnl": pd.Series(dtype="float64"),
+    }
+)
 
 empty_md = {
     "date": pd.Series(dtype="datetime64[ns]"),
@@ -207,8 +209,12 @@ def publish_trades_to_redis(
                 # Use date boundaries for comparison (start of today to end of today)
                 today_start = dt.datetime.combine(dt.date.today(), dt.time.min)
                 today_end = dt.datetime.combine(dt.date.today(), dt.time.max)
-                entry_today = safe_datetime_compare(trades.entry_time, today_start, ">=") & safe_datetime_compare(trades.entry_time, today_end, "<=")
-                exit_today = safe_datetime_compare(trades.exit_time, today_start, ">=") & safe_datetime_compare(trades.exit_time, today_end, "<=")
+                entry_today = safe_datetime_compare(trades.entry_time, today_start, ">=") & safe_datetime_compare(
+                    trades.entry_time, today_end, "<="
+                )
+                exit_today = safe_datetime_compare(trades.exit_time, today_start, ">=") & safe_datetime_compare(
+                    trades.exit_time, today_end, "<="
+                )
                 today_trades = entry_today | exit_today
 
                 # Open trades from earlier days (entered before today, still have open position)
@@ -826,64 +832,13 @@ def get_pnl_table(
                 # Handle mixed types in datetime columns by converting to string for comparison
 
                 mask = (
-                    ((safe_datetime_compare(out.entry_time, start_time, ">=")) | (out.entry_time.astype(str) == ""))
-                    & ((safe_datetime_compare(out.exit_time, end_time, "<=")) | (out.exit_time.astype(str) == "") | (out.entry_time.astype(str) == ""))
+                    (safe_datetime_compare(out.entry_time, start_time, ">=")) | (out.entry_time.astype(str) == "")
+                ) & (
+                    (safe_datetime_compare(out.exit_time, end_time, "<="))
+                    | (out.exit_time.astype(str) == "")
+                    | (out.entry_time.astype(str) == "")
                 )
                 out = out[mask]
-
-                # Debug: Log trades with exit_keys that were filtered out
-                if "int_order_id" in out.columns and "exit_keys" in out.columns:
-                    trades_before = pd.DataFrame(trades)
-                    if "int_order_id" in trades_before.columns and "exit_keys" in trades_before.columns:
-                        trades_with_exits_before = trades_before[
-                            trades_before["exit_keys"].astype(str).str.strip() != ""
-                        ]
-                        trades_with_exits_after = out[out["exit_keys"].astype(str).str.strip() != ""]
-
-                        # Find trades that were filtered out
-                        if len(trades_with_exits_before) > 0:
-                            before_ids = set(cast(pd.Series, trades_with_exits_before["int_order_id"]).values)
-                            after_ids = (
-                                set(cast(pd.Series, trades_with_exits_after["int_order_id"]).values)
-                                if len(trades_with_exits_after) > 0
-                                else set()
-                            )
-                            filtered_out_ids = before_ids - after_ids
-
-                            for filtered_id in filtered_out_ids:
-                                row_filtered = cast(pd.DataFrame, trades_with_exits_before[
-                                    trades_with_exits_before["int_order_id"] == filtered_id
-                                ]).iloc[0]
-                                entry_time_val = row_filtered.get("entry_time", "")
-                                exit_time_val = row_filtered.get("exit_time", "")
-
-                                # Check each condition
-                                entry_time_ok = (str(entry_time_val) >= start_time) or (str(entry_time_val) == "")
-                                exit_time_ok = (
-                                    (str(exit_time_val) <= end_time)
-                                    or (str(exit_time_val) == "0")
-                                    or (str(entry_time_val) == "")
-                                )
-
-                                trading_logger.log_warning(
-                                    "Trade with exit_keys was filtered out by DataFrame filter",
-                                    {
-                                        "int_order_id": filtered_id,
-                                        "symbol": row_filtered.get("symbol", ""),
-                                        "start_time": start_time,
-                                        "end_time": end_time,
-                                        "entry_time": str(entry_time_val),
-                                        "exit_time": str(exit_time_val),
-                                        "entry_time_type": str(type(entry_time_val)),
-                                        "exit_time_type": str(type(exit_time_val)),
-                                        "entry_time_ok": entry_time_ok,
-                                        "exit_time_ok": exit_time_ok,
-                                        "trades_count_before": len(trades),
-                                        "trades_count_after": len(out),
-                                    },
-                                )
-                # pnl = (out.exit_price + out.entry_price) * out.exit_quantity
-                # pnl = np.where(out["side"] == "BUY", pnl, -pnl)
                 out["mtm"] = np.where(out["exit_quantity"] != 0, out["exit_price"], out["entry_price"])
                 out["gross_pnl"] = -1 * (
                     out["exit_price"] * out["exit_quantity"]
@@ -2720,15 +2675,36 @@ def get_price(
     return out
 
 
+# Cache for _get_historical_close_at_time: (symbol, exchange, date_str, time_key) -> (price, ts)
+# TTL only for "current" (within 60s of now); all other times kept indefinitely.
+_historical_close_at_time_cache: Dict[Tuple[str, str, str, str], Tuple[float, float]] = {}
+_CURRENT_THRESHOLD_SECONDS = 60
+_CURRENT_TTL_SECONDS = 60
+
+
 def _get_historical_close_at_time(
     broker: BrokerBase,
     symbol: str,
     exchange: str,
     as_of: dt.datetime,
 ) -> float:
-    """Get historical close price at or just before as_of. Returns float('nan') on failure."""
+    """Get historical close price at or just before as_of. Returns float('nan') on failure. Cached by (symbol, exchange, date_str, time_key)."""
+    date_str = as_of.strftime("%Y-%m-%d")
+    time_key = as_of.replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
+    cache_key: Tuple[str, str, str, str] = (symbol, exchange, date_str, time_key)
+    now_ts = time.time()
+    now_dt = dt.datetime.now()
+    as_of_naive = as_of.replace(tzinfo=None) if as_of.tzinfo else as_of
+    delta_seconds = (now_dt - as_of_naive).total_seconds()
+    is_current = abs(delta_seconds) <= _CURRENT_THRESHOLD_SECONDS
+    if cache_key in _historical_close_at_time_cache:
+        cached_price, cache_ts = _historical_close_at_time_cache[cache_key]
+        if not is_current:
+            return cached_price
+        if now_ts - cache_ts < _CURRENT_TTL_SECONDS:
+            return cached_price
+        del _historical_close_at_time_cache[cache_key]
     try:
-        date_str = as_of.strftime("%Y-%m-%d")
         hist = broker.get_historical(
             symbols=symbol,
             date_start=date_str,
@@ -2756,8 +2732,11 @@ def _get_historical_close_at_time(
             if x_naive <= target_naive:
                 candidates.append((x_naive, x))
         if candidates:
-            return float(candidates[-1][1].close)
-        return float(data[0].close)
+            result = float(candidates[-1][1].close)
+        else:
+            result = float(data[0].close)
+        _historical_close_at_time_cache[cache_key] = (result, now_ts)
+        return result
     except Exception:
         return float("nan")
 
@@ -2844,11 +2823,7 @@ def get_option_underlying_price(
 
     # Current path: mid (or last) and now()
     if not fut_expiry:
-        underlying = (
-            base + "_IND___"
-            if is_index
-            else base + "_STK___"
-        )
+        underlying = base + "_IND___" if is_index else base + "_STK___"
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
         logger.debug(
             "get_option_underlying_price: no fut_expiry underlying=%s price_f=%s",
@@ -3843,7 +3818,9 @@ def register_strategy_capital(
 
                     # Get current data
                     existing_data_str = pipe.get(registration_key)
-                    logger.info(f"Current registration data length: {len(existing_data_str) if existing_data_str else 0}")
+                    logger.info(
+                        f"Current registration data length: {len(existing_data_str) if existing_data_str else 0}"
+                    )
 
                     if existing_data_str:
                         try:
@@ -3884,7 +3861,9 @@ def register_strategy_capital(
 
                     # Update last_updated timestamp
                     registration_data["last_updated"] = current_time
-                    logger.info(f"Saving registration data with {len(registration_data.get('strategies', {}))} strategies and {len(registration_data.get('brokers', {}))} brokers")
+                    logger.info(
+                        f"Saving registration data with {len(registration_data.get('strategies', {}))} strategies and {len(registration_data.get('brokers', {}))} brokers"
+                    )
 
                     # Atomically update the registration data
                     pipe.multi()
@@ -3899,10 +3878,14 @@ def register_strategy_capital(
             except redis.WatchError:
                 # Another client modified the key, retry
                 if attempt < max_retries - 1:
-                    logger.debug(f"Registration key {registration_key} modified by another client, retrying (attempt {attempt + 1}/{max_retries})")
+                    logger.debug(
+                        f"Registration key {registration_key} modified by another client, retrying (attempt {attempt + 1}/{max_retries})"
+                    )
                     continue
                 else:
-                    logger.error(f"Failed to update registration data after {max_retries} attempts due to concurrent modifications")
+                    logger.error(
+                        f"Failed to update registration data after {max_retries} attempts due to concurrent modifications"
+                    )
                     return False
             except Exception as e:
                 logger.error(f"Unexpected error during registration update: {e}")
@@ -3938,11 +3921,15 @@ def register_strategy_capital(
             saved_data = redis_conn.get(registration_key)
             if saved_data:
                 saved_json = json.loads(saved_data)
-                strategies = list(saved_json.get('strategies', {}).keys())
-                brokers = list(saved_json.get('brokers', {}).keys())
-                logger.info(f"Verification: Redis key {registration_key} contains strategies={strategies}, brokers={brokers}")
+                strategies = list(saved_json.get("strategies", {}).keys())
+                brokers = list(saved_json.get("brokers", {}).keys())
+                logger.info(
+                    f"Verification: Redis key {registration_key} contains strategies={strategies}, brokers={brokers}"
+                )
             else:
-                logger.error(f"Verification FAILED: Redis key {registration_key} is empty or missing after successful registration")
+                logger.error(
+                    f"Verification FAILED: Redis key {registration_key} is empty or missing after successful registration"
+                )
         except Exception as e:
             logger.error(f"Verification FAILED: Could not read back Redis key {registration_key}: {e}")
 

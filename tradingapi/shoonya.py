@@ -36,7 +36,7 @@ def _validate_datetime_input(date_input):
         return False
 from NorenRestApiPy.NorenApi import NorenApi
 
-from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price
+from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
 from .config import get_config
 from .utils import json_serializer_default, parse_combo_symbol, set_starting_internal_ids_int, update_order_status
 from .exceptions import (
@@ -52,6 +52,7 @@ from .exceptions import (
 )
 from . import trading_logger
 from .error_handling import validate_inputs, log_execution_time, retry_on_error
+from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
 
 # Set up logging
@@ -405,16 +406,21 @@ class Shoonya(BrokerBase):
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
-    def connect(self, redis_db: int) -> bool:
+    def connect(self, redis_db: int, as_of_date=None) -> bool:
         """
         Connect to Shoonya trading platform with enhanced session management.
 
         Args:
             redis_db: Redis database number
+            as_of_date: Optional date (date, datetime, or str YYYYMMDD/YYYY-MM-DD).
+                If provided, the broker loads the symbol file for that date.
 
         Raises:
             ValueError: If configuration is missing or connection fails
         """
+        normalized = _normalize_as_of_date(as_of_date)
+        if normalized is not None:
+            tradingapi_globals.TRADINGAPI_NOW = normalized
 
         def _fresh_login(susertoken_path) -> None:
             """Perform fresh login with TOTP retry logic."""
