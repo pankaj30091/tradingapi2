@@ -124,8 +124,8 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                 symbol_col = pick_column(["stock_code", "stockcode", "exchangecode", "securitysymbol", "short_name"])
                 lot_col = pick_column(["lot_size", "lotsize", "lot"])
                 tick_col = pick_column(["tick_size", "ticksize"])
-                scrip_code = pick_column(["token", "scripcode", "shortname"])
-                instrument_col = pick_column(["instrument", "instrumentname"])
+                scrip_code = pick_column(["scripcode", "shortname"])
+                instrument_col = pick_column(["instrument", "instrumentname"]) # excluded "token"
 
                 expiry_col = pick_column(["expiry_date", "expirydate", "expiry"])
                 strike_col = pick_column(["strike_price", "strikeprice", "strike"])
@@ -626,10 +626,21 @@ class IciciDirect(BrokerBase):
             self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
             self.starting_order_ids_int = set_starting_internal_ids_int(self.redis_o)
 
+            # Load or generate symbol file (same pattern as FivePaisa)
+            try:
+                self.codes = self.update_symbology()
+                trading_logger.log_debug(
+                    "IciciDirect symbology updated",
+                    {"codes_shape": self.codes.shape if hasattr(self.codes, "shape") else None},
+                )
+            except Exception as e:
+                trading_logger.log_warning("Failed to update IciciDirect symbology", {"error": str(e)})
+
             trading_logger.log_info(
                 "IciciDirect connected",
                 {"redis_db": redis_db},
             )
+            return True
         except (AuthenticationError, ConfigurationError):
             raise
         except Exception as e:
@@ -662,12 +673,35 @@ class IciciDirect(BrokerBase):
 
     def update_symbology(self, **kwargs):
         """
-        Download IciciDirect symbol master and build exchange_mappings.
+        Load or generate IciciDirect symbol master and build exchange_mappings.
+        If ICICIDIRECT.SYMBOLCODES is set and a symbols file exists for the current
+        trading date (get_tradingapi_now()), load from CSV; otherwise download and
+        generate via save_symbol_data() and optionally save to folder.
         """
         try:
-            save_to_folder = kwargs.get("saveToFolder", False)
-            codes = save_symbol_data(saveToFolder=save_to_folder)
-            self.codes = codes
+            save_to_folder = kwargs.get("saveToFolder", True)
+            symbol_codes_path = config.get("ICICIDIRECT.SYMBOLCODES")
+            date_str = get_tradingapi_now().strftime("%Y%m%d")
+
+            if symbol_codes_path:
+                symbols_path = os.path.join(symbol_codes_path, f"{date_str}_symbols.csv")
+                if os.path.exists(symbols_path):
+                    trading_logger.log_info(
+                        "Loading existing IciciDirect symbols file",
+                        {"symbols_path": symbols_path, "date": date_str},
+                    )
+                    codes = pd.read_csv(symbols_path)
+                    self.codes = codes
+                else:
+                    trading_logger.log_info(
+                        "IciciDirect symbols file not found, generating",
+                        {"symbols_path": symbols_path},
+                    )
+                    codes = save_symbol_data(saveToFolder=save_to_folder)
+                    self.codes = codes
+            else:
+                codes = save_symbol_data(saveToFolder=False)
+                self.codes = codes
 
             # Build exchange_mappings in the same structure used by other brokers
             self.exchange_mappings = {}
@@ -951,11 +985,12 @@ class IciciDirect(BrokerBase):
             order.broker_order_id = str(broker_order_id or "")
             order.status = OrderStatus.PENDING
 
+            order.additional_info = json.dumps({"raw_response": resp})
             update_order_status(
-                broker=self,
-                order=order,
-                broker_order_id=order.broker_order_id,
-                additional_info=json.dumps({"raw_response": resp}),
+                self,
+                order.internal_order_id,
+                order.broker_order_id,
+                eod=False,
             )
 
             return order
@@ -982,7 +1017,8 @@ class IciciDirect(BrokerBase):
                 payload["order_id"] = broker_order_id
             resp = self.api.modify_order(**payload)
 
-            order = kwargs.get("order") if isinstance(kwargs.get("order"), Order) else Order()
+            o = kwargs.get("order")
+            order: Order = o if isinstance(o, Order) else Order()
             order.broker_order_id = str(broker_order_id)
             order.status = OrderStatus.PENDING
             order.additional_info = json.dumps({"raw_response": resp})
@@ -1002,7 +1038,8 @@ class IciciDirect(BrokerBase):
                 raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
 
             resp = self.api.cancel_order(order_id=str(broker_order_id), **{k: v for k, v in kwargs.items() if k not in ["order_id", "broker_order_id"]})
-            order = kwargs.get("order") if isinstance(kwargs.get("order"), Order) else Order()
+            o = kwargs.get("order")
+            order: Order = o if isinstance(o, Order) else Order()
             order.broker_order_id = str(broker_order_id)
             order.status = OrderStatus.CANCELLED
             order.additional_info = json.dumps({"raw_response": resp})
