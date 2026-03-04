@@ -23,19 +23,23 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import pandas as pd
 
-from tradingapi import trading_logger
-from tradingapi.broker_base import BrokerBase
-from tradingapi.utils import (
+from . import trading_logger
+from .broker_base import BrokerBase
+from .utils import (
     get_mid_price,
     get_option_underlying_price,
     get_price,
     historical_to_dataframes,
     parse_combo_symbol,
-    parse_datetime,
     _get_historical_close_at_time,
 )
-
-from chameli.dateutils import advance_by_biz_days, format_datetime, get_expiry, get_naive_dt
+from chameli.dateutils import (
+    advance_by_biz_days,
+    format_datetime,  # type: ignore[attr-defined]
+    get_expiry,
+    get_naive_dt,
+    parse_datetime,  # type: ignore[attr-defined]
+)
 from chameli.europeanoptions import _parse_combo_symbol, calc_greeks, performance_attribution
 
 # Optional ohlcutils for get_historical_close_price (local data first)
@@ -118,9 +122,10 @@ def get_historical_close_price(
     else:
         date_str = str(date_str)
 
-    cache_key = (symbol, date_str)
+    date_key: str = date_str if isinstance(date_str, str) else str(date_str)
+    cache_key: Tuple[str, str] = (symbol, date_key)
     if cache_key in _historical_close_price_cache:
-        trading_logger.log_debug(f"Using cached price for {symbol} on {date_str}")
+        trading_logger.log_debug(f"Using cached price for {symbol} on {date_key}")
         return _historical_close_price_cache[cache_key]
 
     if ":" in symbol:
@@ -129,23 +134,23 @@ def get_historical_close_price(
             combo_price = 0.0
             for leg_symbol, quantity in legs.items():
                 leg_price = get_historical_close_price(
-                    broker, leg_symbol, date_str, exchange, refresh_mapping=refresh_mapping
+                    broker, leg_symbol, date_key, exchange, refresh_mapping=refresh_mapping
                 )
                 if leg_price is None:
-                    trading_logger.log_warning(f"Could not get price for combo leg {leg_symbol} on {date_str}")
+                    trading_logger.log_warning(f"Could not get price for combo leg {leg_symbol} on {date_key}")
                     _historical_close_price_cache[cache_key] = None
                     return None
                 combo_price += leg_price * quantity
             _historical_close_price_cache[cache_key] = combo_price
             return combo_price
         except Exception as e:
-            trading_logger.log_warning(f"Error parsing combo symbol {symbol} on {date_str}: {e}")
+            trading_logger.log_warning(f"Error parsing combo symbol {symbol} on {date_key}: {e}")
             _historical_close_price_cache[cache_key] = None
             return None
 
     if _OHLCUTILS_AVAILABLE:
         try:
-            date_obj = parse_datetime(date_str).date()
+            date_obj = parse_datetime(date_key).date()
             date_str_formatted = date_obj.strftime("%Y-%m-%d")
             market_close_time = dt.datetime.combine(date_obj, dt.time(15, 30, 0))
             df = load_symbol(
@@ -178,11 +183,11 @@ def get_historical_close_price(
                         _historical_close_price_cache[cache_key] = close_price
                         return close_price
         except Exception as e:
-            trading_logger.log_debug(f"ohlcutils load failed for {symbol} on {date_str}: {e}")
+            trading_logger.log_debug(f"ohlcutils load failed for {symbol} on {date_key}: {e}")
 
     hist_broker = _get_historical_broker(broker)
     try:
-        date_obj = dt.datetime.strptime(date_str, "%Y%m%d").date()
+        date_obj = dt.datetime.strptime(date_key, "%Y%m%d").date()
         date_str_formatted = date_obj.strftime("%Y-%m-%d")
         hist_data = hist_broker.get_historical(  # type: ignore[union-attr]
             symbols=symbol,
@@ -203,7 +208,7 @@ def get_historical_close_price(
         _historical_close_price_cache[cache_key] = None
         return None
     except Exception as e:
-        trading_logger.log_warning(f"Error getting historical price for {symbol} on {date_str}: {e}")
+        trading_logger.log_warning(f"Error getting historical price for {symbol} on {date_key}: {e}")
         _historical_close_price_cache[cache_key] = None
         return None
 
@@ -275,8 +280,16 @@ def _get_month_end_fut_expiry(opt_expiry_yyyymmdd: str, exchange: str) -> str:
     try:
         d = dt.datetime.strptime(opt_expiry_yyyymmdd, "%Y%m%d").date()
         day_of_week = 2 if exchange == "NSE" else 4  # Tuesday / Thursday
-        expiry_date = get_expiry(d, weekly=0, day_of_week=day_of_week, exchange=exchange)
-        return expiry_date.strftime("%Y%m%d")
+        expiry_date = get_expiry(
+            dt.datetime.combine(d, dt.time(0, 0)),
+            weekly=0,
+            day_of_week=day_of_week,
+            exchange=exchange,
+        )
+        strftime_fn = getattr(expiry_date, "strftime", None)
+        if strftime_fn is not None:
+            return strftime_fn("%Y%m%d")
+        return str(expiry_date)
     except Exception:
         return opt_expiry_yyyymmdd
 
@@ -347,7 +360,10 @@ def get_greeks_at_time(
                 exchange=exchange,
             )
             out[leg_symbol] = {
-                k: getattr(g, k, g.get(k))
+                k: (
+                    getattr(g, k, None)
+                    or (g.get(k) if isinstance(g, dict) else None)
+                )
                 for k in (greeks_list + ["vol"])
                 if k in (greeks_list + ["vol"])
             }
