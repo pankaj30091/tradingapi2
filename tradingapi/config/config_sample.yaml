@@ -30,3 +30,32 @@ SHOONYA:
   TOKEN:
   SYMBOLCODES: "/home/psharma/onedrive/rfiles/data/static/shoonya_symbols"
   USERTOKEN:
+
+ICICIDIRECT:
+  API_KEY:
+  API_SECRET:
+  USER_ID: # Optional: used by scripts/icicidirect_generate_session.py
+  PASSWORD: # Optional: used by scripts/icicidirect_generate_session.py
+  TOTP_TOKEN: # Optional: used by scripts/icicidirect_generate_session.py
+  API_SESSION_TOKEN: # Optional: direct session token
+  USERTOKEN: # Optional: path to cache token file
+  USERTOKEN_MAX_AGE_HOURS: 20
+  AUTO_SESSION_TOKEN_CMD: # Optional: shell command that outputs a fresh session token
+  AUTO_LOGIN: true # Optional: auto-build token command when AUTO_SESSION_TOKEN_CMD is empty
+  SELENIUM_HEADLESS: true
+  SELENIUM_WEBDRIVER_PATH: # Optional: geckodriver path or folder containing geckodriver
+  LOGIN_USERNAME_SELECTOR: # Optional selector override, ex: #txtuid
+  LOGIN_PASSWORD_SELECTOR: # Optional selector override, ex: #txtPass
+  LOGIN_TNC_SELECTOR: # Optional selector override, ex: #chkssTnc
+  LOGIN_SUBMIT_SELECTOR: # Optional selector override, ex: #btnSubmit
+  TOTP_INPUT_SELECTOR: # Optional selector override
+  TOTP_SUBMIT_SELECTOR: # Optional selector override
+  # Example:
+  # AUTO_SESSION_TOKEN_CMD: >
+  #   python scripts/icicidirect_generate_session.py
+  #   --api-key "${ICICI_API_KEY}"
+  #   --user-id "${ICICI_USER_ID}"
+  #   --password "${ICICI_PASSWORD}"
+  #   --totp-token "${ICICI_TOTP_TOKEN}"
+  SYMBOL_MASTER_URL: # Optional: symbol master zip url
+  SYMBOLCODES:

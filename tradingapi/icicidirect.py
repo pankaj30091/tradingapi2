@@ -4,11 +4,13 @@ import inspect
 import json
 import logging
 import math
+import os
+import subprocess
 import sys
 import time
 import traceback
 import zipfile
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 import redis
@@ -331,6 +333,242 @@ class IciciDirect(BrokerBase):
     # Connection / session management
     # ------------------------------------------------------------------
 
+    def _read_session_token_from_file(self, token_file_path: str, max_age_hours: int = 20) -> Optional[str]:
+        """
+        Read and validate a cached ICICIDirect session token from a file.
+
+        The token is considered stale when the file is older than max_age_hours.
+        """
+        if not token_file_path:
+            return None
+
+        if not os.path.exists(token_file_path):
+            trading_logger.log_debug(
+                "IciciDirect token file does not exist",
+                {"token_file_path": token_file_path},
+            )
+            return None
+
+        try:
+            token_age_hours = (time.time() - os.path.getmtime(token_file_path)) / 3600.0
+            if token_age_hours > max_age_hours:
+                trading_logger.log_info(
+                    "IciciDirect cached token file is stale",
+                    {
+                        "token_file_path": token_file_path,
+                        "token_age_hours": round(token_age_hours, 2),
+                        "max_age_hours": max_age_hours,
+                    },
+                )
+                return None
+
+            with open(token_file_path, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+
+            if not token:
+                return None
+
+            trading_logger.log_info(
+                "IciciDirect session token loaded from cache file",
+                {"token_file_path": token_file_path},
+            )
+            return token
+        except Exception as e:
+            trading_logger.log_warning(
+                "Failed to read IciciDirect token cache file",
+                {"token_file_path": token_file_path, "error": str(e)},
+            )
+            return None
+
+    def _write_session_token_to_file(self, token_file_path: str, token: str) -> None:
+        """Persist session token to disk for subsequent non-interactive logins."""
+        if not token_file_path or not token:
+            return
+
+        try:
+            os.makedirs(os.path.dirname(token_file_path), exist_ok=True) if os.path.dirname(token_file_path) else None
+            with open(token_file_path, "w", encoding="utf-8") as f:
+                f.write(token)
+            trading_logger.log_info(
+                "IciciDirect session token persisted to cache file",
+                {"token_file_path": token_file_path},
+            )
+        except Exception as e:
+            trading_logger.log_warning(
+                "Failed to persist IciciDirect session token",
+                {"token_file_path": token_file_path, "error": str(e)},
+            )
+
+    def _get_session_token_from_command(self, token_command: str) -> Optional[str]:
+        """
+        Execute a configured command to obtain a fresh session token.
+
+        Expected behavior: command writes only the token to stdout.
+        """
+        if not token_command:
+            return None
+
+        # Expand environment variables even if users configured values with single quotes,
+        # e.g. '--api-key '$ICICI_API_KEY'' in YAML.
+        expanded_command = os.path.expandvars(token_command)
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        cmd_env = os.environ.copy()
+        # Make common ICICI env names available to command scripts even if caller
+        # did not export them in shell.
+        cmd_env.update(
+            {
+                "ICICI_API_KEY": str(config.get("ICICIDIRECT.API_KEY") or ""),
+                "ICICI_API_SECRET": str(config.get("ICICIDIRECT.API_SECRET") or ""),
+                "ICICI_USER_ID": str(config.get("ICICIDIRECT.USER_ID") or config.get("ICICIDIRECT.USERNAME") or ""),
+                "ICICI_PASSWORD": str(config.get("ICICIDIRECT.PASSWORD") or ""),
+                "ICICI_TOTP_TOKEN": str(config.get("ICICIDIRECT.TOTP_TOKEN") or ""),
+            }
+        )
+
+        try:
+            result = subprocess.run(
+                expanded_command,
+                shell=True,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=repo_root,
+                env=cmd_env,
+            )
+            token = (result.stdout or "").strip()
+            if token:
+                trading_logger.log_info(
+                    "IciciDirect session token obtained via AUTO_SESSION_TOKEN_CMD",
+                    {},
+                )
+                return token
+
+            trading_logger.log_warning(
+                "AUTO_SESSION_TOKEN_CMD executed but returned an empty token",
+                {
+                    "command": token_command,
+                    "expanded_command": expanded_command,
+                    "stdout": (result.stdout or "")[:500],
+                    "stderr": (result.stderr or "")[:500],
+                },
+            )
+            raise AuthenticationError(
+                "AUTO_SESSION_TOKEN_CMD executed but returned an empty token",
+                create_error_context(
+                    command=token_command,
+                    expanded_command=expanded_command,
+                    stdout=(result.stdout or "")[:500],
+                    stderr=(result.stderr or "")[:500],
+                ),
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or "").strip()
+            stdout = (e.stdout or "").strip()
+            trading_logger.log_warning(
+                "AUTO_SESSION_TOKEN_CMD failed with non-zero exit",
+                {
+                    "command": token_command,
+                    "expanded_command": expanded_command,
+                    "returncode": e.returncode,
+                    "stderr": stderr[:500],
+                    "stdout": stdout[:500],
+                },
+            )
+            raise AuthenticationError(
+                f"AUTO_SESSION_TOKEN_CMD failed with return code {e.returncode}",
+                create_error_context(
+                    command=token_command,
+                    expanded_command=expanded_command,
+                    returncode=e.returncode,
+                    stderr=stderr[:1000],
+                    stdout=stdout[:1000],
+                ),
+            )
+        except subprocess.TimeoutExpired as e:
+            raise AuthenticationError(
+                "AUTO_SESSION_TOKEN_CMD timed out",
+                create_error_context(
+                    command=token_command,
+                    expanded_command=expanded_command,
+                    timeout_seconds=60,
+                    stdout=str(e.stdout),
+                    stderr=str(e.stderr),
+                ),
+            )
+        except Exception as e:
+            trading_logger.log_warning(
+                "AUTO_SESSION_TOKEN_CMD failed",
+                {"command": token_command, "expanded_command": expanded_command, "error": str(e)},
+            )
+            raise AuthenticationError(
+                f"AUTO_SESSION_TOKEN_CMD failed: {str(e)}",
+                create_error_context(command=token_command, expanded_command=expanded_command, error=str(e)),
+            )
+
+    def _resolve_session_token(self) -> str:
+        """
+        Resolve a session token without user intervention.
+
+        Resolution order:
+        1) ICICIDIRECT.API_SESSION_TOKEN
+        2) ICICIDIRECT.USERTOKEN (cached token file)
+        3) ICICIDIRECT.AUTO_SESSION_TOKEN_CMD (external non-interactive token fetch)
+        """
+        configured_token = config.get("ICICIDIRECT.API_SESSION_TOKEN")
+        if configured_token:
+            return configured_token.strip()
+
+        token_file_path = config.get("ICICIDIRECT.USERTOKEN")
+        max_age_hours = int(config.get("ICICIDIRECT.USERTOKEN_MAX_AGE_HOURS") or 20)
+        cached_token = self._read_session_token_from_file(token_file_path, max_age_hours=max_age_hours)
+        if cached_token:
+            return cached_token
+
+        token_command = config.get("ICICIDIRECT.AUTO_SESSION_TOKEN_CMD")
+        if not token_command and config.get("ICICIDIRECT.AUTO_LOGIN"):
+            token_command = (
+                "python scripts/icicidirect_generate_session.py "
+                "--api-key \"${ICICI_API_KEY}\" "
+                "--user-id \"${ICICI_USER_ID}\" "
+                "--password \"${ICICI_PASSWORD}\" "
+                "--totp-token \"${ICICI_TOTP_TOKEN}\""
+            )
+            # Optional selector / webdriver overrides from config.
+            opt_map = {
+                "LOGIN_USERNAME_SELECTOR": "--user-selectors",
+                "LOGIN_PASSWORD_SELECTOR": "--password-selectors",
+                "LOGIN_TNC_SELECTOR": "--tnc-selector",
+                "LOGIN_SUBMIT_SELECTOR": "--submit-selectors",
+                "TOTP_INPUT_SELECTOR": "--otp-selectors",
+                "TOTP_SUBMIT_SELECTOR": "--otp-submit-selectors",
+                "SELENIUM_WEBDRIVER_PATH": "--driver-path",
+                "REDIRECT_TIMEOUT": "--redirect-wait",
+            }
+            for conf_key, arg_name in opt_map.items():
+                v = config.get(f"ICICIDIRECT.{conf_key}")
+                if v not in [None, ""]:
+                    token_command += f" {arg_name} \"{v}\""
+
+            if not bool(config.get("ICICIDIRECT.SELENIUM_HEADLESS", True)):
+                token_command += " --no-headless"
+
+        command_token = self._get_session_token_from_command(token_command)
+        if command_token:
+            self._write_session_token_to_file(token_file_path, command_token)
+            return command_token
+
+        raise ConfigurationError(
+            "Unable to resolve ICICIDIRECT session token non-interactively. Configure one of: "
+            "ICICIDIRECT.API_SESSION_TOKEN, ICICIDIRECT.USERTOKEN (cached file), "
+            "or ICICIDIRECT.AUTO_SESSION_TOKEN_CMD.",
+            create_error_context(
+                configured_token_present=bool(configured_token),
+                token_file_path=token_file_path,
+                token_command_configured=bool(token_command),
+            ),
+        )
+
     @log_execution_time
     @retry_on_error(max_retries=3, delay=2.0, backoff_factor=2.0)
     def connect(self, redis_db: int):
@@ -340,20 +578,36 @@ class IciciDirect(BrokerBase):
         try:
             api_key = config.get("ICICIDIRECT.API_KEY")
             api_secret = config.get("ICICIDIRECT.API_SECRET")
-            session_token = config.get("ICICIDIRECT.API_SESSION_TOKEN")
+            session_token = self._resolve_session_token()
 
-            if not api_key or not api_secret or not session_token:
+            if not api_key or not api_secret:
                 raise ConfigurationError(
                     "Missing ICICIDIRECT credentials in config",
                     create_error_context(
                         api_key_present=bool(api_key),
                         api_secret_present=bool(api_secret),
-                        session_token_present=bool(session_token),
                     ),
                 )
 
             self.api = BreezeConnect(api_key=api_key)
             self.api.generate_session(api_secret=api_secret, session_token=session_token)
+
+            # Validate session immediately and persist latest token in cache file when configured.
+            customer_details = self.api.get_customer_details(api_session=session_token)
+            if not isinstance(customer_details, dict):
+                raise AuthenticationError(
+                    "Unexpected response validating ICICIDirect session",
+                    create_error_context(response_type=str(type(customer_details))),
+                )
+
+            if customer_details.get("Error"):
+                raise AuthenticationError(
+                    f"ICICIDirect authentication failed: {customer_details.get('Error')}",
+                    create_error_context(response=customer_details),
+                )
+
+            token_file_path = config.get("ICICIDIRECT.USERTOKEN")
+            self._write_session_token_to_file(token_file_path, session_token)
 
             self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
             self.starting_order_ids_int = set_starting_internal_ids_int(self.redis_o)
@@ -542,9 +796,85 @@ class IciciDirect(BrokerBase):
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
-        TODO: Implement using Breeze historical APIs.
+        Get historical OHLCV data using Breeze historical API.
+
+        This method currently supports a single symbol input (string).
         """
-        raise NotImplementedError("IciciDirect.get_historical is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            symbol = symbols if isinstance(symbols, str) else None
+            if not symbol:
+                raise ValidationError(
+                    "IciciDirect.get_historical currently supports a single symbol string",
+                    create_error_context(symbols_type=str(type(symbols))),
+                )
+
+            if refresh_mapping or not self.exchange_mappings:
+                self.update_symbology(saveToFolder=False)
+
+            mapped_exchange = self.map_exchange_for_api(symbol, exchange)
+            stock_code = self.exchange_mappings.get(mapped_exchange, {}).get("symbol_map", {}).get(symbol)
+            if not stock_code:
+                raise SymbolError(
+                    f"Symbol {symbol} not found for exchange {mapped_exchange}",
+                    create_error_context(symbol=symbol, exchange=mapped_exchange),
+                )
+
+            from_date = pd.to_datetime(date_start).strftime("%Y-%m-%dT00:00:00.000Z")
+            to_date = pd.to_datetime(date_end).strftime("%Y-%m-%dT23:59:59.000Z")
+
+            interval = {
+                "1m": "1minute",
+                "5m": "5minute",
+                "15m": "15minute",
+                "30m": "30minute",
+                "1h": "1hour",
+                "1d": "1day",
+                "D": "1day",
+            }.get(periodicity, periodicity)
+
+            resp = self.api.get_historical_data_v2(
+                interval=interval,
+                from_date=from_date,
+                to_date=to_date,
+                stock_code=stock_code,
+                exchange_code=mapped_exchange,
+                product_type="cash",
+            )
+
+            rows = resp.get("Success") if isinstance(resp, dict) else None
+            if not isinstance(rows, list):
+                raise MarketDataError(
+                    "Invalid response received from IciciDirect historical API",
+                    create_error_context(response=str(resp)[:1000]),
+                )
+
+            out: list[HistoricalData] = []
+            for row in rows:
+                ts = row.get("datetime") or row.get("time") or row.get("date")
+                out.append(
+                    HistoricalData(
+                        date=pd.to_datetime(ts),
+                        open=float(row.get("open", float("nan"))),
+                        high=float(row.get("high", float("nan"))),
+                        low=float(row.get("low", float("nan"))),
+                        close=float(row.get("close", float("nan"))),
+                        volume=int(float(row.get("volume", 0) or 0)),
+                        intoi=int(float(row.get("open_interest", 0) or 0)),
+                        oi=int(float(row.get("open_interest", 0) or 0)),
+                    )
+                )
+
+            return {symbol: out}
+        except (ValidationError, SymbolError, MarketDataError):
+            raise
+        except Exception as e:
+            raise MarketDataError(
+                f"Error fetching historical for IciciDirect: {str(e)}",
+                create_error_context(symbols=str(symbols), error=str(e)),
+            )
 
     # ------------------------------------------------------------------
     # Orders / Positions
@@ -625,57 +955,197 @@ class IciciDirect(BrokerBase):
             raise OrderError(f"Error placing order via IciciDirect: {str(e)}", context)
 
     def modify_order(self, **kwargs) -> Order:
-        """
-        TODO: Implement mapping to Breeze modify order API.
-        """
-        raise NotImplementedError("IciciDirect.modify_order is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            broker_order_id = kwargs.get("broker_order_id") or kwargs.get("order_id")
+            if not broker_order_id:
+                raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
+
+            payload = {k: v for k, v in kwargs.items() if v is not None}
+            if "order_id" not in payload:
+                payload["order_id"] = broker_order_id
+            resp = self.api.modify_order(**payload)
+
+            order = kwargs.get("order") if isinstance(kwargs.get("order"), Order) else Order()
+            order.broker_order_id = str(broker_order_id)
+            order.status = OrderStatus.PENDING
+            order.additional_info = json.dumps({"raw_response": resp})
+            return order
+        except (ValidationError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            raise OrderError(f"Error modifying IciciDirect order: {str(e)}", create_error_context(kwargs=kwargs, error=str(e)))
 
     def cancel_order(self, **kwargs) -> Order:
-        """
-        TODO: Implement mapping to Breeze cancel order API.
-        """
-        raise NotImplementedError("IciciDirect.cancel_order is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            broker_order_id = kwargs.get("broker_order_id") or kwargs.get("order_id")
+            if not broker_order_id:
+                raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
+
+            resp = self.api.cancel_order(order_id=str(broker_order_id), **{k: v for k, v in kwargs.items() if k not in ["order_id", "broker_order_id"]})
+            order = kwargs.get("order") if isinstance(kwargs.get("order"), Order) else Order()
+            order.broker_order_id = str(broker_order_id)
+            order.status = OrderStatus.CANCELLED
+            order.additional_info = json.dumps({"raw_response": resp})
+            return order
+        except (ValidationError, BrokerConnectionError):
+            raise
+        except Exception as e:
+            raise OrderError(f"Error cancelling IciciDirect order: {str(e)}", create_error_context(kwargs=kwargs, error=str(e)))
 
     def get_order_info(self, **kwargs) -> OrderInfo:
-        """
-        TODO: Implement using Breeze order status / order book.
-        """
-        raise NotImplementedError("IciciDirect.get_order_info is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            order_id = str(kwargs.get("broker_order_id") or kwargs.get("order_id") or "")
+            if not order_id:
+                raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
+
+            book = self.get_orders_today()
+            row = book[book["order_id"].astype(str) == order_id]
+            if row.empty:
+                raise OrderError(f"Order {order_id} not found in order book", create_error_context(order_id=order_id))
+
+            rec = row.iloc[-1]
+            status_raw = str(rec.get("status", "UNDEFINED")).upper()
+            status = OrderStatus[status_raw] if status_raw in OrderStatus.__members__ else OrderStatus.UNDEFINED
+
+            return OrderInfo(
+                order_size=int(float(rec.get("quantity", 0) or 0)),
+                order_price=float(rec.get("price", float("nan"))),
+                fill_size=int(float(rec.get("filled_quantity", 0) or 0)),
+                fill_price=float(rec.get("average_price", 0) or 0),
+                status=status,
+                broker_order_id=order_id,
+                exchange_order_id=str(rec.get("exchange_order_id", "")),
+                broker=self.broker,
+            )
+        except (ValidationError, BrokerConnectionError, OrderError):
+            raise
+        except Exception as e:
+            raise OrderError(f"Error fetching IciciDirect order info: {str(e)}", create_error_context(kwargs=kwargs, error=str(e)))
 
     def get_position(self, long_symbol: str) -> Union[pd.DataFrame, int]:
-        """
-        TODO: Implement using Breeze portfolio/positions API.
-        """
-        raise NotImplementedError("IciciDirect.get_position is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            resp = self.api.get_portfolio_positions()
+            rows = resp.get("Success") if isinstance(resp, dict) else None
+            df = pd.DataFrame(rows or [])
+            if long_symbol:
+                if df.empty:
+                    return 0
+                key = "stock_code" if "stock_code" in df.columns else ("symbol" if "symbol" in df.columns else None)
+                if key:
+                    df = df[df[key].astype(str).str.upper() == str(long_symbol).split("_")[0].upper()]
+                return df if not df.empty else 0
+            return df
+        except Exception as e:
+            raise MarketDataError(f"Error fetching IciciDirect positions: {str(e)}", create_error_context(error=str(e)))
 
     def get_orders_today(self, **kwargs) -> pd.DataFrame:
-        """
-        TODO: Implement using Breeze order book API.
-        """
-        raise NotImplementedError("IciciDirect.get_orders_today is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            resp = self.api.get_order_list(**kwargs)
+            rows = resp.get("Success") if isinstance(resp, dict) else None
+            df = pd.DataFrame(rows or [])
+            # normalize core columns used by get_order_info
+            rename_map = {
+                "order_id": "order_id",
+                "order_no": "order_id",
+                "status": "status",
+                "quantity": "quantity",
+                "pending_quantity": "pending_quantity",
+                "executed_quantity": "filled_quantity",
+                "average_price": "average_price",
+                "price": "price",
+                "exchange_order_id": "exchange_order_id",
+            }
+            present = {k: v for k, v in rename_map.items() if k in df.columns}
+            if present:
+                df = df.rename(columns=present)
+            return df
+        except Exception as e:
+            raise OrderError(f"Error fetching IciciDirect orders: {str(e)}", create_error_context(error=str(e), kwargs=kwargs))
 
     def get_trades_today(self, **kwargs) -> pd.DataFrame:
-        """
-        TODO: Implement using Breeze trade book API.
-        """
-        raise NotImplementedError("IciciDirect.get_trades_today is not implemented yet")
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            resp = self.api.get_trade_list(**kwargs)
+            rows = resp.get("Success") if isinstance(resp, dict) else None
+            return pd.DataFrame(rows or [])
+        except Exception as e:
+            raise MarketDataError(f"Error fetching IciciDirect trades: {str(e)}", create_error_context(error=str(e), kwargs=kwargs))
 
     def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
-        """
-        TODO: Implement inverse mapping: broker identifier -> long_symbol.
-        """
-        raise NotImplementedError("IciciDirect.get_long_name_from_broker_identifier is not implemented yet")
+        broker_identifier = str(kwargs.get("broker_identifier") or kwargs.get("scrip_code") or "")
+        if not broker_identifier:
+            raise ValidationError("broker_identifier or scrip_code is required", create_error_context(kwargs=kwargs))
+
+        try:
+            if self.codes is None or self.codes.empty:
+                self.update_symbology(saveToFolder=False)
+
+            matches = self.codes[self.codes["Scripcode"].astype(str) == broker_identifier]
+            return matches["long_symbol"] if not matches.empty else pd.Series(dtype="object")
+        except Exception as e:
+            raise SymbolError(
+                f"Error mapping broker identifier to long_symbol: {str(e)}",
+                create_error_context(broker_identifier=broker_identifier, error=str(e)),
+            )
 
     def get_min_lot_size(self, long_symbol: str, exchange: str) -> int:
-        """
-        TODO: Implement using IciciDirect symbol master (self.codes).
-        """
-        raise NotImplementedError("IciciDirect.get_min_lot_size is not implemented yet")
+        try:
+            mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
+            if mapped_exchange in self.exchange_mappings:
+                lot = self.exchange_mappings[mapped_exchange]["contractsize_map"].get(long_symbol)
+                if lot is not None:
+                    return int(lot)
 
-    def get_available_capital(self) -> float:
-        """
-        TODO: Implement using IciciDirect balance/margin API.
-        """
-        raise NotImplementedError("IciciDirect.get_available_capital is not implemented yet")
+            if self.codes is None or self.codes.empty:
+                self.update_symbology(saveToFolder=False)
 
+            row = self.codes[self.codes["long_symbol"] == long_symbol]
+            if row.empty:
+                raise SymbolError(
+                    f"Unable to find lot size for {long_symbol}",
+                    create_error_context(long_symbol=long_symbol, exchange=exchange),
+                )
+            return int(float(row.iloc[0].get("LotSize", 1)))
+        except SymbolError:
+            raise
+        except Exception as e:
+            raise SymbolError(
+                f"Error getting lot size from IciciDirect: {str(e)}",
+                create_error_context(long_symbol=long_symbol, exchange=exchange, error=str(e)),
+            )
 
+    def get_available_capital(self) -> Dict[str, float]:
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            resp = self.api.get_funds()
+            data = resp.get("Success", {}) if isinstance(resp, dict) else {}
+            if isinstance(data, list):
+                data = data[0] if data else {}
+
+            cash = float(data.get("available_margin", data.get("cash_limit", data.get("cash", 0))) or 0)
+            collateral = float(data.get("collateral", data.get("adhoc_margin", 0)) or 0)
+            return {"cash": cash, "collateral": collateral}
+        except Exception as e:
+            raise MarketDataError(
+                f"Error fetching IciciDirect available capital: {str(e)}",
+                create_error_context(error=str(e)),
+            )

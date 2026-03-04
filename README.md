@@ -232,9 +232,46 @@ FLATTRADE:
 ICICIDIRECT:
   API_KEY: "your_api_key"
   API_SECRET: "your_api_secret"
-  API_SESSION_TOKEN: "your_session_token"
+  USER_ID: "your_user_id" # Optional: used by auto token script
+  PASSWORD: "your_password" # Optional: used by auto token script
+  TOTP_TOKEN: "your_totp_seed" # Optional: used by auto token script
+  API_SESSION_TOKEN: "your_session_token" # Optional if you provide one directly
+  USERTOKEN: "/path/to/icicidirect_token.txt" # Optional cache file
+  USERTOKEN_MAX_AGE_HOURS: 20
+  AUTO_SESSION_TOKEN_CMD: "python scripts/icicidirect_generate_session.py --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\"" # Optional non-interactive token command
   SYMBOLCODES: "/path/to/icicidirect/symbols"
 ```
+
+#### ICICIDirect fully automated session-token refresh (no copy/paste)
+
+Use the included script `scripts/icicidirect_generate_session.py` as your `AUTO_SESSION_TOKEN_CMD`.
+It automates login, captures redirect token, and prints only the session token to stdout.
+
+```bash
+export ICICI_API_KEY="your_api_key"
+export ICICI_USER_ID="your_user_id"
+export ICICI_PASSWORD="your_password"
+export ICICI_TOTP_TOKEN="your_totp_seed"
+
+python scripts/icicidirect_generate_session.py \
+  --api-key "$ICICI_API_KEY" \
+  --user-id "$ICICI_USER_ID" \
+  --password "$ICICI_PASSWORD" \
+  --totp-token "$ICICI_TOTP_TOKEN"
+```
+
+Then set:
+
+```yaml
+ICICIDIRECT:
+  AUTO_SESSION_TOKEN_CMD: "python scripts/icicidirect_generate_session.py --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\""
+  USERTOKEN: "/path/to/icicidirect_token.txt"
+```
+
+Notes:
+- `connect()` executes `AUTO_SESSION_TOKEN_CMD` automatically when no direct/cached token is available.
+- Command is executed from repo root, so `scripts/icicidirect_generate_session.py` works as a relative path.
+- If `AUTO_SESSION_TOKEN_CMD` is empty and `ICICIDIRECT.AUTO_LOGIN: true`, `connect()` auto-builds a command using `API_KEY/USER_ID/PASSWORD/TOTP_TOKEN` plus optional selector/webdriver overrides.
 
 ### Commission Files
 

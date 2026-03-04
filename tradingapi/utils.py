@@ -147,8 +147,16 @@ def set_starting_internal_ids_int(redis_db) -> dict:
         while True:
             cursor, keys = redis_db.scan(cursor, match=pattern, count=1000)
             for key in keys:
-                if out.get(s, 1) <= int(key.split("_")[1]):
-                    out[s] = int(key.split("_")[1]) + 1
+                # Expected order key format is <STRATEGY>_<INT>_*; ignore any
+                # non-conforming keys (e.g. symbol strings containing "_OPT_").
+                parts = key.split("_")
+                if len(parts) < 2 or not parts[1].isdigit():
+                    logger.debug(f"Skipping non-internal-id key while scanning strategy {s}: {key}")
+                    continue
+
+                key_id = int(parts[1])
+                if out.get(s, 1) <= key_id:
+                    out[s] = key_id + 1
             if cursor == 0:
                 break
     logger.debug(f"Starting internal ids : {out} ")
