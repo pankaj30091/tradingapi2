@@ -34,9 +34,9 @@ SHOONYA:
 ICICIDIRECT:
   API_KEY:
   API_SECRET:
-  USER_ID: # Optional: used by scripts/icicidirect_generate_session.py
-  PASSWORD: # Optional: used by scripts/icicidirect_generate_session.py
-  TOTP_TOKEN: # Optional: used by scripts/icicidirect_generate_session.py
+  USER_ID: # Optional: used by icicidirect-generate-session (AUTO_SESSION_TOKEN_CMD)
+  PASSWORD: # Optional: used by icicidirect-generate-session
+  TOTP_TOKEN: # Optional: used by icicidirect-generate-session
   API_SESSION_TOKEN: # Optional: direct session token
   USERTOKEN: # Optional: path to cache token file
   USERTOKEN_MAX_AGE_HOURS: 20
@@ -52,7 +52,7 @@ ICICIDIRECT:
   TOTP_SUBMIT_SELECTOR: # Optional selector override
   # Example:
   # AUTO_SESSION_TOKEN_CMD: >
-  #   python scripts/icicidirect_generate_session.py
+  #   icicidirect-generate-session
   #   --api-key "${ICICI_API_KEY}"
   #   --user-id "${ICICI_USER_ID}"
   #   --password "${ICICI_PASSWORD}"

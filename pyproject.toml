@@ -47,6 +47,9 @@ dependencies = [
     "types-redis>=4.6.0"
 ]
 
+[project.scripts]
+icicidirect-generate-session = "tradingapi.icicidirect_generate_session:main"
+
 [project.urls]
 homepage = "https://bitbucket.org/incurrency/tradingpapi2"
 repository = "https://bitbucket.org/incurrency/tradingapi2"

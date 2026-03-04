@@ -530,7 +530,7 @@ class IciciDirect(BrokerBase):
         token_command = config.get("ICICIDIRECT.AUTO_SESSION_TOKEN_CMD")
         if not token_command and config.get("ICICIDIRECT.AUTO_LOGIN"):
             token_command = (
-                "python scripts/icicidirect_generate_session.py "
+                "icicidirect-generate-session "
                 "--api-key \"${ICICI_API_KEY}\" "
                 "--user-id \"${ICICI_USER_ID}\" "
                 "--password \"${ICICI_PASSWORD}\" "

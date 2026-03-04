@@ -238,14 +238,13 @@ ICICIDIRECT:
   API_SESSION_TOKEN: "your_session_token" # Optional if you provide one directly
   USERTOKEN: "/path/to/icicidirect_token.txt" # Optional cache file
   USERTOKEN_MAX_AGE_HOURS: 20
-  AUTO_SESSION_TOKEN_CMD: "python scripts/icicidirect_generate_session.py --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\"" # Optional non-interactive token command
+  AUTO_SESSION_TOKEN_CMD: "icicidirect-generate-session --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\"" # Optional non-interactive token command
   SYMBOLCODES: "/path/to/icicidirect/symbols"
 ```
 
 #### ICICIDirect fully automated session-token refresh (no copy/paste)
 
-Use the included script `scripts/icicidirect_generate_session.py` as your `AUTO_SESSION_TOKEN_CMD`.
-It automates login, captures redirect token, and prints only the session token to stdout.
+When the package is installed, the `icicidirect-generate-session` CLI is available. Use it as your `AUTO_SESSION_TOKEN_CMD`; it automates login, captures the redirect token, and prints only the session token to stdout.
 
 ```bash
 export ICICI_API_KEY="your_api_key"
@@ -253,7 +252,7 @@ export ICICI_USER_ID="your_user_id"
 export ICICI_PASSWORD="your_password"
 export ICICI_TOTP_TOKEN="your_totp_seed"
 
-python scripts/icicidirect_generate_session.py \
+icicidirect-generate-session \
   --api-key "$ICICI_API_KEY" \
   --user-id "$ICICI_USER_ID" \
   --password "$ICICI_PASSWORD" \
@@ -264,13 +263,13 @@ Then set:
 
 ```yaml
 ICICIDIRECT:
-  AUTO_SESSION_TOKEN_CMD: "python scripts/icicidirect_generate_session.py --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\""
+  AUTO_SESSION_TOKEN_CMD: "icicidirect-generate-session --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\""
   USERTOKEN: "/path/to/icicidirect_token.txt"
 ```
 
 Notes:
 - `connect()` executes `AUTO_SESSION_TOKEN_CMD` automatically when no direct/cached token is available.
-- Command is executed from repo root, so `scripts/icicidirect_generate_session.py` works as a relative path.
+- When the package is installed (e.g. `pip install .`), `icicidirect-generate-session` is on PATH. From a source checkout you can run `python -m tradingapi.icicidirect_generate_session`.
 - If `AUTO_SESSION_TOKEN_CMD` is empty and `ICICIDIRECT.AUTO_LOGIN: true`, `connect()` auto-builds a command using `API_KEY/USER_ID/PASSWORD/TOTP_TOKEN` plus optional selector/webdriver overrides.
 
 ### Commission Files
