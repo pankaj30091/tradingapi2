@@ -286,12 +286,14 @@ def get_greeks_at_time(
     current_time: dt.datetime,
     broker: Optional[object],
     greeks_list: Optional[List[str]] = None,
+    leg_prices: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
     For a trade row (combo or single leg), compute greeks at current_time for each option leg.
-    Uses broker for option price and underlying at current_time (historical close at time),
-    then chameli calc_greeks. Returns dict: leg_symbol -> {delta, gamma, theta, vega, vol}
-    or {error: str} on failure. Used by scalping vol-attrib logging and notebooks (e.g. test_attribution).
+    Option price: if leg_prices is provided and has a valid price for the leg, use it (e.g. entry
+    price or current mark); otherwise uses broker 1m OHLC close at current_time via
+    _get_historical_close_at_time. Underlying is always from broker/API at current_time.
+    Returns dict: leg_symbol -> {delta, gamma, theta, vega, vol} or {error: str} on failure.
     """
     if greeks_list is None:
         greeks_list = ["delta", "gamma", "theta", "vega"]
@@ -310,9 +312,15 @@ def get_greeks_at_time(
         if broker is None:
             continue
         try:
-            opt_price = _get_historical_close_at_time(
-                cast(BrokerBase, broker), leg_symbol, exchange, current_time
-            )
+            opt_price = None
+            if leg_prices and leg_symbol in leg_prices:
+                p = leg_prices[leg_symbol]
+                if p is not None and (not isinstance(p, float) or not (p != p)):
+                    opt_price = float(p)
+            if opt_price is None:
+                opt_price = _get_historical_close_at_time(
+                    cast(BrokerBase, broker), leg_symbol, exchange, current_time
+                )
             if opt_price is None or (
                 isinstance(opt_price, float) and (opt_price != opt_price)
             ):
@@ -674,7 +682,7 @@ def _build_spot_fn_from_row_broker(
 
 def _get_leg_price_from_broker_row(
     broker: object,
-    row: pd.Series,
+    row: Union[pd.Series, Dict[str, Any]],
     leg_symbol: str,
     price_type: str,
 ) -> Optional[float]:
@@ -760,6 +768,25 @@ def _get_leg_price_from_broker_row(
     except Exception:
         pass
     return None
+
+
+def get_per_leg_entry_prices(
+    broker: object,
+    row: Union[pd.Series, Dict[str, Any]],
+) -> Dict[str, float]:
+    """
+    Get per-leg entry price for a combo/single-leg row from Redis (entry_keys) or row fallback.
+    Returns dict leg_symbol -> price; only includes legs for which a price was found.
+    Use with get_greeks_at_time(..., leg_prices=...) to compute greeks at entry using fill price.
+    """
+    out: Dict[str, float] = {}
+    combo = row.get("symbol", "")
+    legs = _parse_combo_symbol(combo)
+    for leg_symbol in legs:
+        p = _get_leg_price_from_broker_row(broker, row, leg_symbol, "entry")
+        if p is not None:
+            out[leg_symbol] = float(p)
+    return out
 
 
 # ============================================================================
