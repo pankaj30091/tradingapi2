@@ -268,7 +268,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                     "TradingSymbol": "trading_symbol",
                 }
                 codes_fno.rename(columns=new_column_names, inplace=True)
-                codes_nse_fno = codes_fno[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize"]]
+                codes_nse_fno = codes_fno[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize","trading_symbol"]]
 
     url = "https://api.shoonya.com/BFO_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_shoonyacodes_bse_fno.zip"
@@ -1573,17 +1573,14 @@ class Shoonya(BrokerBase):
             out = {}  # Initialize the output dictionary
 
             for index, row_outer in symbols_pd.iterrows():
+                long_symbol = row_outer["long_symbol"]
                 trading_logger.log_debug(
                     "Processing historical data",
-                    {"index": str(index), "total_symbols": str(len(symbols)), "long_symbol": row_outer["long_symbol"]},
+                    {"index": str(index), "total_symbols": str(len(symbols)), "long_symbol": long_symbol},
                 )
-                exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
+                exchange = self.map_exchange_for_api(long_symbol, exchange)
                 historical_data_list = []
                 exch = exchange
-                s = row_outer["long_symbol"].replace("/", "-")
-                row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
-                # we do the above remapping for downloading permin data to database for legacy reasons.
-                # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
 
                 # Parse date_start (accepts datetime, date, or string) -> datetime for API
                 try:
@@ -1678,7 +1675,7 @@ class Shoonya(BrokerBase):
                     trading_logger.log_error(
                         "Error in get_time_price_series or get_daily_price_series",
                         e,
-                        {"long_symbol": row_outer["long_symbol"], "periodicity": periodicity},
+                        {"long_symbol": long_symbol, "periodicity": periodicity},
                     )
                     data = None
 
@@ -1712,7 +1709,7 @@ class Shoonya(BrokerBase):
                             historical_data_list.append(historical_data)
                 else:
                     # data is None or empty list
-                    trading_logger.log_debug("No data found for symbol", {"long_symbol": row_outer["long_symbol"]})
+                    trading_logger.log_debug("No data found for symbol", {"long_symbol": long_symbol})
                     historical_data_list.append(
                         HistoricalData(
                             date=dt.datetime(1970, 1, 1),
@@ -1747,7 +1744,7 @@ class Shoonya(BrokerBase):
                         trading_logger.log_error(
                             "Error in get_time_price_series for intraday data",
                             e,
-                            {"long_symbol": row_outer["long_symbol"]},
+                            {"long_symbol": long_symbol},
                         )
                         intraday_data = None
 
@@ -1789,7 +1786,10 @@ class Shoonya(BrokerBase):
                                     oi=row["oi"],
                                 )
                                 historical_data_list.append(historical_data)
-                out[row_outer["long_symbol"]] = historical_data_list
+                # Remap NIFTY_ to NSENIFTY_ for output key only (legacy: permin data to database)
+                s = long_symbol.replace("/", "-")
+                output_key = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else long_symbol
+                out[output_key] = historical_data_list
 
             return out
         except Exception as e:

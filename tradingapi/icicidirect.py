@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 import zipfile
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, cast
 
 import pandas as pd
 import redis
@@ -46,6 +46,7 @@ from .error_handling import retry_on_error, safe_execute, log_execution_time, va
 from . import trading_logger
 from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
+from chameli.dateutils import format_datetime
 
 logger = logging.getLogger(__name__)
 config = get_config()
@@ -124,7 +125,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                 symbol_col = pick_column(["stock_code", "stockcode", "exchangecode", "securitysymbol", "short_name"])
                 lot_col = pick_column(["lot_size", "lotsize", "lot"])
                 tick_col = pick_column(["tick_size", "ticksize"])
-                scrip_code = pick_column(["scripcode", "shortname"])
+                scrip_code = pick_column(["shortname"]) # excluded scripcode
                 instrument_col = pick_column(["instrument", "instrumentname"]) # excluded "token"
 
                 expiry_col = pick_column(["expiry_date", "expirydate", "expiry"])
@@ -139,7 +140,10 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                     continue
 
                 part = pd.DataFrame()
-                part["stock_code"] = df[symbol_col].astype(str).str.strip()
+                # Breeze API methods expect stock_code (human-readable symbol), not token id.
+                part["stock_code"] = df[symbol_col].astype(str).str.strip().str.upper()
+                # Normalize index names in part: NIFTY 50 -> NIFTY, NIFTY BANK -> BANKNIFTY
+                part["stock_code"] = part["stock_code"].replace("NIFTY 50", "NIFTY").replace("NIFTY BANK", "BANKNIFTY").replace("NIFTY MIDCAP","MIDCPNIFTY").replace("NIFTY FINANCIAL","FINNIFTY").replace("NIFTY NEXT 50", "NIFTYNXT50")
 
                 # Assign exchange and segment based on file name
                 if fname == "NSEScripMaster.txt":
@@ -164,7 +168,10 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                     part["LotSize"] = 1
                 
                 if fname in ["FONSEScripMaster.txt", "FOBSEScripMaster.txt"]:
-                    part["ExchType"] = df[instrument_col].astype(str).str[:3]
+                    if instrument_col and instrument_col in df.columns:
+                        part["ExchType"] = df[instrument_col].astype(str).str.upper().str.strip().str[:3]
+                    else:
+                        part["ExchType"] = "DER"
                     
                     if expiry_col and expiry_col in df.columns:
                         part["ExpiryDate"] = df[expiry_col]
@@ -235,8 +242,14 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                              return f"{sym_u}_DERIV___"
                 
                 part["long_symbol"] = part.apply(make_long_symbol, axis=1)
-                part["Scripcode"] = df[scrip_code].astype(str).str.strip()
+                if scrip_code and scrip_code in df.columns:
+                    part["Scripcode"] = df[scrip_code].astype(str).str.strip()
+                else:
+                    # Fallback so downstream lookups still work even without explicit token column.
+                    part["Scripcode"] = part["stock_code"]
 
+                # Drop extra columns (e.g. ExpiryDate, StrikePrice, OptionType) after long_symbol is constructed.
+                part = part[["stock_code", "Exch", "ExchType", "LotSize", "TickSize", "long_symbol", "Scripcode"]]
                 parts.append(part)
 
         if not parts:
@@ -249,6 +262,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
 
         # Reorder columns to the common schema
         codes = codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize", "stock_code"]]
+        codes = codes.drop_duplicates(subset=["long_symbol", "Exch"], keep="first").reset_index(drop=True)
 
         if saveToFolder:
             dest_symbol_file = (
@@ -275,6 +289,41 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
         context = create_error_context(url=url, error=str(e))
         trading_logger.log_error("Error in IciciDirect save_symbol_data", e, {"url": url})
         raise DataError(f"Error fetching/parsing IciciDirect symbol data: {str(e)}", context)
+
+
+def _format_expiry_for_breeze(expiry_yyyymmdd: str) -> str:
+    """Convert YYYYMMDD to ISO8601 UTC for Breeze get_quotes (e.g. 20260326 -> 2026-03-26T06:00:00.000Z)."""
+    if not expiry_yyyymmdd or len(expiry_yyyymmdd) != 8:
+        return ""
+    try:
+        d = dt.datetime.strptime(expiry_yyyymmdd, "%Y%m%d")
+        # Breeze expects expiry_date in ISO8601 UTC; use 06:00:00 UTC as expiry time.
+        return d.strftime("%Y-%m-%d") + "T06:00:00.000Z"
+    except ValueError:
+        return expiry_yyyymmdd
+
+
+# Timezone for Breeze API responses (exchange times are India)
+ICICIDIRECT_TIMEZONE = "Asia/Kolkata"
+
+
+def _parse_api_date_to_kolkata(
+    ts: Union[str, float, int, None, dt.datetime, pd.Timestamp],
+) -> pd.Timestamp:
+    """
+    Convert API date (string or number) to timezone-aware datetime in Asia/Kolkata.
+    Breeze API returns dates as strings (e.g. ISO8601); we normalize to Asia/Kolkata
+    so HistoricalData.date is always timezone-aware and consistent for downstream.
+    """
+    if ts is None:
+        return pd.NaT  # type: ignore[return-value]
+    dt_val = pd.to_datetime(ts)
+    if pd.isna(dt_val):
+        return dt_val
+    tz = getattr(dt_val, "tz", None) or getattr(dt_val, "tzinfo", None)
+    if tz is not None:
+        return dt_val.tz_convert(ICICIDIRECT_TIMEZONE)
+    return dt_val.tz_localize(ICICIDIRECT_TIMEZONE)
 
 
 def my_handler(typ, value, trace):
@@ -339,7 +388,8 @@ class IciciDirect(BrokerBase):
         """
         Read and validate a cached ICICIDirect session token from a file.
 
-        The token is considered stale when the file is older than max_age_hours.
+        The token is considered stale when the file is from a previous day, or when
+        the file is older than max_age_hours (for same-day staleness).
         """
         if not token_file_path:
             return None
@@ -352,7 +402,21 @@ class IciciDirect(BrokerBase):
             return None
 
         try:
-            token_age_hours = (time.time() - os.path.getmtime(token_file_path)) / 3600.0
+            mod_time = os.path.getmtime(token_file_path)
+            mod_datetime = dt.datetime.fromtimestamp(mod_time)
+            today = dt.datetime.now().date()
+            if mod_datetime.date() < today:
+                trading_logger.log_info(
+                    "IciciDirect cached token file is from a previous day, will regenerate",
+                    {
+                        "token_file_path": token_file_path,
+                        "token_date": mod_datetime.date().isoformat(),
+                        "today": today.isoformat(),
+                    },
+                )
+                return None
+
+            token_age_hours = (time.time() - mod_time) / 3600.0
             if token_age_hours > max_age_hours:
                 trading_logger.log_info(
                     "IciciDirect cached token file is stale",
@@ -530,7 +594,7 @@ class IciciDirect(BrokerBase):
         token_command = config.get("ICICIDIRECT.AUTO_SESSION_TOKEN_CMD")
         if not token_command and config.get("ICICIDIRECT.AUTO_LOGIN"):
             token_command = (
-                "icicidirect-generate-session "
+                "python -m tradingapi.icicidirect_generate_session "
                 "--api-key \"${ICICI_API_KEY}\" "
                 "--user-id \"${ICICI_USER_ID}\" "
                 "--password \"${ICICI_PASSWORD}\" "
@@ -703,17 +767,21 @@ class IciciDirect(BrokerBase):
                 codes = save_symbol_data(saveToFolder=False)
                 self.codes = codes
 
-            # Build exchange_mappings in the same structure used by other brokers
+            # Build exchange_mappings in the same structure used by other brokers.
+            # Use Scripcode so mappings work both when loading from CSV (which has no stock_code) and from save_symbol_data().
             self.exchange_mappings = {}
+            scrip_col = "Scripcode" if "Scripcode" in codes.columns else "stock_code"
             for exchange, group in codes.groupby("Exch"):
                 try:
                     self.exchange_mappings[exchange] = {
-                        "symbol_map": dict(zip(group["long_symbol"], group["Scripcode"])),
+                        # Breeze APIs use this as stock_code / instrument id.
+                        "symbol_map": dict(zip(group["long_symbol"], group[scrip_col])),
                         "contractsize_map": dict(zip(group["long_symbol"], group["LotSize"])),
                         "exchange_map": dict(zip(group["long_symbol"], group["Exch"])),
                         "exchangetype_map": dict(zip(group["long_symbol"], group["ExchType"])),
                         "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"])),
-                        "symbol_map_reversed": dict(zip(group["Scripcode"], group["long_symbol"])),
+                        "symbol_map_reversed": dict(zip(group[scrip_col], group["long_symbol"])),
+                        "brokerid_map_reversed": dict(zip(group[scrip_col], group["long_symbol"])),
                     }
 
                     trading_logger.log_debug(
@@ -743,16 +811,100 @@ class IciciDirect(BrokerBase):
     def map_exchange_for_api(self, long_symbol, exchange) -> str:
         """
         Map internal exchange representation to Breeze exchange_code.
-
-        For now this is a simple passthrough; extend as needed once symbology is in place.
         """
-        return exchange
+        ex = str(exchange or "").upper().strip()
+        sym = str(long_symbol or "").upper()
+
+        # Derivative symbols are quoted/traded via FO exchanges.
+        is_derivative = "_FUT_" in sym or "_OPT_" in sym
+        if is_derivative:
+            if ex in ["N", "NSE", "NFO"]:
+                return "NFO"
+            if ex in ["B", "BSE", "BFO"]:
+                return "BFO"
+
+        mapping = {
+            "N": "NSE",
+            "NSE": "NSE",
+            "B": "BSE",
+            "BSE": "BSE",
+            "NFO": "NFO",
+            "BFO": "BFO",
+        }
+        return mapping.get(ex, ex)
 
     def map_exchange_for_db(self, long_symbol, exchange) -> str:
         """
         Map exchange for database usage. Currently same as API mapping.
         """
         return self.map_exchange_for_api(long_symbol, exchange)
+
+    def _resolve_stock_code_for_symbol(self, long_symbol: str, mapped_exchange: str) -> str:
+        """Resolve stock_code from long_symbol with tolerant fallbacks for derivatives/index options."""
+        if mapped_exchange not in self.exchange_mappings:
+            raise SymbolError(
+                f"Exchange {mapped_exchange} not available for IciciDirect",
+                create_error_context(mapped_exchange=mapped_exchange, available_exchanges=list(self.exchange_mappings.keys())),
+            )
+
+        symbol_map = self.exchange_mappings[mapped_exchange].get("symbol_map", {})
+        stock_code = symbol_map.get(long_symbol)
+        if stock_code:
+            return stock_code
+
+        # Fallback: try matching by instrument root symbol prefix (e.g. INFY_* / NIFTY_* / SENSEX_*).
+        base_symbol = str(long_symbol).split("_")[0].upper()
+        for lsym, scode in symbol_map.items():
+            if str(lsym).upper().startswith(base_symbol + "_"):
+                trading_logger.log_warning(
+                    "IciciDirect symbol exact match not found; using fallback base-symbol match",
+                    {"requested_symbol": long_symbol, "matched_symbol": lsym, "exchange": mapped_exchange},
+                )
+                return str(scode)
+
+        raise SymbolError(
+            f"Symbol {long_symbol} not found for exchange {mapped_exchange} in IciciDirect mappings",
+            create_error_context(long_symbol=long_symbol, mapped_exchange=mapped_exchange),
+        )
+
+    def _get_quotes_params_from_long_symbol(
+        self, long_symbol: str, exchange: str
+    ) -> Dict[str, str]:
+        """
+        Explode long_symbol into Breeze get_quotes(...) parameters.
+
+        long_symbol formats: SYMBOL_STK___, SYMBOL_IND___, SYMBOL_FUT_YYYYMMDD__,
+        SYMBOL_OPT_YYYYMMDD_CALL_19500 / SYMBOL_OPT_YYYYMMDD_PUT_19500.
+        Returns dict with keys: stock_code, exchange_code, expiry_date, product_type, right, strike_price.
+        """
+        mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
+        stock_code = self._resolve_stock_code_for_symbol(long_symbol, mapped_exchange)
+        lsym = str(long_symbol).strip().upper()
+        parts = lsym.split("_")
+
+        out = {
+            "stock_code": str(stock_code),
+            "exchange_code": mapped_exchange,
+            "expiry_date": "",
+            "product_type": "cash",
+            "right": "",
+            "strike_price": "",
+        }
+
+        if "_OPT_" in lsym and len(parts) >= 5:
+            # SYMBOL_OPT_YYYYMMDD_CALL_19500 or _PUT_19500
+            out["product_type"] = "options"
+            out["expiry_date"] = _format_expiry_for_breeze(parts[2])
+            out["right"] = "call" if parts[3] == "CALL" else "put"
+            out["strike_price"] = parts[4] if len(parts) > 4 else ""
+        elif "_FUT_" in lsym and len(parts) >= 3:
+            # SYMBOL_FUT_YYYYMMDD__; Breeze expects right="others", strike_price="0" for futures.
+            out["product_type"] = "futures"
+            out["expiry_date"] = _format_expiry_for_breeze(parts[2])
+            out["right"] = "others"
+            out["strike_price"] = "0"
+
+        return out
 
     # ------------------------------------------------------------------
     # Market data
@@ -763,58 +915,83 @@ class IciciDirect(BrokerBase):
     def get_quote(self, long_symbol: str, exchange="NSE") -> Price:
         """
         Get a quote from BreezeConnect.
-
-        NOTE: This is a minimal mapping that assumes long_symbol can be used as stock_code.
-        You should refine this once you have a proper symbol master for IciciDirect.
+        Explodes long_symbol (including F&O) into stock_code, exchange_code,
+        expiry_date, product_type, right, strike_price per Breeze get_quotes() signature.
         """
         if self.api is None:
             raise BrokerConnectionError("IciciDirect not connected", create_error_context())
 
+        market_feed = Price()
+        market_feed.symbol = long_symbol
+        market_feed.exchange = exchange
+        market_feed.src = "ICICIDIRECT"
+        market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         try:
-            mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
-            if mapped_exchange not in self.exchange_mappings:
-                raise SymbolError(
-                    f"Exchange {mapped_exchange} not available for IciciDirect",
-                    create_error_context(
-                        mapped_exchange=mapped_exchange,
-                        available_exchanges=list(self.exchange_mappings.keys()),
-                    ),
-                )
-
-            stock_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(long_symbol)
-            if not stock_code:
-                raise SymbolError(
-                    f"Symbol {long_symbol} not found for exchange {mapped_exchange} in IciciDirect mappings",
-                    create_error_context(
-                        long_symbol=long_symbol,
-                        mapped_exchange=mapped_exchange,
-                    ),
-                )
-
-            exchange_code = mapped_exchange
+            params = self._get_quotes_params_from_long_symbol(long_symbol, exchange)
 
             resp = self.api.get_quotes(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                product_type="cash",
+                stock_code=params["stock_code"],
+                exchange_code=params["exchange_code"],
+                expiry_date=params["expiry_date"],
+                product_type=params["product_type"],
+                right=params["right"],
+                strike_price=str(params["strike_price"]),
             )
 
-            md = resp.get("Success", [])[0] if isinstance(resp.get("Success"), list) else resp.get("Success", {})
+            success = resp.get("Success")
+            if isinstance(success, list):
+                md = success[0] if success else None
+            else:
+                md = success if success is not None else None
+            if md is None:
+                trading_logger.log_warning(
+                    "IciciDirect returned no quote data for this symbol",
+                    {"long_symbol": long_symbol, "exchange": exchange, "response": resp},
+                )
+                return market_feed
 
-            bid = float(md.get("best_bid_price", "nan"))
-            ask = float(md.get("best_ask_price", "nan"))
-            last = float(md.get("ltp", "nan"))
-            high = float(md.get("high", "nan"))
-            low = float(md.get("low", "nan"))
-            volume = int(md.get("volume", 0))
-            timestamp = md.get("exchange_time", "")
+            def _float(v, default=float("nan")):
+                if v is None or v == "":
+                    return default
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return default
+
+            def _int(v, default=0):
+                if v is None or v == "":
+                    return default
+                try:
+                    return int(float(v))
+                except (ValueError, TypeError):
+                    return default
+
+            bid = _float(md.get("best_bid_price"))
+            ask = _float(md.get("best_offer_price") or md.get("best_ask_price"))
+            last = _float(md.get("ltp"))
+            high = _float(md.get("high"))
+            low = _float(md.get("low"))
+            volume = _int(md.get("total_quantity_traded") or md.get("volume"))
+            bid_vol = _int(md.get("best_bid_quantity"))
+            ask_vol = _int(md.get("best_offer_quantity") or md.get("best_ask_quantity"))
+            prior_close = _float(md.get("previous_close"))
+
+            ltt = md.get("ltt") or ""
+            if ltt:
+                try:
+                    timestamp = format_datetime(ltt, "%Y-%m-%d %H:%M:%S")  # type: ignore[name-defined]
+                except (ValueError, TypeError):
+                    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             return Price(
                 bid=bid,
                 ask=ask,
-                bid_volume=0,
-                ask_volume=0,
-                prior_close=float("nan"),
+                bid_volume=bid_vol,
+                ask_volume=ask_vol,
+                prior_close=prior_close,
                 last=last,
                 high=high,
                 low=low,
@@ -825,12 +1002,12 @@ class IciciDirect(BrokerBase):
                 timestamp=timestamp,
             )
         except Exception as e:
-            context = create_error_context(
-                long_symbol=long_symbol,
-                exchange=exchange,
-                error=str(e),
+            trading_logger.log_error(
+                "Error getting quote from IciciDirect",
+                e,
+                {"long_symbol": long_symbol, "exchange": exchange, "error": str(e)},
             )
-            raise MarketDataError(f"Error getting quote from IciciDirect: {str(e)}", context)
+            return market_feed
 
     @log_execution_time
     def get_historical(
@@ -883,14 +1060,30 @@ class IciciDirect(BrokerBase):
                 "D": "1day",
             }.get(periodicity, periodicity)
 
-            resp = self.api.get_historical_data_v2(
-                interval=interval,
-                from_date=from_date,
-                to_date=to_date,
-                stock_code=stock_code,
-                exchange_code=mapped_exchange,
-                product_type="cash",
-            )
+            # For NFO/BFO, API requires expiry_date and product_type (options/futures), right, strike_price.
+            kwargs: Dict[str, str] = {
+                "interval": interval,
+                "from_date": from_date,
+                "to_date": to_date,
+                "stock_code": stock_code,
+                "exchange_code": mapped_exchange,
+            }
+            if mapped_exchange in ("NFO", "BFO"):
+                params = self._get_quotes_params_from_long_symbol(symbol, exchange)
+                expiry_date = (params.get("expiry_date") or "").strip()
+                if not expiry_date:
+                    raise MarketDataError(
+                        "Expiry date is required for F&O historical data; symbol must be in long_symbol format (e.g. NIFTY_OPT_YYYYMMDD_CALL_19500)",
+                        create_error_context(symbol=symbol, exchange=mapped_exchange),
+                    )
+                kwargs["expiry_date"] = expiry_date
+                kwargs["product_type"] = params.get("product_type") or "options"
+                kwargs["right"] = params.get("right") or "others"
+                kwargs["strike_price"] = str(params.get("strike_price") or "0")
+            else:
+                kwargs["product_type"] = "cash"
+
+            resp = self.api.get_historical_data_v2(**kwargs)
 
             rows = resp.get("Success") if isinstance(resp, dict) else None
             if not isinstance(rows, list):
@@ -902,9 +1095,10 @@ class IciciDirect(BrokerBase):
             out: list[HistoricalData] = []
             for row in rows:
                 ts = row.get("datetime") or row.get("time") or row.get("date")
+                dt_val = _parse_api_date_to_kolkata(ts)
                 out.append(
                     HistoricalData(
-                        date=pd.to_datetime(ts),
+                        date=dt_val,
                         open=float(row.get("open", float("nan"))),
                         high=float(row.get("high", float("nan"))),
                         low=float(row.get("low", float("nan"))),
@@ -915,6 +1109,74 @@ class IciciDirect(BrokerBase):
                     )
                 )
 
+            # For 1d periodicity, when date_end is today, update with today's OHLCV from intraday (like Shoonya).
+            today_date = get_tradingapi_now().date()
+            date_end_date = pd.to_datetime(date_end).date()
+            if periodicity in ("1d", "D") and date_end_date >= today_date:
+                today_str = get_tradingapi_now().strftime("%Y-%m-%d")
+                from_date_today = f"{today_str}T00:00:00.000Z"
+                to_date_today = f"{today_str}T23:59:59.000Z"
+                kwargs_today = {
+                    "interval": "1minute",
+                    "from_date": from_date_today,
+                    "to_date": to_date_today,
+                    "stock_code": stock_code,
+                    "exchange_code": mapped_exchange,
+                }
+                if mapped_exchange in ("NFO", "BFO"):
+                    params = self._get_quotes_params_from_long_symbol(symbol, exchange)
+                    kwargs_today["expiry_date"] = (params.get("expiry_date") or "").strip()
+                    kwargs_today["product_type"] = params.get("product_type") or "options"
+                    kwargs_today["right"] = params.get("right") or "others"
+                    kwargs_today["strike_price"] = str(params.get("strike_price") or "0")
+                else:
+                    kwargs_today["product_type"] = "cash"
+                try:
+                    resp_today = self.api.get_historical_data_v2(**kwargs_today)
+                    rows_today = resp_today.get("Success") if isinstance(resp_today, dict) else []
+                    if isinstance(rows_today, list) and len(rows_today) > 0:
+                        df_t = pd.DataFrame(rows_today)
+                        ts_col = df_t["datetime"] if "datetime" in df_t.columns else (df_t["time"] if "time" in df_t.columns else df_t["date"])
+                        df_t["date"] = pd.to_datetime(ts_col)
+                        if df_t["date"].dt.tz is not None:
+                            df_t["date"] = df_t["date"].dt.tz_convert(ICICIDIRECT_TIMEZONE)
+                        else:
+                            df_t["date"] = df_t["date"].dt.tz_localize(ICICIDIRECT_TIMEZONE)
+                        df_t = df_t.set_index("date")
+                        agg_map: Dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+                        if "open_interest" in df_t.columns:
+                            agg_map["open_interest"] = "last"
+                        resampled = df_t.resample("D").agg(agg_map)  # type: ignore[arg-type]
+                        for _, r in resampled.iterrows():
+                            idx_val = r.name if r.name is not None else resampled.index[0]
+                            dt_val = _parse_api_date_to_kolkata(
+                                cast(Union[str, dt.datetime, pd.Timestamp], idx_val)
+                            )
+                            oi_val = int(float(r.get("open_interest", 0) or 0)) if "open_interest" in r.index else 0
+                            today_bar = HistoricalData(
+                                date=dt_val,
+                                open=float(r.get("open", float("nan"))),
+                                high=float(r.get("high", float("nan"))),
+                                low=float(r.get("low", float("nan"))),
+                                close=float(r.get("close", float("nan"))),
+                                volume=int(float(r.get("volume", 0) or 0)),
+                                intoi=oi_val,
+                                oi=oi_val,
+                            )
+                            # Remove any existing bar for today from daily API, then append intraday-derived bar
+                            def _day(d):
+                                return d.date() if hasattr(d, "date") and callable(getattr(d, "date", None)) else pd.to_datetime(d).date()
+
+                            out = [x for x in out if _day(x.date) != today_date]
+                            out.append(today_bar)
+                            break
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Failed to fetch today intraday for 1d update",
+                        {"symbol": symbol, "error": str(e)},
+                    )
+
+            out.sort(key=lambda x: x.date)
             return {symbol: out}
         except (ValidationError, SymbolError, MarketDataError):
             raise
