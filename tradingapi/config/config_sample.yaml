@@ -1,6 +1,16 @@
 # bhavcopy path  - this is the path where symbol files from brokers are saved
 bhavcopy_folder : /home/psharma/onedrive/rfiles/data/bhavcopy
 
+# Optional: proxy for broker HTTP requests (e.g. connect, save_symbol_data).
+# When a broker has USE_PROXY: true, proxies are fetched from the source (e.g. webshare).
+proxy:
+  source: webshare
+  api_key: # Webshare API key (or set WEBSHARE_PROXY_API_KEY env)
+  username: # Optional: override per-proxy username from API
+  password: # Optional: override per-proxy password from API
+  country_code: # Optional: e.g. IN
+  mode: direct
+
 commissions:
   - effective_date: "2020-01-01"
     file: "commissions_20200101.yaml"
@@ -10,6 +20,7 @@ commissions:
     file: "commissions_20241216.yaml"
 
 FIVEPAISA:
+  USE_PROXY: false
   APP_NAME:
   APP_SOURCE:
   USER_ID:
@@ -23,6 +34,7 @@ FIVEPAISA:
   USERTOKEN:
 
 SHOONYA:
+  USE_PROXY: false
   USER:
   PWD:
   VC:
@@ -32,6 +44,7 @@ SHOONYA:
   USERTOKEN:
 
 ICICIDIRECT:
+  USE_PROXY: false
   API_KEY:
   API_SECRET:
   USER_ID: # Optional: used by icicidirect-generate-session (AUTO_SESSION_TOKEN_CMD)

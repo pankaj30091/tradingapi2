@@ -1773,17 +1773,21 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
 
     if order.order_type in ["BUY", "SHORT"]:
         current_orders = cast(str, broker.redis_o.hget(order.internal_order_id, "entry_keys"))
-        new_orders = (
-            str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
-        )
+        entry_keys = [k for k in str(current_orders or "").split() if k]
+        broker_key = str(order.broker_order_id)
+        if broker_key not in entry_keys:
+            entry_keys.append(broker_key)
+        new_orders = " ".join(entry_keys)
         cast(bool, broker.redis_o.hset(order.orderRef, "entry_keys", new_orders))
         cast(bool, broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol))
 
     if order.order_type in ["SELL", "COVER"]:
         current_orders = cast(str, broker.redis_o.hget(order.internal_order_id, "exit_keys"))
-        new_orders = (
-            str(order.broker_order_id) if current_orders is None else current_orders + " " + str(order.broker_order_id)
-        )
+        exit_keys = [k for k in str(current_orders or "").split() if k]
+        broker_key = str(order.broker_order_id)
+        if broker_key not in exit_keys:
+            exit_keys.append(broker_key)
+        new_orders = " ".join(exit_keys)
         cast(bool, broker.redis_o.hset(order.orderRef, "exit_keys", new_orders))
         cast(bool, broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol))
 
@@ -1907,12 +1911,13 @@ def update_order_status(
     if eod is false, [price,quantity,status] is updated to [fill_price/order_price,order_size,orderstatus]
     if eod is true, [price,quantity,status] is updated to [fill_price,fill_size,orderstatus]. in addition to eod functionality, order is deleted if fill_size is zero
     """
-    # Skip refresh if broker_order_id is invalid (e.g., "0" for paper orders or missing IDs)
-    if not broker_order_id or broker_order_id == "0":
+    # Skip refresh if broker_order_id is invalid (e.g., "0"/paper IDs/missing IDs)
+    broker_order_id_str = str(broker_order_id or "").strip()
+    if not broker_order_id_str or broker_order_id_str == "0" or broker_order_id_str.upper().endswith("P"):
         return None
 
     try:
-        fills = broker.get_order_info(broker_order_id=broker_order_id)
+        fills = broker.get_order_info(broker_order_id=broker_order_id_str)
     except Exception as e:
         trading_logger.log_error(
             "Error calling get_order_info in update_order_status",

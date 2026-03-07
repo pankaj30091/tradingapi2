@@ -18,6 +18,7 @@ import pandas as pd
 import pyotp
 import redis
 import requests
+import httpx
 from chameli.dateutils import format_datetime, parse_datetime
 
 
@@ -86,8 +87,14 @@ def save_symbol_data(saveToFolder: bool = False):
         bhavcopyfolder = config.get("bhavcopy_folder")
         url = "https://openapi.5paisa.com/VendorsAPI/Service1.svc/ScripMaster/segment/All"
         dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_codes.csv"
+        _proxies = None
+        try:
+            from .proxy_utils import get_proxies_for_broker
+            _proxies = get_proxies_for_broker("FIVEPAISA")
+        except Exception:
+            pass
         response = requests.get(
-            url, allow_redirects=True, timeout=100
+            url, allow_redirects=True, timeout=100, proxies=_proxies or {}
         )  # Add timeout to `requests.get` to fix Bandit issue
 
         if response.status_code != 200:
@@ -240,6 +247,7 @@ class FivePaisa(BrokerBase):
             self.codes = pd.DataFrame()
             self.broker = Brokers.FIVEPAISA
             self.api = None
+            self._api_proxy_url = None
             self.subscribe_thread = None
             self.subscribed_symbols = []
 
@@ -249,6 +257,31 @@ class FivePaisa(BrokerBase):
         except Exception as e:
             context = create_error_context(broker_type="FivePaisa", config_keys=list(kwargs.keys()), error=str(e))
             raise BrokerConnectionError(f"Failed to initialize FivePaisa broker: {str(e)}", context)
+
+    def _configure_api_proxy_session(self, force_refresh: bool = False):
+        try:
+            if self.api is None or not hasattr(self.api, "session"):
+                return
+            from .proxy_utils import get_proxies_for_broker
+            proxies = get_proxies_for_broker(self.broker.name)
+            proxy_url = (proxies or {}).get("https") or (proxies or {}).get("http")
+            if not proxy_url or (not force_refresh and proxy_url == self._api_proxy_url):
+                return
+
+            old_session = self.api.session
+            new_session = httpx.Client(verify=False, proxy=proxy_url, trust_env=True)
+            try:
+                new_session.cookies.update(old_session.cookies)
+            except Exception:
+                pass
+            self.api.session = new_session
+            self._api_proxy_url = proxy_url
+            try:
+                old_session.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     @log_execution_time
     @validate_inputs(any_object=lambda x: x is not None)
@@ -477,6 +510,12 @@ class FivePaisa(BrokerBase):
         normalized = _normalize_as_of_date(as_of_date)
         if normalized is not None:
             tradingapi_globals.TRADINGAPI_NOW = normalized
+        previous_proxy_env = None
+        try:
+            from .proxy_utils import set_proxy_env_for_broker
+            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+        except Exception:
+            pass
 
         def extract_credentials():
             """Extract credentials from config with validation."""
@@ -685,6 +724,7 @@ class FivePaisa(BrokerBase):
 
             # Get connected using robust session management
             get_connected()
+            self._configure_api_proxy_session()
 
             # Set up Redis connection
             try:
@@ -713,6 +753,12 @@ class FivePaisa(BrokerBase):
         except Exception as e:
             context = create_error_context(redis_db=redis_db, broker_name=self.broker.name, error=str(e))
             raise BrokerConnectionError(f"Unexpected error connecting to FivePaisa: {str(e)}", context)
+        finally:
+            try:
+                from .proxy_utils import restore_proxy_env
+                restore_proxy_env(previous_proxy_env)
+            except Exception:
+                pass
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
@@ -2321,6 +2367,8 @@ class FivePaisa(BrokerBase):
             MarketDataError: If historical data retrieval fails
             BrokerConnectionError: If broker connection issues
         """
+        self._configure_api_proxy_session()
+
         try:
             trading_logger.log_debug(
                 "Getting historical data",
@@ -2461,6 +2509,8 @@ class FivePaisa(BrokerBase):
                         )
                         continue
 
+                    data = None
+                    first_error = None
                     try:
                         if self.api is None:
                             raise BrokerConnectionError("API client not initialized")
@@ -2468,21 +2518,59 @@ class FivePaisa(BrokerBase):
                             exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
                         )
                     except Exception as e:
-                        trading_logger.log_error(
-                            "Error fetching historical data from API",
-                            e,
+                        first_error = e
+
+                    if first_error is not None or data is None:
+                        trading_logger.log_warning(
+                            "Historical API failed/None; reconnecting and retrying once",
                             {
+                                "symbol": row_outer["long_symbol"],
                                 "exch": exch,
                                 "exch_type": exch_type,
                                 "scripcode": row_outer["Scripcode"],
                                 "periodicity": periodicity,
                                 "date_start": date_start_str,
                                 "date_end": date_end_str,
+                                "error": str(first_error) if first_error else None,
                             },
                         )
-                        continue
+                        try:
+                            redis_db = (
+                                self.redis_o.connection_pool.connection_kwargs.get("db")
+                                if getattr(self, "redis_o", None) is not None
+                                else None
+                            )
+                            if redis_db is None:
+                                raise BrokerConnectionError("Redis DB unavailable for reconnect retry")
+                            self.connect(redis_db=int(redis_db))
+                            if self.api is None:
+                                raise BrokerConnectionError("API client not initialized after reconnect")
+                            data = self.api.historical_data(
+                                exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
+                            )
+                        except Exception as retry_error:
+                            trading_logger.log_error(
+                                "Error fetching historical data from API after reconnect retry",
+                                retry_error,
+                                {
+                                    "exch": exch,
+                                    "exch_type": exch_type,
+                                    "scripcode": row_outer["Scripcode"],
+                                    "periodicity": periodicity,
+                                    "date_start": date_start_str,
+                                    "date_end": date_end_str,
+                                },
+                            )
+                            continue
 
-                    if not (data is None or len(data) == 0):
+                    if isinstance(data, str):
+                        trading_logger.log_warning(
+                            "Historical API returned message instead of data",
+                            {"symbol": row_outer["long_symbol"], "message": data},
+                        )
+                        data = None
+
+                    if isinstance(data, pd.DataFrame) and len(data) > 0:
                         try:
                             data = cast(pd.DataFrame, data)
                             data.columns = ["date", "open", "high", "low", "close", "volume"]
@@ -2618,6 +2706,14 @@ class FivePaisa(BrokerBase):
             MarketDataError: If price retrieval fails
             BrokerConnectionError: If broker connection issues
         """
+        previous_proxy_env = None
+        try:
+            from .proxy_utils import set_proxy_env_for_broker
+            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+        except Exception:
+            pass
+        self._configure_api_proxy_session()
+
         try:
             trading_logger.log_info(
                 "Getting close price",
@@ -2746,6 +2842,12 @@ class FivePaisa(BrokerBase):
                 error=str(e),
             )
             raise MarketDataError(f"Unexpected error getting close price: {str(e)}", context)
+        finally:
+            try:
+                from .proxy_utils import restore_proxy_env
+                restore_proxy_env(previous_proxy_env)
+            except Exception:
+                pass
 
     @log_execution_time
     @validate_inputs(

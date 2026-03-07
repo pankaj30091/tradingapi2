@@ -18,6 +18,9 @@ chameli for IV and performance_attribution (options).
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
+import os
+import threading
 import time as _time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
@@ -57,6 +60,52 @@ except ImportError:
 _historical_broker_cache: Dict[str, object] = {}
 _HISTORICAL_BROKER_REDIS_DB = 0
 _historical_close_price_cache: Dict[Tuple[str, str], Optional[float]] = {}
+_GET_HISTORICAL_CALL_LOG_FILE = os.path.join(
+    os.path.expanduser("~/logs"),
+    "get_historical_calls.log",
+)
+_get_historical_call_count = 0
+_get_historical_call_lock = threading.Lock()
+
+
+def _log_get_historical_call(
+    broker: object,
+    symbols: str,
+    date_start: str,
+    date_end: str,
+    periodicity: str,
+) -> None:
+    """Log get_historical call details and keep a process-level call counter."""
+    global _get_historical_call_count
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    broker_name = type(broker).__name__ if broker is not None else "None"
+    with _get_historical_call_lock:
+        try:
+            os.makedirs(os.path.dirname(_GET_HISTORICAL_CALL_LOG_FILE), exist_ok=True)
+            with open(_GET_HISTORICAL_CALL_LOG_FILE, "a+", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                lines = f.readlines()
+                if lines:
+                    last = lines[-1].strip().split(",", 1)[0]
+                    try:
+                        count = int(last) + 1
+                    except (TypeError, ValueError):
+                        count = 1
+                else:
+                    count = 1
+                _get_historical_call_count = count
+                line = f"{count},{ts},{broker_name},{symbols},{date_start},{date_end},{periodicity}\n"
+                f.write(line)
+                f.flush()
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            trading_logger.log_debug(f"Failed to log get_historical call: {e}")
+
+
+def get_historical_call_count() -> int:
+    with _get_historical_call_lock:
+        return _get_historical_call_count
 
 
 def clear_historical_close_price_cache() -> None:
@@ -189,6 +238,13 @@ def get_historical_close_price(
     try:
         date_obj = dt.datetime.strptime(date_key, "%Y%m%d").date()
         date_str_formatted = date_obj.strftime("%Y-%m-%d")
+        _log_get_historical_call(
+            hist_broker,
+            symbol,
+            date_str_formatted,
+            date_str_formatted,
+            "1m",
+        )
         hist_data = hist_broker.get_historical(  # type: ignore[union-attr]
             symbols=symbol,
             date_start=date_str_formatted,
@@ -481,6 +537,13 @@ def get_spot_price_at_time(broker, underlying_symbol: str, exchange: str, at_tim
     if not within_ttl:
         try:
             date_str = at_time.strftime("%Y-%m-%d")
+            _log_get_historical_call(
+                broker,
+                underlying_symbol,
+                date_str,
+                date_str,
+                "1m",
+            )
             hist = broker.get_historical(
                 symbols=underlying_symbol,
                 date_start=date_str,

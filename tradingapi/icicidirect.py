@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -16,6 +17,16 @@ import pandas as pd
 import redis
 import requests
 from breeze_connect import BreezeConnect
+
+# Re-enable IPv6 after breeze_connect import (breeze_connect sets HAS_IPV6 = False at load).
+try:
+    requests.packages.urllib3.util.connection.HAS_IPV6 = True  # type: ignore[attr-defined]
+except Exception:
+    try:
+        import urllib3.util.connection as _conn
+        _conn.HAS_IPV6 = True
+    except Exception:
+        pass
 
 from .broker_base import (
     BrokerBase,
@@ -52,6 +63,40 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
+def _temporarily_force_ipv4():
+    """
+    Force IPv4 for the next request(s) only (ICICIDirect/Breeze endpoints can return 403 over IPv6).
+    Returns the previous HAS_IPV6 value so caller can restore in a finally.
+    """
+    try:
+        conn = requests.packages.urllib3.util.connection  # type: ignore[attr-defined]
+        old = getattr(conn, "HAS_IPV6", True)
+        conn.HAS_IPV6 = False
+        return old
+    except Exception:
+        try:
+            import urllib3.util.connection as conn
+            old = getattr(conn, "HAS_IPV6", True)
+            conn.HAS_IPV6 = False
+            return old
+        except Exception:
+            return None
+
+
+def _restore_ipv6(previous):
+    """Restore HAS_IPV6 to previous value (from _temporarily_force_ipv4)."""
+    if previous is None:
+        return
+    try:
+        requests.packages.urllib3.util.connection.HAS_IPV6 = previous  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            import urllib3.util.connection as conn
+            conn.HAS_IPV6 = previous
+        except Exception:
+            pass
+
+
 @log_execution_time
 @retry_on_error(max_retries=3, delay=2.0, backoff_factor=2.0)
 def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
@@ -80,8 +125,18 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
 
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_icicidirect_instruments.csv"
 
+    _proxies = None
     try:
-        response = requests.get(url, allow_redirects=True, timeout=60)
+        from .proxy_utils import get_proxies_for_broker
+        _proxies = get_proxies_for_broker("ICICIDIRECT")
+    except Exception:
+        pass
+    _prev_ipv6 = _temporarily_force_ipv4()
+    try:
+        response = requests.get(url, allow_redirects=True, timeout=60, proxies=_proxies or {})
+    finally:
+        _restore_ipv6(_prev_ipv6)
+    try:
         if response.status_code != 200:
             raise DataError(
                 f"Failed to fetch IciciDirect symbol data. Status code: {response.status_code}",
@@ -367,6 +422,15 @@ class IciciDirect(BrokerBase):
             self.codes = pd.DataFrame()
             self.starting_order_ids_int: Dict[str, int] = {}
             self.redis_o = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+            self.subscribed_symbols: List[str] = []
+            self._stream_token_to_symbol: Dict[str, str] = {}
+            self._stream_symbol_to_token: Dict[str, str] = {}
+            self._stream_stock_code_to_symbol: Dict[str, str] = {}
+            self._stream_symbol_meta: Dict[str, Dict[str, str]] = {}
+            self._stream_external_callback = None
+            self._stream_raw_tick_count = 0
+            self._stream_mapped_tick_count = 0
+            self._stream_last_tick_preview: Dict[str, object] = {}
 
             trading_logger.log_info(
                 "IciciDirect broker initialized",
@@ -653,6 +717,15 @@ class IciciDirect(BrokerBase):
         normalized = _normalize_as_of_date(as_of_date)
         if normalized is not None:
             tradingapi_globals.TRADINGAPI_NOW = normalized
+
+        previous_proxy_env = None
+        try:
+            from .proxy_utils import set_proxy_env_for_broker, restore_proxy_env
+            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+        except Exception:
+            pass
+
+        _prev_ipv6 = _temporarily_force_ipv4()
         try:
             api_key = config.get("ICICIDIRECT.API_KEY")
             api_secret = config.get("ICICIDIRECT.API_SECRET")
@@ -713,6 +786,13 @@ class IciciDirect(BrokerBase):
                 error=str(e),
             )
             raise BrokerConnectionError(f"Error connecting to IciciDirect: {str(e)}", context)
+        finally:
+            _restore_ipv6(_prev_ipv6)
+            try:
+                from .proxy_utils import restore_proxy_env
+                restore_proxy_env(previous_proxy_env)
+            except Exception:
+                pass
 
     def is_connected(self):
         """
@@ -725,6 +805,10 @@ class IciciDirect(BrokerBase):
         BreezeConnect is HTTP-based and generally stateless; we just drop the client.
         """
         try:
+            try:
+                self.stop_streaming()
+            except Exception:
+                pass
             self.api = None
             trading_logger.log_info("IciciDirect disconnected", {})
         except Exception as e:
@@ -839,6 +923,125 @@ class IciciDirect(BrokerBase):
         """
         return self.map_exchange_for_api(long_symbol, exchange)
 
+    def _call_api_method(self, method_name: str, payload: Dict[str, object]) -> dict:
+        """
+        Call a BreezeConnect method with keyword filtering based on runtime signature.
+        This avoids TypeError from unsupported kwargs across breeze_connect versions.
+        Also forces IPv4 for the request window because Breeze endpoints can intermittently
+        fail over IPv6 with non-JSON responses.
+        """
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        method = getattr(self.api, method_name)
+        sig = inspect.signature(method)
+        accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
+        if accepts_kwargs:
+            filtered_payload = payload
+        else:
+            filtered_payload = {k: v for k, v in payload.items() if k in sig.parameters}
+
+        _prev_ipv6 = _temporarily_force_ipv4()
+        try:
+            return method(**filtered_payload)
+        finally:
+            _restore_ipv6(_prev_ipv6)
+
+    def _today_window_utc(self) -> tuple[str, str]:
+        now = get_tradingapi_now()
+        day = now.strftime("%Y-%m-%d")
+        return f"{day}T00:00:00.000Z", f"{day}T23:59:59.000Z"
+
+    def _resolve_exchange_code_for_order(self, broker_order_id: str = "", fallback: str = "NSE") -> str:
+        """
+        Resolve exchange_code for order APIs using kwargs/redis context, defaulting safely.
+        """
+        if broker_order_id and hasattr(self, "redis_o"):
+            try:
+                order_data = self.redis_o.hgetall(str(broker_order_id))
+                long_symbol = str(order_data.get("long_symbol") or "").strip()
+                exchange = str(order_data.get("exchange") or "").strip()
+                if long_symbol:
+                    return self.map_exchange_for_api(long_symbol, exchange or fallback)
+            except Exception:
+                pass
+        return str(fallback or "NSE").upper()
+
+    def _sanitize_user_remark(self, value: str) -> str:
+        """
+        Breeze place_order enforces alphanumeric-only user_remark.
+        """
+        raw = str(value or "")
+        cleaned = "".join(ch for ch in raw if ch.isalnum())
+        if cleaned:
+            return cleaned[:20]
+        return "ORD" + get_tradingapi_now().strftime("%H%M%S")
+
+    def _persist_order_links(self, order: Order) -> None:
+        """
+        Persist order object and link broker order id into internal order's entry/exit keys.
+        Mirrors behavior expected by shared utils for direct broker.place_order() calls.
+        """
+        broker_order_id = str(order.broker_order_id or "").strip()
+        internal_order_id = str(order.internal_order_id or "").strip()
+        order_ref = str(order.orderRef or internal_order_id).strip()
+        if not broker_order_id or not internal_order_id:
+            return
+
+        existing = self.redis_o.hgetall(broker_order_id) if hasattr(self, "redis_o") else {}
+        if not existing:
+            self.redis_o.hmset(broker_order_id, {key: str(val) for key, val in order.to_dict().items()})
+
+        if order.order_type in ["BUY", "SHORT"]:
+            current_keys = self.redis_o.hget(internal_order_id, "entry_keys") or ""
+            key_list = [k for k in str(current_keys).split() if k]
+            if broker_order_id not in key_list:
+                key_list.append(broker_order_id)
+                self.redis_o.hset(order_ref, "entry_keys", " ".join(key_list))
+                self.redis_o.hset(internal_order_id, "long_symbol", str(order.long_symbol))
+        elif order.order_type in ["SELL", "COVER"]:
+            current_keys = self.redis_o.hget(internal_order_id, "exit_keys") or ""
+            key_list = [k for k in str(current_keys).split() if k]
+            if broker_order_id not in key_list:
+                key_list.append(broker_order_id)
+                self.redis_o.hset(order_ref, "exit_keys", " ".join(key_list))
+                self.redis_o.hset(internal_order_id, "long_symbol", str(order.long_symbol))
+
+    def _normalize_order_status(
+        self,
+        status_raw: str,
+        fill_size: int,
+        order_size: int,
+        exchange_order_id: str = "",
+    ) -> OrderStatus:
+        """
+        Normalize broker-native status strings to common OrderStatus values.
+        """
+        s = str(status_raw or "").strip().upper()
+        exch_order_id = str(exchange_order_id or "").strip()
+
+        if any(tok in s for tok in ["REJECT", "FAIL", "DENIED", "ERROR"]):
+            return OrderStatus.REJECTED
+        if any(tok in s for tok in ["CANCEL", "CANCELLED", "CANCELED", "EXPIRE"]):
+            return OrderStatus.CANCELLED
+        if any(tok in s for tok in ["COMPLETE", "COMPLETED", "EXECUTED", "TRADED", "FILLED"]):
+            return OrderStatus.FILLED
+        if any(tok in s for tok in ["PENDING", "TRIGGER", "WAIT", "RECEIVED", "VALIDATION"]):
+            return OrderStatus.PENDING
+        if any(tok in s for tok in ["OPEN", "WORKING", "PARTIAL", "MODIFIED", "ORDERED"]):
+            return OrderStatus.OPEN
+
+        # Quantity/exchange-id fallbacks to keep behavior consistent with other brokers.
+        if order_size > 0 and fill_size >= order_size:
+            return OrderStatus.FILLED
+        if fill_size > 0:
+            return OrderStatus.OPEN
+        if exch_order_id and exch_order_id not in ["0", "None", "NONE"]:
+            return OrderStatus.OPEN
+        if s:
+            return OrderStatus.PENDING
+        return OrderStatus.UNDEFINED
+
     def _resolve_stock_code_for_symbol(self, long_symbol: str, mapped_exchange: str) -> str:
         """Resolve stock_code from long_symbol with tolerant fallbacks for derivatives/index options."""
         if mapped_exchange not in self.exchange_mappings:
@@ -930,16 +1133,28 @@ class IciciDirect(BrokerBase):
         try:
             params = self._get_quotes_params_from_long_symbol(long_symbol, exchange)
 
-            resp = self.api.get_quotes(
-                stock_code=params["stock_code"],
-                exchange_code=params["exchange_code"],
-                expiry_date=params["expiry_date"],
-                product_type=params["product_type"],
-                right=params["right"],
-                strike_price=str(params["strike_price"]),
-            )
+            quote_payload = {
+                "stock_code": params["stock_code"],
+                "exchange_code": params["exchange_code"],
+                "expiry_date": params["expiry_date"],
+                "product_type": params["product_type"],
+                "right": params["right"],
+                "strike_price": str(params["strike_price"]),
+            }
+            last_quote_error: Exception | None = None
+            resp: object = {}
+            for attempt in range(2):
+                try:
+                    resp = self._call_api_method("get_quotes", quote_payload)
+                    break
+                except Exception as quote_error:
+                    last_quote_error = quote_error
+                    if attempt == 0:
+                        time.sleep(0.25)
+                    else:
+                        raise last_quote_error
 
-            success = resp.get("Success")
+            success = resp.get("Success") if isinstance(resp, dict) else None
             if isinstance(success, list):
                 md = success[0] if success else None
             else:
@@ -1008,6 +1223,359 @@ class IciciDirect(BrokerBase):
                 {"long_symbol": long_symbol, "exchange": exchange, "error": str(e)},
             )
             return market_feed
+
+    def _stream_exchange_prefix(self, exchange_code: str) -> str:
+        ex = str(exchange_code or "").upper()
+        mapping = {
+            "NSE": "4",
+            "NFO": "4",
+            "BSE": "1",
+            "BFO": "8",
+            "NDX": "13",
+            "MCX": "6",
+        }
+        return mapping.get(ex, "4")
+
+    def _build_stream_token(self, long_symbol: str, exchange: str) -> tuple[str, str]:
+        mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
+        scrip_code = self._resolve_stock_code_for_symbol(long_symbol, mapped_exchange)
+        prefix = self._stream_exchange_prefix(mapped_exchange)
+        # 1! = exchange quote stream token in Breeze
+        token = f"{prefix}.1!{scrip_code}"
+        return mapped_exchange, token
+
+    def _resolve_long_symbol_from_tick(self, token: str, tick: Dict[str, object]) -> Optional[str]:
+        def _norm(s: str) -> str:
+            return "".join(ch for ch in str(s or "").upper() if ch.isalnum())
+
+        # 1) Direct token mapping (preferred)
+        if token in self._stream_token_to_symbol:
+            return self._stream_token_to_symbol[token]
+
+        # 2) Resolve token id via symbol_map_reversed in current exchange mappings
+        try:
+            token_id = token.split("!", 1)[1] if "!" in token else ""
+            if token_id:
+                for exch in self.exchange_mappings.values():
+                    rev = exch.get("symbol_map_reversed", {})
+                    if token_id in rev:
+                        return str(rev[token_id])
+                    try:
+                        token_id_int = int(token_id)
+                        if token_id_int in rev:
+                            return str(rev[token_id_int])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 3) Fallback on stock_name populated by Breeze on_ticks enrichment.
+        stock_name = str(tick.get("stock_name") or "").strip().upper().replace(" ", "")
+        if stock_name:
+            cands = [s for s in self.subscribed_symbols if str(s).upper().startswith(stock_name + "_")]
+            if len(cands) == 1:
+                return cands[0]
+
+        # 4) Fallback on stock_code present in quote payload.
+        stock_code = str(tick.get("stock_code") or "").strip().upper().replace(" ", "")
+        if stock_code:
+            if stock_code in self._stream_stock_code_to_symbol:
+                return self._stream_stock_code_to_symbol[stock_code]
+            cands = [s for s in self.subscribed_symbols if str(s).upper().startswith(stock_code + "_")]
+            if len(cands) == 1:
+                return cands[0]
+
+        # 5) Decode token via Breeze helper and map by stock_name/root symbol.
+        try:
+            if self.api is not None and token:
+                token_data = self._call_api_method("get_data_from_stock_token_value", {"input_stock_token": token})
+                token_stock_name = str(token_data.get("stock_name") or "").strip()
+                if token_stock_name:
+                    token_key = _norm(token_stock_name)
+
+                    # Prefer metadata-based exact matching on subscribed symbols.
+                    cands = []
+                    for s in self.subscribed_symbols:
+                        meta = self._stream_symbol_meta.get(s, {})
+                        meta_stock_code = _norm(meta.get("stock_code", ""))
+                        sym_root = _norm(str(s).split("_", 1)[0])
+                        if token_key and (token_key == meta_stock_code or token_key == sym_root):
+                            cands.append(s)
+
+                    # Fallback: token key may be long company name; match by inclusion with root/code.
+                    if len(cands) == 0 and token_key:
+                        for s in self.subscribed_symbols:
+                            meta = self._stream_symbol_meta.get(s, {})
+                            meta_stock_code = _norm(meta.get("stock_code", ""))
+                            sym_root = _norm(str(s).split("_", 1)[0])
+                            if (
+                                (meta_stock_code and (meta_stock_code in token_key or token_key in meta_stock_code))
+                                or (sym_root and (sym_root in token_key or token_key in sym_root))
+                            ):
+                                cands.append(s)
+
+                    if len(cands) > 1:
+                        product_type = str(token_data.get("product_type") or "").strip().lower()
+                        right = str(token_data.get("right") or "").strip().lower()
+                        strike = str(token_data.get("strike_price") or "").strip()
+                        expiry = str(token_data.get("expiry_date") or "").strip()
+                        try:
+                            expiry_yyyymmdd = pd.to_datetime(expiry, errors="coerce").strftime("%Y%m%d") if expiry else ""
+                        except Exception:
+                            expiry_yyyymmdd = ""
+
+                        if product_type == "options":
+                            cands = [s for s in cands if "_OPT_" in s]
+                            if right in ("call", "put"):
+                                suffix = "_CALL_" if right == "call" else "_PUT_"
+                                cands = [s for s in cands if suffix in s]
+                            if strike:
+                                cands = [s for s in cands if s.endswith(f"_{strike}") or f"_{strike}_" in s]
+                            if expiry_yyyymmdd:
+                                cands = [s for s in cands if f"_OPT_{expiry_yyyymmdd}_" in s]
+                        elif product_type == "futures":
+                            cands = [s for s in cands if "_FUT_" in s]
+                            if expiry_yyyymmdd:
+                                cands = [s for s in cands if f"_FUT_{expiry_yyyymmdd}" in s]
+                        else:
+                            # cash/index symbols
+                            cands = [s for s in cands if ("_STK_" in s or "_IND_" in s)]
+
+                    if len(cands) == 1:
+                        self._stream_token_to_symbol[token] = cands[0]
+                        return cands[0]
+        except Exception:
+            pass
+        return None
+
+    def _map_stream_tick_to_price(self, tick: Dict[str, object]) -> Optional[Price]:
+        token = str(tick.get("symbol") or "").strip()
+        long_symbol = self._resolve_long_symbol_from_tick(token, tick)
+        if not long_symbol:
+            return None
+
+        market_feed = Price()
+        market_feed.src = "ICICIDIRECT"
+        market_feed.symbol = long_symbol
+        market_feed.exchange = str(tick.get("exchange") or "")
+        market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _f(k: str, default=float("nan")):
+            v = tick.get(k)
+            if v in [None, ""]:
+                return default
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        def _i(k: str, default=0):
+            v = tick.get(k)
+            if v in [None, ""]:
+                return default
+            try:
+                return int(float(v))
+            except Exception:
+                return default
+
+        market_feed.bid = _f("bPrice")
+        market_feed.ask = _f("sPrice")
+        market_feed.bid_volume = _i("bQty")
+        market_feed.ask_volume = _i("sQty")
+        market_feed.last = _f("last")
+        market_feed.high = _f("high")
+        market_feed.low = _f("low")
+        market_feed.prior_close = _f("close")
+        market_feed.volume = _i("ttq")
+        if isinstance(tick.get("ltt"), str) and tick.get("ltt"):
+            market_feed.timestamp = str(tick.get("ltt"))
+        return market_feed
+
+    @log_execution_time
+    @validate_inputs(
+        operation=lambda x: isinstance(x, str) and x in ["s", "u"],
+        symbols=lambda x: isinstance(x, list) and len(x) > 0,
+        exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    )
+    def start_quotes_streaming(self, operation: str, symbols: List[str], ext_callback=None, exchange="NSE") -> None:
+        if self.api is None:
+            raise BrokerConnectionError("IciciDirect not connected", create_error_context())
+
+        try:
+            if not self.exchange_mappings:
+                self.update_symbology(saveToFolder=False)
+
+            if ext_callback is not None:
+                self._stream_external_callback = ext_callback
+
+            def _on_tick(tick):
+                try:
+                    if not isinstance(tick, dict):
+                        return
+                    self._stream_raw_tick_count += 1
+                    # Keep only a small safe preview for debug visibility.
+                    self._stream_last_tick_preview = {k: tick.get(k) for k in list(tick.keys())[:12]}
+                    price = self._map_stream_tick_to_price(tick)
+                    if price is not None:
+                        self._stream_mapped_tick_count += 1
+                        if callable(self._stream_external_callback):
+                            self._stream_external_callback(price)
+                except Exception as callback_error:
+                    trading_logger.log_error(
+                        "Error in IciciDirect stream callback",
+                        callback_error,
+                        {"tick_preview": str(tick)[:500]},
+                    )
+
+            # Set callback before connection so first tick is not dropped.
+            self.api.on_ticks = _on_tick
+
+            if operation == "s":
+                self._stream_raw_tick_count = 0
+                self._stream_mapped_tick_count = 0
+                self._stream_last_tick_preview = {}
+                self._call_api_method("ws_connect", {})
+
+            for raw_symbol in symbols:
+                symbol = str(raw_symbol).split("?", 1)[0].strip()
+                params = self._get_quotes_params_from_long_symbol(symbol, exchange)
+                mapped_exchange = str(params.get("exchange_code") or self.map_exchange_for_api(symbol, exchange))
+                stock_code = str(params.get("stock_code") or "").strip()
+                if not stock_code:
+                    raise MarketDataError(
+                        "Unable to resolve stock_code for streaming subscription",
+                        create_error_context(symbol=symbol, exchange=exchange),
+                    )
+
+                if operation == "s":
+                    # Resolve Breeze websocket token for this instrument and cache mapping.
+                    try:
+                        exchange_token, _ = self._call_api_method(
+                            "get_stock_token_value",
+                            {
+                                "exchange_code": mapped_exchange,
+                                "stock_code": stock_code,
+                                "product_type": str(params.get("product_type") or "cash"),
+                                "expiry_date": str(params.get("expiry_date") or ""),
+                                "strike_price": str(params.get("strike_price") or ""),
+                                "right": str(params.get("right") or ""),
+                                "get_exchange_quotes": True,
+                                "get_market_depth": False,
+                            },
+                        )
+                        if exchange_token:
+                            self._stream_token_to_symbol[str(exchange_token)] = symbol
+                    except Exception:
+                        # Non-fatal: stream can still run; callback resolver has other fallbacks.
+                        pass
+
+                    sub_resp = self._call_api_method(
+                        "subscribe_feeds",
+                        {
+                            "exchange_code": mapped_exchange,
+                            "stock_code": stock_code,
+                            "get_exchange_quotes": True,
+                            "get_market_depth": False,
+                        },
+                    )
+                    if isinstance(sub_resp, str) and "Exception while subscribing to feeds" in sub_resp:
+                        raise MarketDataError(
+                            f"IciciDirect subscribe failed: {sub_resp}",
+                            create_error_context(symbol=symbol, exchange=mapped_exchange, stock_code=stock_code),
+                        )
+                    self._stream_stock_code_to_symbol[stock_code.upper()] = symbol
+                    self._stream_symbol_to_token[symbol] = stock_code
+                    self._stream_symbol_meta[symbol] = {
+                        "exchange_code": mapped_exchange,
+                        "stock_code": stock_code,
+                        "product_type": str(params.get("product_type") or "cash"),
+                        "expiry_date": str(params.get("expiry_date") or ""),
+                        "right": str(params.get("right") or ""),
+                        "strike_price": str(params.get("strike_price") or ""),
+                    }
+                    if symbol not in self.subscribed_symbols:
+                        self.subscribed_symbols.append(symbol)
+                    trading_logger.log_info(
+                        "IciciDirect subscribed to market stream",
+                        {"symbol": symbol, "exchange": mapped_exchange, "stock_code": stock_code},
+                    )
+                else:
+                    unsub_stock_code = self._stream_symbol_to_token.get(symbol, stock_code)
+                    # Best-effort token lookup for cleanup map
+                    try:
+                        exchange_token, _ = self._call_api_method(
+                            "get_stock_token_value",
+                            {
+                                "exchange_code": mapped_exchange,
+                                "stock_code": str(unsub_stock_code),
+                                "product_type": str(params.get("product_type") or "cash"),
+                                "expiry_date": str(params.get("expiry_date") or ""),
+                                "strike_price": str(params.get("strike_price") or ""),
+                                "right": str(params.get("right") or ""),
+                                "get_exchange_quotes": True,
+                                "get_market_depth": False,
+                            },
+                        )
+                        if exchange_token:
+                            self._stream_token_to_symbol.pop(str(exchange_token), None)
+                    except Exception:
+                        pass
+                    unsub_resp = self._call_api_method(
+                        "unsubscribe_feeds",
+                        {
+                            "exchange_code": mapped_exchange,
+                            "stock_code": unsub_stock_code,
+                            "get_exchange_quotes": True,
+                            "get_market_depth": False,
+                        },
+                    )
+                    if isinstance(unsub_resp, str) and "Exception while unsubscribing to feeds" in unsub_resp:
+                        raise MarketDataError(
+                            f"IciciDirect unsubscribe failed: {unsub_resp}",
+                            create_error_context(symbol=symbol, stock_code=unsub_stock_code),
+                        )
+                    self._stream_stock_code_to_symbol.pop(str(unsub_stock_code).upper(), None)
+                    self._stream_symbol_to_token.pop(symbol, None)
+                    self._stream_symbol_meta.pop(symbol, None)
+                    self.subscribed_symbols = [s for s in self.subscribed_symbols if s != symbol]
+                    trading_logger.log_info(
+                        "IciciDirect unsubscribed from market stream",
+                        {"symbol": symbol, "stock_code": unsub_stock_code},
+                    )
+        except Exception as e:
+            raise MarketDataError(
+                f"Error starting quotes streaming for IciciDirect: {str(e)}",
+                create_error_context(operation=operation, symbols=symbols, exchange=exchange, error=str(e)),
+            )
+
+    @log_execution_time
+    def stop_streaming(self) -> None:
+        if self.api is None:
+            return
+        try:
+            for token in list(self._stream_token_to_symbol.keys()):
+                try:
+                    self._call_api_method(
+                        "unsubscribe_feeds",
+                        {
+                            "stock_token": token,
+                            "get_exchange_quotes": True,
+                            "get_market_depth": False,
+                        },
+                    )
+                except Exception:
+                    pass
+            self._stream_token_to_symbol = {}
+            self._stream_symbol_to_token = {}
+            self._stream_stock_code_to_symbol = {}
+            self._stream_symbol_meta = {}
+            self.subscribed_symbols = []
+            self._call_api_method("ws_disconnect", {})
+        except Exception as e:
+            raise BrokerConnectionError(
+                f"Error stopping IciciDirect streaming: {str(e)}",
+                create_error_context(error=str(e)),
+            )
 
     @log_execution_time
     def get_historical(
@@ -1213,48 +1781,97 @@ class IciciDirect(BrokerBase):
                     ),
                 )
 
-            stock_code = self.exchange_mappings[mapped_exchange]["symbol_map"].get(order.long_symbol)
-            if not stock_code:
-                raise SymbolError(
-                    f"Symbol {order.long_symbol} not found for exchange {mapped_exchange} in IciciDirect mappings",
-                    create_error_context(
-                        long_symbol=order.long_symbol,
-                        mapped_exchange=mapped_exchange,
-                    ),
-                )
+            stock_code = self._resolve_stock_code_for_symbol(order.long_symbol, mapped_exchange)
 
             exchange_code = mapped_exchange
 
-            action = order.order_type.capitalize() if order.order_type else "Buy"
-            order_type = "limit" if not math.isnan(order.price) else "market"
-            quantity = str(order.quantity)
+            if order.paper:
+                order.exch_order_id = str(secrets.randbelow(10**15)) + "P"
+                order.broker_order_id = str(secrets.randbelow(10**8)) + "P"
+                order.orderRef = order.internal_order_id
+                order.message = "Paper Order"
+                order.status = OrderStatus.FILLED
+                order.broker = Brokers.ICICIDIRECT
+                order.additional_info = json.dumps({"paper": True, "broker": "ICICIDIRECT"})
+                self._persist_order_links(order)
+                return order
 
-            resp = self.api.place_order(
-                stock_code=stock_code,
-                exchange_code=exchange_code,
-                product="cash",
-                action=action,
-                order_type=order_type,
-                quantity=quantity,
-                price=str(order.price) if not math.isnan(order.price) else "0",
-                validity="day",
-                **kwargs,
+            order_side = str(order.order_type or "").upper().strip()
+            if order_side in ["BUY", "COVER"]:
+                action = "buy"
+            elif order_side in ["SELL", "SHORT"]:
+                action = "sell"
+            else:
+                raise ValidationError(
+                    f"Invalid order_type for IciciDirect place_order: {order.order_type}",
+                    create_error_context(order_type=order.order_type),
+                )
+
+            has_trigger = not math.isnan(order.trigger_price)
+            has_limit_price = (not math.isnan(order.price)) and float(order.price) > 0
+            if has_trigger:
+                mapped_order_type = "stoploss"
+            else:
+                mapped_order_type = "limit" if has_limit_price else "market"
+
+            symbol_params = self._get_quotes_params_from_long_symbol(order.long_symbol, order.exchange or "NSE")
+            product = symbol_params.get("product_type") or "cash"
+            payload: Dict[str, object] = {
+                "stock_code": str(stock_code),
+                "exchange_code": exchange_code,
+                "product": product,
+                "action": action,
+                "order_type": mapped_order_type,
+                "quantity": str(int(order.quantity)),
+                "price": str(order.price if has_limit_price else 0),
+                "validity": str(kwargs.get("validity", "day")).lower(),
+                "user_remark": self._sanitize_user_remark(str(kwargs.get("user_remark") or order.internal_order_id or "")),
+            }
+
+            if has_trigger:
+                payload["stoploss"] = str(order.trigger_price)
+
+            if product in ("options", "futures"):
+                payload["expiry_date"] = str(symbol_params.get("expiry_date") or kwargs.get("expiry_date") or "")
+                payload["right"] = str(symbol_params.get("right") or kwargs.get("right") or ("others" if product == "futures" else ""))
+                payload["strike_price"] = str(symbol_params.get("strike_price") or kwargs.get("strike_price") or ("0" if product == "futures" else ""))
+
+            # Allow explicitly provided kwargs only when accepted by installed SDK signature.
+            payload.update({k: v for k, v in kwargs.items() if v is not None})
+            if "product_type" in payload and "product" not in kwargs:
+                payload["product"] = payload.get("product_type") or product
+            resp = self._call_api_method("place_order", payload)
+
+            success = resp.get("Success", {}) if isinstance(resp, dict) else {}
+            success_dict = success if isinstance(success, dict) else {}
+            error = resp.get("Error") if isinstance(resp, dict) else None
+            status_code = resp.get("Status") if isinstance(resp, dict) else None
+            broker_order_id = (
+                success_dict.get("order_id")
+                or success_dict.get("order_no")
+                or success_dict.get("order_reference")
+                or success_dict.get("orderNumber")
             )
-
-            success = resp.get("Success", {})
-            broker_order_id = success.get("order_id") or success.get("order_no")
 
             order.broker_order_id = str(broker_order_id or "")
-            order.status = OrderStatus.PENDING
-
+            order.exch_order_id = str(success_dict.get("exchange_order_id") or success_dict.get("exchangeOrderID") or "")
+            order.orderRef = order.internal_order_id
+            order.status = OrderStatus.PENDING if order.broker_order_id else OrderStatus.REJECTED
+            error_message = ""
+            if error not in [None, ""]:
+                error_message = str(error)
+            elif success_dict:
+                error_message = str(success_dict.get("message") or success_dict.get("Error") or "")
+            elif isinstance(resp, dict):
+                error_message = str(resp.get("Message") or "")
+            if status_code not in [None, ""] and error_message:
+                error_message = f"[Status {status_code}] {error_message}"
+            order.message = error_message
             order.additional_info = json.dumps({"raw_response": resp})
-            update_order_status(
-                self,
-                order.internal_order_id,
-                order.broker_order_id,
-                eod=False,
-            )
 
+            if order.broker_order_id:
+                self._persist_order_links(order)
+                update_order_status(self, order.internal_order_id, order.broker_order_id, eod=False)
             return order
         except Exception as e:
             context = create_error_context(
@@ -1270,20 +1887,93 @@ class IciciDirect(BrokerBase):
             raise BrokerConnectionError("IciciDirect not connected", create_error_context())
 
         try:
-            broker_order_id = kwargs.get("broker_order_id") or kwargs.get("order_id")
+            mandatory_keys = ["broker_order_id", "new_price", "new_quantity"]
+            missing_keys = [key for key in mandatory_keys if key not in kwargs]
+            if missing_keys:
+                raise ValidationError(
+                    f"Missing mandatory keys: {', '.join(missing_keys)}",
+                    create_error_context(kwargs=kwargs, missing_keys=missing_keys),
+                )
+
+            broker_order_id = str(kwargs.get("broker_order_id") or kwargs.get("order_id") or "").strip()
             if not broker_order_id:
                 raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
 
-            payload = {k: v for k, v in kwargs.items() if v is not None}
-            if "order_id" not in payload:
-                payload["order_id"] = broker_order_id
-            resp = self.api.modify_order(**payload)
+            new_price = float(kwargs.get("new_price", kwargs.get("price", 0)) or 0)
+            new_quantity = int(float(kwargs.get("new_quantity", kwargs.get("quantity", 0)) or 0))
 
+            if new_price < 0:
+                raise ValidationError("new_price cannot be negative", create_error_context(new_price=new_price))
+            if new_quantity <= 0:
+                raise ValidationError("new_quantity must be greater than 0", create_error_context(new_quantity=new_quantity))
+
+            redis_order_data = self.redis_o.hgetall(broker_order_id)
             o = kwargs.get("order")
-            order: Order = o if isinstance(o, Order) else Order()
-            order.broker_order_id = str(broker_order_id)
-            order.status = OrderStatus.PENDING
+            order: Order = o if isinstance(o, Order) else (Order(**redis_order_data) if redis_order_data else Order())
+            order.broker_order_id = broker_order_id
+            order.broker = self.broker
+
+            if broker_order_id.upper().endswith("P"):
+                order.price = new_price
+                order.quantity = new_quantity
+                order.status = OrderStatus.FILLED
+                order.message = "Paper Order (modify simulated)"
+                order.additional_info = json.dumps({"paper": True, "operation": "modify", "request": kwargs})
+                self.redis_o.hmset(broker_order_id, {key: str(val) for key, val in order.to_dict().items()})
+                return order
+
+            current_info = self.get_order_info(broker_order_id=broker_order_id)
+            if current_info.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED]:
+                order.status = current_info.status
+                order.message = f"Order not modifiable in status {current_info.status.name}"
+                return order
+
+            exchange_code = str(kwargs.get("exchange_code") or self._resolve_exchange_code_for_order(broker_order_id))
+            mod_order_type = kwargs.get("order_type")
+            if mod_order_type is None:
+                mod_order_type = "limit" if new_price > 0 else "market"
+
+            payload: Dict[str, object] = {
+                "order_id": broker_order_id,
+                "exchange_code": exchange_code,
+                "order_type": str(mod_order_type or ""),
+                "stoploss": kwargs.get("stoploss", ""),
+                "quantity": str(new_quantity),
+                "price": str(new_price),
+                "validity": kwargs.get("validity", ""),
+                "disclosed_quantity": kwargs.get("disclosed_quantity", ""),
+                "validity_date": kwargs.get("validity_date", ""),
+            }
+            resp = self._call_api_method("modify_order", payload)
+
+            success = resp.get("Success", {}) if isinstance(resp, dict) else {}
+            success_dict = success if isinstance(success, dict) else {}
+            error = resp.get("Error") if isinstance(resp, dict) else None
+            status_code = resp.get("Status") if isinstance(resp, dict) else None
+
+            order.price = new_price
+            order.quantity = new_quantity
+            order.status = OrderStatus.PENDING if error in [None, ""] else OrderStatus.REJECTED
+            error_message = ""
+            if error not in [None, ""]:
+                error_message = str(error)
+            elif success_dict:
+                error_message = str(success_dict.get("message") or success_dict.get("Error") or "")
+            elif isinstance(resp, dict):
+                error_message = str(resp.get("Message") or "")
+            if status_code not in [None, ""] and error_message:
+                error_message = f"[Status {status_code}] {error_message}"
+            order.message = error_message
             order.additional_info = json.dumps({"raw_response": resp})
+
+            self.redis_o.hmset(broker_order_id, {key: str(val) for key, val in order.to_dict().items()})
+            if order.internal_order_id:
+                refreshed = update_order_status(self, order.internal_order_id, broker_order_id, eod=False)
+                if refreshed is not None:
+                    order.status = refreshed.status
+                    order.exch_order_id = refreshed.exchange_order_id
+                    if float(refreshed.fill_price or 0) > 0:
+                        order.price = float(refreshed.fill_price)
             return order
         except (ValidationError, BrokerConnectionError):
             raise
@@ -1299,11 +1989,28 @@ class IciciDirect(BrokerBase):
             if not broker_order_id:
                 raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
 
-            resp = self.api.cancel_order(order_id=str(broker_order_id), **{k: v for k, v in kwargs.items() if k not in ["order_id", "broker_order_id"]})
+            broker_order_id = str(broker_order_id)
             o = kwargs.get("order")
             order: Order = o if isinstance(o, Order) else Order()
-            order.broker_order_id = str(broker_order_id)
+            order.broker = self.broker
+
+            if broker_order_id.endswith("P"):
+                order.broker_order_id = broker_order_id
+                order.status = OrderStatus.CANCELLED
+                order.message = "Paper Order (cancel simulated)"
+                order.additional_info = json.dumps({"paper": True, "operation": "cancel", "request": kwargs})
+                return order
+
+            exchange_code = str(kwargs.get("exchange_code") or self._resolve_exchange_code_for_order(broker_order_id))
+            payload = {
+                "exchange_code": exchange_code,
+                "order_id": broker_order_id,
+            }
+            resp = self._call_api_method("cancel_order", payload)
+
+            order.broker_order_id = broker_order_id
             order.status = OrderStatus.CANCELLED
+            order.message = str(resp.get("Error") if isinstance(resp, dict) else "")
             order.additional_info = json.dumps({"raw_response": resp})
             return order
         except (ValidationError, BrokerConnectionError):
@@ -1320,23 +2027,59 @@ class IciciDirect(BrokerBase):
             if not order_id:
                 raise ValidationError("broker_order_id/order_id is required", create_error_context(kwargs=kwargs))
 
+            # Paper orders are simulated locally and do not exist in broker order book APIs.
+            if order_id.upper().endswith("P"):
+                redis_rec = self.redis_o.hgetall(order_id) if hasattr(self, "redis_o") else {}
+                q = int(float(redis_rec.get("quantity", 0) or 0))
+                p = float(redis_rec.get("price", 0) or 0)
+                return OrderInfo(
+                    order_size=q,
+                    order_price=p,
+                    fill_size=q,
+                    fill_price=p,
+                    status=OrderStatus.FILLED,
+                    broker_order_id=order_id,
+                    exchange_order_id=str(redis_rec.get("exch_order_id", order_id)),
+                    broker=self.broker,
+                )
+
             book = self.get_orders_today()
+            if book.empty:
+                raise OrderError(f"Order book is empty while searching for {order_id}", create_error_context(order_id=order_id))
+            if "order_id" not in book.columns:
+                raise OrderError(
+                    f"order_id column missing in order book while searching for {order_id}",
+                    create_error_context(order_id=order_id, columns=list(book.columns)),
+                )
+
             row = book[book["order_id"].astype(str) == order_id]
             if row.empty:
                 raise OrderError(f"Order {order_id} not found in order book", create_error_context(order_id=order_id))
 
             rec = row.iloc[-1]
-            status_raw = str(rec.get("status", "UNDEFINED")).upper()
-            status = OrderStatus[status_raw] if status_raw in OrderStatus.__members__ else OrderStatus.UNDEFINED
+
+            order_size = int(float(rec.get("quantity", rec.get("order_qty", 0)) or 0))
+            fill_size = int(
+                float(
+                    rec.get("filled_quantity", rec.get("executed_quantity", rec.get("filled_qty", 0))) or 0
+                )
+            )
+            order_price = float(rec.get("price", rec.get("order_price", float("nan"))))
+            fill_price = float(rec.get("average_price", rec.get("fill_price", 0)) or 0)
+            exchange_order_id = str(
+                rec.get("exchange_order_id", rec.get("exchangeOrderID", rec.get("exch_order_id", "")))
+            )
+            status_raw = str(rec.get("status", rec.get("order_status", "")))
+            status = self._normalize_order_status(status_raw, fill_size, order_size, exchange_order_id)
 
             return OrderInfo(
-                order_size=int(float(rec.get("quantity", 0) or 0)),
-                order_price=float(rec.get("price", float("nan"))),
-                fill_size=int(float(rec.get("filled_quantity", 0) or 0)),
-                fill_price=float(rec.get("average_price", 0) or 0),
+                order_size=order_size,
+                order_price=order_price,
+                fill_size=fill_size,
+                fill_price=fill_price,
                 status=status,
                 broker_order_id=order_id,
-                exchange_order_id=str(rec.get("exchange_order_id", "")),
+                exchange_order_id=exchange_order_id,
                 broker=self.broker,
             )
         except (ValidationError, BrokerConnectionError, OrderError):
@@ -1368,12 +2111,28 @@ class IciciDirect(BrokerBase):
             raise BrokerConnectionError("IciciDirect not connected", create_error_context())
 
         try:
-            resp = self.api.get_order_list(**kwargs)
-            rows = resp.get("Success") if isinstance(resp, dict) else None
-            df = pd.DataFrame(rows or [])
+            from_date, to_date = self._today_window_utc()
+            req_from = kwargs.get("from_date", from_date)
+            req_to = kwargs.get("to_date", to_date)
+            exchange_codes = [str(kwargs["exchange_code"]).upper()] if kwargs.get("exchange_code") else ["NSE", "BSE", "NFO", "BFO"]
+            frames: list[pd.DataFrame] = []
+
+            for exchange_code in exchange_codes:
+                resp = self._call_api_method(
+                    "get_order_list",
+                    {
+                        "exchange_code": exchange_code,
+                        "from_date": req_from,
+                        "to_date": req_to,
+                    },
+                )
+                rows = resp.get("Success") if isinstance(resp, dict) else None
+                if isinstance(rows, list) and rows:
+                    frames.append(pd.DataFrame(rows))
+
+            df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             # normalize core columns used by get_order_info
             rename_map = {
-                "order_id": "order_id",
                 "order_no": "order_id",
                 "status": "status",
                 "quantity": "quantity",
@@ -1395,9 +2154,26 @@ class IciciDirect(BrokerBase):
             raise BrokerConnectionError("IciciDirect not connected", create_error_context())
 
         try:
-            resp = self.api.get_trade_list(**kwargs)
-            rows = resp.get("Success") if isinstance(resp, dict) else None
-            return pd.DataFrame(rows or [])
+            from_date, to_date = self._today_window_utc()
+            req_from = kwargs.get("from_date", from_date)
+            req_to = kwargs.get("to_date", to_date)
+            exchange_codes = [str(kwargs["exchange_code"]).upper()] if kwargs.get("exchange_code") else ["NSE", "BSE", "NFO", "BFO"]
+
+            frames: list[pd.DataFrame] = []
+            for exchange_code in exchange_codes:
+                payload: Dict[str, object] = {
+                    "from_date": req_from,
+                    "to_date": req_to,
+                    "exchange_code": exchange_code,
+                    "product_type": kwargs.get("product_type", ""),
+                    "action": kwargs.get("action", ""),
+                    "stock_code": kwargs.get("stock_code", ""),
+                }
+                resp = self._call_api_method("get_trade_list", payload)
+                rows = resp.get("Success") if isinstance(resp, dict) else None
+                if isinstance(rows, list) and rows:
+                    frames.append(pd.DataFrame(rows))
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         except Exception as e:
             raise MarketDataError(f"Error fetching IciciDirect trades: {str(e)}", create_error_context(error=str(e), kwargs=kwargs))
 

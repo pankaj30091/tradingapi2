@@ -99,9 +99,15 @@ def save_symbol_data(saveToFolder: bool = True):
             return lst[0]
 
     bhavcopyfolder = config.get("bhavcopy_folder")
+    _proxies = None
+    try:
+        from .proxy_utils import get_proxies_for_broker
+        _proxies = get_proxies_for_broker("FLATTRADE")
+    except Exception:
+        pass
     url = "https://api.shoonya.com/NSE_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_flattradecodes_nse_cash.zip"
-    response = requests.get(url, allow_redirects=True, timeout=10)
+    response = requests.get(url, allow_redirects=True, timeout=10, proxies=_proxies or {})
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -155,7 +161,7 @@ def save_symbol_data(saveToFolder: bool = True):
 
     url = "https://api.shoonya.com/BSE_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_flattradecodes_bse_cash.zip"
-    response = requests.get(url, allow_redirects=True, timeout=10)
+    response = requests.get(url, allow_redirects=True, timeout=10, proxies=_proxies or {})
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -221,7 +227,7 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes_bse_cash = pd.concat([codes_bse_cash, sensex_row])
     url = "https://api.shoonya.com/NFO_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_flattradecodes_fno.zip"
-    response = requests.get(url, allow_redirects=True, timeout=10)
+    response = requests.get(url, allow_redirects=True, timeout=10, proxies=_proxies or {})
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -268,7 +274,7 @@ def save_symbol_data(saveToFolder: bool = True):
 
     url = "https://api.shoonya.com/BFO_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_flattradecodes_bse_fno.zip"
-    response = requests.get(url, allow_redirects=True, timeout=10)
+    response = requests.get(url, allow_redirects=True, timeout=10, proxies=_proxies or {})
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
@@ -423,6 +429,13 @@ class FlatTrade(BrokerBase):
         normalized = _normalize_as_of_date(as_of_date)
         if normalized is not None:
             tradingapi_globals.TRADINGAPI_NOW = normalized
+
+        previous_proxy_env = None
+        try:
+            from .proxy_utils import set_proxy_env_for_broker, restore_proxy_env
+            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+        except Exception:
+            pass
 
         def extract_credentials():
             """Extract credentials from config with validation."""
@@ -796,6 +809,12 @@ class FlatTrade(BrokerBase):
         except Exception as e:
             context = create_error_context(redis_db=redis_db, broker_name=self.broker.name, error=str(e))
             raise BrokerConnectionError(f"Unexpected error connecting to FlatTrade: {str(e)}", context)
+        finally:
+            try:
+                from .proxy_utils import restore_proxy_env
+                restore_proxy_env(previous_proxy_env)
+            except Exception:
+                pass
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
