@@ -93,9 +93,12 @@ def save_symbol_data(saveToFolder: bool = False):
             _proxies = get_proxies_for_broker("FIVEPAISA")
         except Exception:
             pass
-        response = requests.get(
-            url, allow_redirects=True, timeout=100, proxies=_proxies or {}
-        )  # Add timeout to `requests.get` to fix Bandit issue
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+        }
+
+        response = requests.get(url, headers=headers, allow_redirects=True, proxies=_proxies or {}, timeout=(10,300))  # Add timeout to `requests.get` to fix Bandit issue
 
         if response.status_code != 200:
             raise Exception(f"Failed to fetch symbol data. Status code: {response.status_code}")

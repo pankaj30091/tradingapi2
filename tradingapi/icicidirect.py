@@ -133,7 +133,11 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
         pass
     _prev_ipv6 = _temporarily_force_ipv4()
     try:
-        response = requests.get(url, allow_redirects=True, timeout=60, proxies=_proxies or {})
+        headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        }
+        response = requests.get(url, headers=headers,allow_redirects=True, timeout=60, proxies=_proxies or {})
     finally:
         _restore_ipv6(_prev_ipv6)
     try:
@@ -1145,7 +1149,7 @@ class IciciDirect(BrokerBase):
             resp: object = {}
             for attempt in range(2):
                 try:
-                    resp = self._call_api_method("get_quotes", quote_payload)
+                    resp = self._call_api_method("get_quotes", cast(Dict[str, object], quote_payload))
                     break
                 except Exception as quote_error:
                     last_quote_error = quote_error
@@ -1320,7 +1324,8 @@ class IciciDirect(BrokerBase):
                         strike = str(token_data.get("strike_price") or "").strip()
                         expiry = str(token_data.get("expiry_date") or "").strip()
                         try:
-                            expiry_yyyymmdd = pd.to_datetime(expiry, errors="coerce").strftime("%Y%m%d") if expiry else ""
+                            dt_val = pd.to_datetime(expiry, errors="coerce")
+                            expiry_yyyymmdd = dt_val.strftime("%Y%m%d") if (expiry and pd.notna(dt_val)) else ""
                         except Exception:
                             expiry_yyyymmdd = ""
 
@@ -1365,7 +1370,7 @@ class IciciDirect(BrokerBase):
             if v in [None, ""]:
                 return default
             try:
-                return float(v)
+                return float(cast(Union[int, float, str], v))
             except Exception:
                 return default
 
@@ -1374,7 +1379,7 @@ class IciciDirect(BrokerBase):
             if v in [None, ""]:
                 return default
             try:
-                return int(float(v))
+                return int(float(cast(Union[int, float, str], v)))
             except Exception:
                 return default
 
@@ -1428,7 +1433,7 @@ class IciciDirect(BrokerBase):
                     )
 
             # Set callback before connection so first tick is not dropped.
-            self.api.on_ticks = _on_tick
+            self.api.on_ticks = _on_tick  # type: ignore[assignment]
 
             if operation == "s":
                 self._stream_raw_tick_count = 0
@@ -2006,7 +2011,7 @@ class IciciDirect(BrokerBase):
                 "exchange_code": exchange_code,
                 "order_id": broker_order_id,
             }
-            resp = self._call_api_method("cancel_order", payload)
+            resp = self._call_api_method("cancel_order", cast(Dict[str, object], payload))
 
             order.broker_order_id = broker_order_id
             order.status = OrderStatus.CANCELLED

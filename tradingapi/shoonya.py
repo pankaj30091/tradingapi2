@@ -102,7 +102,11 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
         pass
     url = "https://api.shoonya.com/NSE_symbols.txt.zip"
     dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_shoonyacodes_nse_cash.zip"
-    response = requests.get(url, allow_redirects=True, timeout=10, proxies=_proxies or {})
+    headers = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "*/*",
+    }
+    response = requests.get(url, headers=headers, allow_redirects=True, proxies=_proxies or {}, timeout=(10,300))  # Add timeout to `requests.get` to fix Bandit issue
     if response.status_code == 200:
         with open(dest_file, "wb") as f:
             f.write(response.content)
