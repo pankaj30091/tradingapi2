@@ -7,34 +7,32 @@ This module provides:
 - Attribution (spot, vol, timedecay, spread) per trade
 - Real-time spot/IV fetching with caching; use calculate_attribution_for_trade(row, broker=...) for live use
 
-Fast path for batch: pass spot_prices= and leg_prices= (dict or callable) when already available to avoid
-broker/Redis lookups; or use calculate_attribution_for_trades(rows, broker, ...) with shared historical_cache.
+Fast path for batch: pass underlying_prices= and leg_prices= (dicts) when already available to avoid
+broker/Redis lookups.
 
-Self-sufficient: defines get_historical_close_price here; uses tradingapi.utils (get_price, get_mid_price,
-parse_combo_symbol, historical_to_dataframes, parse_datetime) and broker.get_historical for intraday spot;
+Self-sufficient: defines get_historical_close_price here; uses tradingapi.utils (get_price_at_time,
+parse_combo_symbol, parse_datetime) and broker.get_historical for intraday price;
 chameli for IV and performance_attribution (options).
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import fcntl
 import os
-import threading
-import time as _time
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import pandas as pd
 
 from . import trading_logger
 from .broker_base import BrokerBase
 from .utils import (
-    get_mid_price,
+    get_price_at_time,
+    get_future_underlying_price,
     get_option_underlying_price,
-    get_price,
-    historical_to_dataframes,
+    get_historical_call_count,
+    get_price_cache,
     parse_combo_symbol,
-    _get_historical_close_at_time,
+    set_price_cache,
 )
 from chameli.dateutils import (
     advance_by_biz_days,
@@ -45,72 +43,25 @@ from chameli.dateutils import (
 )
 from chameli.europeanoptions import _parse_combo_symbol, calc_greeks, performance_attribution
 
-# Optional ohlcutils for get_historical_close_price (local data first)
-try:
-    from ohlcutils.data import load_symbol
-    from ohlcutils.enums import Periodicity
-
-    _OHLCUTILS_AVAILABLE = True
-except ImportError:
-    _OHLCUTILS_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
-# Historical close price: broker cache (Shoonya -> FivePaisa) and price cache
+# Historical close price: broker cache (Shoonya -> FivePaisa)
 # ---------------------------------------------------------------------------
 _historical_broker_cache: Dict[str, object] = {}
 _HISTORICAL_BROKER_REDIS_DB = 0
-_historical_close_price_cache: Dict[Tuple[str, str], Optional[float]] = {}
-_GET_HISTORICAL_CALL_LOG_FILE = os.path.join(
-    os.path.expanduser("~/logs"),
-    "get_historical_calls.log",
-)
-_get_historical_call_count = 0
-_get_historical_call_lock = threading.Lock()
+# ---------------------------------------------------------------------------
+# Unified IV cache: (symbol, time_key) -> iv. Price cache lives in utils.
+# ---------------------------------------------------------------------------
+_iv_cache: Dict[Tuple[str, str], float] = {}  # (symbol, time_key) -> iv
 
 
-def _log_get_historical_call(
-    broker: object,
-    symbols: str,
-    date_start: str,
-    date_end: str,
-    periodicity: str,
-) -> None:
-    """Log get_historical call details and keep a process-level call counter."""
-    global _get_historical_call_count
-    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    broker_name = type(broker).__name__ if broker is not None else "None"
-    with _get_historical_call_lock:
-        try:
-            os.makedirs(os.path.dirname(_GET_HISTORICAL_CALL_LOG_FILE), exist_ok=True)
-            with open(_GET_HISTORICAL_CALL_LOG_FILE, "a+", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                f.seek(0)
-                lines = f.readlines()
-                if lines:
-                    last = lines[-1].strip().split(",", 1)[0]
-                    try:
-                        count = int(last) + 1
-                    except (TypeError, ValueError):
-                        count = 1
-                else:
-                    count = 1
-                _get_historical_call_count = count
-                line = f"{count},{ts},{broker_name},{symbols},{date_start},{date_end},{periodicity}\n"
-                f.write(line)
-                f.flush()
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except Exception as e:
-            trading_logger.log_debug(f"Failed to log get_historical call: {e}")
+def _is_missing_number(value: Any) -> bool:
+    return value is None or (isinstance(value, float) and value != value)
 
 
-def get_historical_call_count() -> int:
-    with _get_historical_call_lock:
-        return _get_historical_call_count
-
-
-def clear_historical_close_price_cache() -> None:
-    """Clear the module-level historical close price cache (e.g. for tests or explicit teardown)."""
-    _historical_close_price_cache.clear()
+def _set_iv_cache(symbol: str, time_key: str, value: Optional[float]) -> None:
+    if _is_missing_number(value):
+        return
+    _iv_cache[(symbol, time_key)] = float(cast(float, value))
 
 
 def _get_historical_broker(broker: object) -> object:
@@ -146,13 +97,13 @@ def get_historical_close_price(
     date_str: Union[str, dt.datetime, dt.date, pd.Timestamp],
     exchange: str,
     *,
-    refresh_mapping: bool = True,
+    refresh_mapping: bool = False,
 ) -> Optional[float]:
     """
-    Get historical close price for a symbol on a specific date.
-    Uses an internal cache. First tries ohlcutils (local data) if available, then broker API.
-    If broker is Shoonya, FivePaisa is used for the API fallback (db=0, cached).
-    Supports combo symbols (SYMBOL1?QTY1:SYMBOL2?QTY2:...); decomposes and combines weighted by quantity.
+    Get historical close price for a symbol on a specific date (EOD close, 15:29 bar).
+    Delegates to utils.get_price_at_time(..., as_of=eod_datetime) for single symbols;
+    combo symbols are decomposed and combined weighted by quantity. If broker is Shoonya,
+    FivePaisa is used for the API fallback (db=0, cached).
 
     refresh_mapping: If True, broker loads symbol mapping from date's symbols CSV (default).
     Set False for batch/repeated (symbol, date) calls to avoid repeated mapping refresh.
@@ -172,11 +123,6 @@ def get_historical_close_price(
         date_str = str(date_str)
 
     date_key: str = date_str if isinstance(date_str, str) else str(date_str)
-    cache_key: Tuple[str, str] = (symbol, date_key)
-    if cache_key in _historical_close_price_cache:
-        trading_logger.log_debug(f"Using cached price for {symbol} on {date_key}")
-        return _historical_close_price_cache[cache_key]
-
     if ":" in symbol:
         try:
             legs = parse_combo_symbol(symbol)
@@ -187,98 +133,21 @@ def get_historical_close_price(
                 )
                 if leg_price is None:
                     trading_logger.log_warning(f"Could not get price for combo leg {leg_symbol} on {date_key}")
-                    _historical_close_price_cache[cache_key] = None
                     return None
                 combo_price += leg_price * quantity
-            _historical_close_price_cache[cache_key] = combo_price
             return combo_price
         except Exception as e:
             trading_logger.log_warning(f"Error parsing combo symbol {symbol} on {date_key}: {e}")
-            _historical_close_price_cache[cache_key] = None
             return None
 
-    if _OHLCUTILS_AVAILABLE:
-        try:
-            date_obj = parse_datetime(date_key).date()
-            date_str_formatted = date_obj.strftime("%Y-%m-%d")
-            market_close_time = dt.datetime.combine(date_obj, dt.time(15, 30, 0))
-            df = load_symbol(
-                symbol,
-                start_time=date_str_formatted,
-                end_time=date_str_formatted + " 23:59:59",
-                src=Periodicity.PERMIN,
-                exchange=exchange,
-                market_close_time="15:30:00",
-            )
-            if df is not None and not df.empty:
-                import pytz
-
-                tz = pytz.timezone("Asia/Kolkata")
-                market_close_time_tz = (
-                    tz.localize(market_close_time) if market_close_time.tzinfo is None else market_close_time
-                )
-                if df.index.tz is None:  # type: ignore[union-attr]
-                    df_index_tz = df.index.tz_localize(tz)  # type: ignore[union-attr]
-                else:
-                    df_index_tz = df.index
-                filtered_df = df[df_index_tz <= market_close_time_tz]
-                if not filtered_df.empty:
-                    if "close" in filtered_df.columns:
-                        close_price = float(filtered_df["close"].iloc[-1])
-                        _historical_close_price_cache[cache_key] = close_price
-                        return close_price
-                    if "asettle" in filtered_df.columns:
-                        close_price = float(filtered_df["asettle"].iloc[-1])
-                        _historical_close_price_cache[cache_key] = close_price
-                        return close_price
-        except Exception as e:
-            trading_logger.log_debug(f"ohlcutils load failed for {symbol} on {date_key}: {e}")
-
     hist_broker = _get_historical_broker(broker)
-    try:
-        date_obj = dt.datetime.strptime(date_key, "%Y%m%d").date()
-        date_str_formatted = date_obj.strftime("%Y-%m-%d")
-        _log_get_historical_call(
-            hist_broker,
-            symbol,
-            date_str_formatted,
-            date_str_formatted,
-            "1m",
-        )
-        hist_data = hist_broker.get_historical(  # type: ignore[union-attr]
-            symbols=symbol,
-            date_start=date_str_formatted,
-            date_end=date_str_formatted,
-            exchange=exchange,
-            periodicity="1m",
-            market_close_time="15:30:00",
-            refresh_mapping=refresh_mapping,
-        )
-        dfs = historical_to_dataframes(hist_data)
-        if dfs and not dfs[0].empty:
-            df = dfs[0]
-            if "close" in df.columns:
-                close_price = float(df["close"].iloc[-1])
-                _historical_close_price_cache[cache_key] = close_price
-                return close_price
-        _historical_close_price_cache[cache_key] = None
+    eod_dt = dt.datetime.strptime(date_key + " 15:29:00", "%Y%m%d %H:%M:%S")
+    result = get_price_at_time(
+        cast(BrokerBase, hist_broker), symbol, exchange, as_of=eod_dt, mds="mds", refresh_mapping=False
+    )
+    if result is None:
         return None
-    except Exception as e:
-        trading_logger.log_warning(f"Error getting historical price for {symbol} on {date_key}: {e}")
-        _historical_close_price_cache[cache_key] = None
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Real-time caches (spot and IV) – used by get_current_spot_price,
-# get_spot_price_at_time, get_iv_for_symbol_cached
-# ---------------------------------------------------------------------------
-_price_cache: Dict[Tuple[str, str, str], Tuple[float, float]] = {}  # (symbol, exchange, time_key) -> (price, ts)
-_iv_cache: Dict[Tuple[str, float, float, str, str], Tuple[float, float]] = (
-    {}
-)  # (symbol, price, spot, time_key, exch) -> (iv, ts)
-_CACHE_TTL_SECONDS = 60
-_IV_CACHE_TTL_SECONDS = 30
+    return float(result)
 
 
 # ============================================================================
@@ -361,7 +230,7 @@ def get_greeks_at_time(
     For a trade row (combo or single leg), compute greeks at current_time for each option leg.
     Option price: if leg_prices is provided and has a valid price for the leg, use it (e.g. entry
     price or current mark); otherwise uses broker 1m OHLC close at current_time via
-    _get_historical_close_at_time. Underlying is always from broker/API at current_time.
+    get_price_at_time. Underlying is always from broker/API at current_time.
     Returns dict: leg_symbol -> {delta, gamma, theta, vega, vol} or {error: str} on failure.
     """
     if greeks_list is None:
@@ -387,12 +256,10 @@ def get_greeks_at_time(
                 if p is not None and (not isinstance(p, float) or not (p != p)):
                     opt_price = float(p)
             if opt_price is None:
-                opt_price = _get_historical_close_at_time(
-                    cast(BrokerBase, broker), leg_symbol, exchange, current_time
+                opt_price = get_price_at_time(
+                    cast(BrokerBase, broker), leg_symbol, exchange, as_of=current_time, mds="mds"
                 )
-            if opt_price is None or (
-                isinstance(opt_price, float) and (opt_price != opt_price)
-            ):
+            if opt_price is None:
                 continue
             underlying = get_option_underlying_price(
                 [cast(BrokerBase, broker)],
@@ -402,9 +269,7 @@ def get_greeks_at_time(
                 exchange=exchange,
                 as_of=current_time,
             )
-            if underlying is None or (
-                isinstance(underlying, float) and (underlying != underlying)
-            ):
+            if underlying is None:
                 continue
             g = calc_greeks(
                 long_symbol=leg_symbol,
@@ -480,145 +345,121 @@ def get_iv_for_symbol(
 
 
 # ============================================================================
-# Real-time spot / IV fetching (with caching) – for live attribution
+# Underlying/leg price input normalization
 # ============================================================================
 
 
-def get_current_spot_price(broker, underlying_symbol: str, exchange: str) -> Optional[float]:
-    """Get current spot price for underlying (real-time) with caching."""
-    now_ts = _time.time()
-    time_key = "current"
-    cache_key = (underlying_symbol, exchange, time_key)
-    if cache_key in _price_cache:
-        cached_price, cache_ts = _price_cache[cache_key]
-        if now_ts - cache_ts < _CACHE_TTL_SECONDS:
-            return cached_price
-        del _price_cache[cache_key]
-    try:
-        quote = get_price([broker], underlying_symbol, exchange=exchange, mds=None, attempts=1)
-        if quote and hasattr(quote, "last") and not pd.isna(quote.last):
-            if hasattr(quote, "bid") and hasattr(quote, "ask"):
-                if not pd.isna(quote.bid) and not pd.isna(quote.ask):
-                    price = (quote.bid + quote.ask) / 2
-                    _price_cache[cache_key] = (price, now_ts)
-                    return price
-            price = quote.last
-            _price_cache[cache_key] = (price, now_ts)
-            return price
-    except Exception:
-        pass
+_UnderlyingPricesArg = Optional[Dict[Tuple[str, Union[dt.datetime, dt.date]], float]]
+_LegPricesArg = Optional[Dict[str, Dict[str, float]]]
+
+
+def _lookup_underlying_price_from_map(
+    underlying_prices: _UnderlyingPricesArg, symbol: str, time: dt.datetime
+) -> Optional[float]:
+    if underlying_prices is None:
+        return None
+    key_exact = (symbol, time)
+    if key_exact in underlying_prices:
+        return float(underlying_prices[key_exact])
+    key_date = (symbol, time.date())
+    if key_date in underlying_prices:
+        return float(underlying_prices[key_date])
     return None
 
 
-def get_spot_price_at_time(broker, underlying_symbol: str, exchange: str, at_time: dt.datetime) -> Optional[float]:
-    """
-    Get spot price at a specific time (for real-time attribution) with caching.
-    If at_time is within _CACHE_TTL_SECONDS of now, returns current spot. Otherwise
-    tries broker.get_historical(1m) and closest bar close, then current spot as fallback.
-    """
-    now_ts = _time.time()
-    today = dt.date.today()
-    time_date = at_time.date() if hasattr(at_time, "date") else pd.to_datetime(at_time).date()
-    now = dt.datetime.now()
-    time_rounded = at_time.replace(second=0, microsecond=0)
-    time_key = time_rounded.strftime("%Y%m%d_%H%M")
-    cache_key = (underlying_symbol, exchange, time_key)
-    if cache_key in _price_cache:
-        cached_price, cache_ts = _price_cache[cache_key]
-        # Past times: keep indefinitely. Current/near-now: apply TTL.
-        if at_time < now - dt.timedelta(seconds=_CACHE_TTL_SECONDS):
-            return cached_price
-        if now_ts - cache_ts < _CACHE_TTL_SECONDS:
-            return cached_price
-        del _price_cache[cache_key]
+def _get_underlying_price(
+    symbol: str,
+    exchange: str,
+    time: Optional[dt.datetime],
+    *,
+    underlying_prices: _UnderlyingPricesArg,
+    broker: Optional[object],
+) -> Optional[float]:
+    if time is not None:
+        from_map = _lookup_underlying_price_from_map(underlying_prices, symbol, time)
+        if from_map is not None:
+            return from_map
+    if broker is None:
+        return None
 
-    now_minus_ttl = now - dt.timedelta(seconds=_CACHE_TTL_SECONDS)
-    within_ttl = now_minus_ttl <= at_time <= now
-    if not within_ttl:
+    broker_t = cast(BrokerBase, broker)
+
+    if is_options_symbol(symbol):
+        parts = symbol.split("_")
+        if len(parts) < 3:
+            trading_logger.log_error(f"Malformed option symbol for underlying lookup: {symbol}")
+            return None
+
         try:
-            date_str = at_time.strftime("%Y-%m-%d")
-            _log_get_historical_call(
-                broker,
-                underlying_symbol,
-                date_str,
-                date_str,
-                "1m",
-            )
-            hist = broker.get_historical(
-                symbols=underlying_symbol,
-                date_start=date_str,
-                date_end=date_str,
+            opt_root = parts[0]
+            opt_expiry = parts[2]
+            fut_expiry = _get_month_end_fut_expiry(opt_expiry, exchange)
+            underlying_fut_symbol = f"{opt_root}_FUT_{fut_expiry}___"
+            time_key: Optional[str] = None
+            if time is not None:
+                time_key = time.replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
+                cached = get_price_cache(underlying_fut_symbol, time_key)
+                if cached is not None:
+                    return float(cached)
+
+            underlying_price = get_option_underlying_price(
+                [broker_t],
+                symbol,
+                opt_expiry,
+                fut_expiry=fut_expiry,
                 exchange=exchange,
-                periodicity="1m",
-                market_close_time="15:30:00",
-                refresh_mapping=False,
+                as_of=time,
             )
-            if underlying_symbol.startswith("NIFTY_"):
-                keys_to_replace = [k for k in hist if k.startswith("NSENIFTY_")]
-                for old_key in keys_to_replace:
-                    new_key = old_key.replace("NSENIFTY_", "NIFTY_", 1)
-                    hist[new_key] = hist.pop(old_key)
-            data = hist.get(underlying_symbol, [])
-            if data:
-                data = sorted(data, key=lambda x: x.date)
-                target_naive = at_time.replace(tzinfo=None) if at_time.tzinfo else at_time
-                candidates = []
-                for x in data:
-                    x_naive = x.date
-                    if hasattr(x_naive, "tzinfo") and x_naive.tzinfo is not None:
-                        x_naive = x_naive.replace(tzinfo=None)  # type: ignore[union-attr]
-                    if x_naive <= target_naive:
-                        candidates.append((x_naive, x))
-                if candidates:
-                    price = candidates[-1][1].close
-                    _price_cache[cache_key] = (price, now_ts)
-                    return price
-                if data:
-                    price = data[0].close
-                    _price_cache[cache_key] = (price, now_ts)
-                    return price
+            if underlying_price is None:
+                return None
+
+            if time_key is not None:
+                set_price_cache(underlying_fut_symbol, time_key, underlying_price)
+            return float(underlying_price)
         except Exception:
             pass
-    return get_current_spot_price(broker, underlying_symbol, exchange)
+        underlying_symbol = get_underlying_symbol(symbol)
+        return get_price_at_time(broker_t, underlying_symbol, exchange, as_of=time, mds="mds")
+
+    if is_futures_symbol(symbol):
+        return get_future_underlying_price(broker_t, symbol, exchange, as_of=time)
+
+    return get_price_at_time(broker_t, symbol, exchange, as_of=time, mds="mds")
+
+
+def _lookup_leg_price_from_map(
+    leg_prices: _LegPricesArg, leg_symbol: str, price_type: str
+) -> Optional[float]:
+    if leg_prices is None:
+        return None
+    row_prices = leg_prices.get(leg_symbol)
+    if row_prices is None:
+        return None
+    value = row_prices.get(price_type)
+    if value is None:
+        return None
+    return float(value)
 
 
 def get_iv_for_symbol_cached(
     symbol: str, price: float, spot: float, at_time: dt.datetime, exchange: str
 ) -> Optional[float]:
-    """Get implied volatility for an options symbol with caching (real-time). Past times cached indefinitely."""
-    now_ts = _time.time()
-    now = dt.datetime.now()
-    time_rounded = at_time.replace(second=0, microsecond=0)
-    time_key = time_rounded.strftime("%Y%m%d_%H%M")
-    price_rounded = round(price, 2)
-    spot_rounded = round(spot, 2)
-    cache_key = (symbol, price_rounded, spot_rounded, time_key, exchange)
+    """
+    Get implied volatility for an options symbol with caching.
+    Keyed by (symbol, time_key) — same structure as utils price cache.
+    No TTL, no eviction — cache is process-scoped and starts fresh on each
+    tradingapi instance. IV is treated as immutable for a given symbol+minute
+    since in practice each (symbol, time_key) maps to exactly one (price, spot)
+    pair per attribution run.
+    """
+    time_key = at_time.replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
+    cache_key = (symbol, time_key)
     if cache_key in _iv_cache:
-        cached_iv, cache_ts = _iv_cache[cache_key]
-        if at_time < now - dt.timedelta(seconds=60):
-            return cached_iv
-        if now_ts - cache_ts < _IV_CACHE_TTL_SECONDS:
-            return cached_iv
-        del _iv_cache[cache_key]
+        return _iv_cache[cache_key]
     iv = get_iv_for_symbol(symbol, price, spot, at_time, exchange)
     if iv is not None:
-        _iv_cache[cache_key] = (iv, now_ts)
+        _set_iv_cache(symbol, time_key, iv)
     return iv
-
-
-# Type aliases for spot_prices / leg_prices: callable or dict
-_SpotLookup = Callable[[str, str, dt.datetime], Optional[float]]
-_LegLookup = Callable[[str, str], Optional[float]]
-_SpotPricesArg = Union[
-    None,
-    _SpotLookup,
-    Dict[Tuple[str, str, Union[dt.datetime, dt.date]], float],
-]
-_LegPricesArg = Union[
-    None,
-    _LegLookup,
-    Dict[str, Union[Dict[str, float], Tuple[float, float], List[float]]],
-]
 
 
 def row_from_attribution_data(
@@ -655,110 +496,6 @@ def row_from_attribution_data(
     return pd.Series(data)
 
 
-def _normalize_spot_prices(
-    spot_prices: _SpotPricesArg,
-    entry_time: dt.datetime,
-    exit_time: dt.datetime,
-) -> Optional[_SpotLookup]:
-    """Return a callable (symbol, exchange, time) -> price, or None. Symbol is the trading symbol (option/fut/stock)."""
-    if spot_prices is None:
-        return None
-    if callable(spot_prices):
-        return spot_prices  # type: ignore[return-value]
-    # Dict: keys (symbol, exchange, time) or (symbol, exchange, date)
-    d = spot_prices
-
-    def lookup(symbol: str, exchange: str, time: dt.datetime) -> Optional[float]:
-        key_exact = (symbol, exchange, time)
-        if key_exact in d:
-            return d[key_exact]  # type: ignore[index]
-        key_date = (symbol, exchange, time.date())
-        if key_date in d:
-            return d[key_date]  # type: ignore[index]
-        return None
-
-    return lookup
-
-
-def _normalize_leg_prices(leg_prices: _LegPricesArg) -> Optional[_LegLookup]:
-    """Return a callable (leg_symbol, 'entry'|'exit') -> price, or None."""
-    if leg_prices is None:
-        return None
-    if callable(leg_prices):
-        return leg_prices  # type: ignore[return-value]
-    d = leg_prices
-
-    def lookup(leg_symbol: str, price_type: str) -> Optional[float]:
-        val = d.get(leg_symbol)
-        if val is None:
-            return None
-        if isinstance(val, (tuple, list)) and len(val) >= 2:
-            return float(val[0]) if price_type == "entry" else float(val[1])
-        if isinstance(val, dict):
-            return val.get(price_type)
-        return None
-
-    return lookup
-
-
-def _build_spot_fn_from_row_broker(
-    row: pd.Series,
-    broker: Optional[object],
-    entry_time: dt.datetime,
-    exit_time: dt.datetime,
-    entry_price: float,
-    exit_price: float,
-    legs: Dict[str, int],
-) -> Optional[_SpotLookup]:
-    has_futures = any(is_futures_symbol(leg) for leg in legs)
-    has_options = any(is_options_symbol(leg) for leg in legs)
-    if not has_futures and not has_options:
-        return None
-    if broker is None:
-        return None
-    brokers_list = [cast(BrokerBase, broker)]
-
-    def fn(symbol: str, exchange: str, time: dt.datetime) -> Optional[float]:
-        if is_options_symbol(symbol):
-            try:
-                parts = symbol.split("_")
-                if len(parts) >= 3:
-                    opt_root = parts[0]  # e.g. "NIFTY"
-                    opt_expiry = parts[2]  # e.g. "20251230"
-                    fut_expiry = _get_month_end_fut_expiry(opt_expiry, exchange)
-                    # *** Build the underlying futures symbol ***
-                    underlying_fut_symbol = f"{opt_root}_FUT_{fut_expiry}___"
-
-                    time_rounded = time.replace(second=0, microsecond=0)
-                    time_key = time_rounded.strftime("%Y%m%d_%H%M")
-                    cache_key = (underlying_fut_symbol, exchange, time_key)  # cache under FUT symbol
-                    if cache_key in _price_cache:
-                        cached_price, _ = _price_cache[cache_key]
-                        return cached_price
-
-                    p = get_option_underlying_price(
-                        brokers_list,
-                        symbol,
-                        opt_expiry,
-                        fut_expiry=fut_expiry,
-                        exchange=exchange,
-                        as_of=time,
-                    )
-                    if p is not None and not pd.isna(p):
-                        _price_cache[cache_key] = (float(p), _time.time())  # stored under FUT symbol
-                        return float(p)
-                    return None
-            except Exception:
-                pass
-            underlying_symbol = get_underlying_symbol(symbol)
-            return get_spot_price_at_time(broker, underlying_symbol, exchange, time)
-
-        underlying_symbol = get_underlying_symbol(symbol)
-        return get_spot_price_at_time(broker, underlying_symbol, exchange, time)
-
-    return fn
-
-
 def _get_leg_price_from_broker_row(
     broker: object,
     row: Union[pd.Series, Dict[str, Any]],
@@ -778,13 +515,11 @@ def _get_leg_price_from_broker_row(
         redis_o = getattr(broker, "redis_o", None)
         if redis_o is None:
             if price_type == "exit" and not exit_keys:
-                import math
-
                 exchange = get_exchange(leg_symbol)
-                price = get_mid_price(
-                    cast(List[BrokerBase], [broker]), leg_symbol, exchange=exchange, mds=None, last=True
+                price = get_price_at_time(
+                    cast(BrokerBase, broker), leg_symbol, exchange, as_of=None, mds="mds", last=True
                 )
-                if price is not None and not math.isnan(price):
+                if price is not None:
                     return float(price)
             return None
 
@@ -834,13 +569,11 @@ def _get_leg_price_from_broker_row(
                     continue
             # Open position: current market price
             try:
-                import math
-
                 exchange = get_exchange(leg_symbol)
-                price = get_mid_price(
-                    cast(List[BrokerBase], [broker]), leg_symbol, exchange=exchange, mds=None, last=True
+                price = get_price_at_time(
+                    cast(BrokerBase, broker), leg_symbol, exchange, as_of=None, mds="mds", last=True
                 )
-                if price is not None and not math.isnan(price):
+                if price is not None:
                     return float(price)
             except Exception:
                 pass
@@ -878,15 +611,16 @@ def calculate_spot_attribution(
     entry_price: float,
     exit_price: float,
     entry_time: dt.datetime,
-    exit_time: dt.datetime,
+    exit_time: Optional[dt.datetime],
     quantity: float,
-    get_spot_price_fn: Callable[[str, str, dt.datetime], Optional[float]],
+    underlying_prices: _UnderlyingPricesArg,
+    broker: Optional[object],
 ) -> float:
     """
     Calculate spot attribution for stocks and futures.
 
     For stocks: spot_attrib = (exit_price - entry_price) * quantity
-    For futures: spot_attrib = (spot_t1 - spot_t0) * quantity (underlying movement)
+    For futures: spot_attrib = (underlying_t1 - underlying_t0) * quantity (underlying movement)
     """
     try:
         if is_stock_symbol(symbol):
@@ -894,11 +628,15 @@ def calculate_spot_attribution(
 
         if is_futures_symbol(symbol):
             exchange = get_exchange(symbol)
-            spot_t0 = get_spot_price_fn(symbol, exchange, entry_time)
-            spot_t1 = get_spot_price_fn(symbol, exchange, exit_time)
-            if spot_t0 is None or spot_t1 is None:
+            underlying_t0 = _get_underlying_price(
+                symbol, exchange, entry_time, underlying_prices=underlying_prices, broker=broker
+            )
+            underlying_t1 = _get_underlying_price(
+                symbol, exchange, exit_time, underlying_prices=underlying_prices, broker=broker
+            )
+            if underlying_t0 is None or underlying_t1 is None:
                 return 0.0
-            return (spot_t1 - spot_t0) * quantity
+            return (underlying_t1 - underlying_t0) * quantity
 
         return 0.0
     except Exception:
@@ -910,9 +648,10 @@ def calculate_spread_attribution(
     entry_price: float,
     exit_price: float,
     entry_time: dt.datetime,
-    exit_time: dt.datetime,
+    exit_time: Optional[dt.datetime],
     quantity: float,
-    get_spot_price_fn: Callable[[str, str, dt.datetime], Optional[float]],
+    underlying_prices: _UnderlyingPricesArg,
+    broker: Optional[object],
 ) -> float:
     """
     Calculate spread attribution for futures trades.
@@ -924,12 +663,16 @@ def calculate_spread_attribution(
 
     try:
         exchange = get_exchange(symbol)
-        spot_t0 = get_spot_price_fn(symbol, exchange, entry_time)
-        spot_t1 = get_spot_price_fn(symbol, exchange, exit_time)
-        if spot_t0 is None or spot_t1 is None:
+        underlying_t0 = _get_underlying_price(
+            symbol, exchange, entry_time, underlying_prices=underlying_prices, broker=broker
+        )
+        underlying_t1 = _get_underlying_price(
+            symbol, exchange, exit_time, underlying_prices=underlying_prices, broker=broker
+        )
+        if underlying_t0 is None or underlying_t1 is None:
             return 0.0
-        spread_t0 = entry_price - spot_t0
-        spread_t1 = exit_price - spot_t1
+        spread_t0 = entry_price - underlying_t0
+        spread_t1 = exit_price - underlying_t1
         return (spread_t1 - spread_t0) * quantity
     except Exception:
         return 0.0
@@ -939,26 +682,21 @@ def calculate_attribution_for_trade(
     row: Union[pd.Series, Dict[str, Any]],
     broker: Optional[object] = None,
     *,
-    spot_prices: _SpotPricesArg = None,
+    underlying_prices: _UnderlyingPricesArg = None,
     leg_prices: _LegPricesArg = None,
     current_time: Optional[dt.datetime] = None,
     day: bool = True,
-    historical_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
     refresh_mapping: bool = False,
 ) -> Dict[str, Any]:
     """
     Calculate attribution for a single trade.
 
-    Row is the single input; spot_prices and leg_prices can be dicts, callables, or None
+    Row is the single input; underlying_prices and leg_prices can be dicts or None
     (derived from row and broker when None). current_time defaults to row["exit_time"] or now.
 
     When day=True (default): use day-level attribution with MTM for carried-forward trades
     (mtm_entry_price / mtm_exit_price for prior day close and current day close/mark).
     When day=False: use trade-level attribution from row entry/exit prices and times.
-
-    historical_cache: optional dict (symbol, date_str) -> EOD close; when provided and day=True,
-    passed to mtm_entry_price/mtm_exit_price so repeated (symbol, date) lookups are reused (e.g. when
-    calling in a loop over many trades).
 
     refresh_mapping: when False (default), broker does not refresh symbol mapping on historical
     fetches (faster for batch). Set True to refresh mapping on each get_historical_close_price.
@@ -1014,25 +752,22 @@ def calculate_attribution_for_trade(
         exit_dt = cast(dt.datetime, exit_dt)
         original_entry_dt = entry_dt
         original_exit_dt = exit_dt
+        entry_time_shifted = False
+        exit_time_shifted = False
         no_exit_in_row = exit_time_str == "" or exit_time_str == "0" or pd.isna(exit_time_str)
+        effective_open = no_exit_in_row
 
         entry_price = row.get("entry_price", 0.0)
         exit_price = row.get("exit_price", 0.0)
         if exit_price == 0 or exit_price is None:
             exit_price = row.get("mtm", entry_price)
 
-        # Day-level attribution: use MTM for carried-forward / open positions (existing helpers)
+        # Day-level attribution: compute effective attribution window and rely on as_of/live lookups downstream.
         if day and broker is not None and current_time is not None:
             attribution_date = current_time.date() if hasattr(current_time, "date") else get_naive_dt(current_time).date()  # type: ignore[union-attr]
             attribution_date_str = attribution_date.strftime("%Y%m%d")
-            entry_price = mtm_entry_price(
-                row, attribution_date, broker, historical_cache, refresh_mapping=refresh_mapping
-            )
-            exit_price = mtm_exit_price(
-                row, attribution_date, broker, historical_cache, refresh_mapping=refresh_mapping
-            )
-            # MTM entry/exit times for spot/IV (keep entry_dt/exit_dt as original until we assign at end)
-            mtm_entry_time = entry_dt
+            entry_price = mtm_entry_price(row, attribution_date, broker, refresh_mapping=refresh_mapping)
+            exit_price = mtm_exit_price(row, attribution_date, broker, refresh_mapping=refresh_mapping)
             entry_date = entry_dt.date() if hasattr(entry_dt, "date") else entry_dt
             if attribution_date < entry_date:
                 return result  # Trade did not exist on attribution day; zero attribution for this day
@@ -1045,7 +780,7 @@ def calculate_attribution_for_trade(
                 )
                 if len(prior_date_str) == 10 and prior_date_str[4] == "-":
                     prior_date_str = prior_date_str.replace("-", "")
-                mtm_entry_time = dt.datetime.strptime(prior_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
+                entry_dt = dt.datetime.strptime(prior_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
             market_close_attr = dt.datetime.strptime(attribution_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
             current_naive = get_naive_dt(current_time)
             current_dt = (
@@ -1056,35 +791,35 @@ def calculate_attribution_for_trade(
             if attribution_date == entry_date and current_dt < entry_dt:
                 return result  # Current time is before trade entry; no attribution yet
 
-            no_exit = exit_time_str == "" or exit_time_str == "0" or pd.isna(exit_time_str)
-
-            # If the trade has a same-day exit in the future relative to current_time,
-            # treat it as still open at current_time for day-level attribution.
-            if (not no_exit) and hasattr(exit_dt, "date"):
+            if not no_exit_in_row and hasattr(exit_dt, "date"):
                 exit_date = exit_dt.date()
-                if exit_date == attribution_date and current_dt < exit_dt:
-                    no_exit = True
-                    mtm_exit_time = current_dt
-                else:
-                    if exit_date < attribution_date:
-                        return result  # Trade already closed before attribution day; zero attribution for this day
-                    if exit_date > attribution_date:
-                        mtm_exit_time = (
-                            current_dt
-                            if (attribution_date == dt.date.today() and current_dt < market_close_attr)
-                            else market_close_attr
-                        )
+                if exit_date < attribution_date:
+                    return result  # Trade already closed before attribution day; zero attribution for this day
+                if exit_date == attribution_date:
+                    if current_dt < exit_dt:
+                        effective_open = True
+                        exit_dt = current_dt
                     else:
-                        mtm_exit_time = exit_dt  # exit on attribution day: original exit time
+                        effective_open = False
+                else:
+                    effective_open = True
+                    exit_dt = (
+                        current_dt
+                        if (attribution_date == dt.date.today() and current_dt < market_close_attr)
+                        else market_close_attr
+                    )
             else:
-                if no_exit:
-                    mtm_exit_time = market_close_attr if current_dt >= market_close_attr else current_dt
-            entry_dt = mtm_entry_time
-            exit_dt = mtm_exit_time
+                effective_open = True
+                exit_dt = current_dt if current_dt < market_close_attr else market_close_attr
+
+            entry_time_shifted = entry_dt != original_entry_dt
+            exit_time_shifted = exit_dt != original_exit_dt
 
         # Minute-align entry/exit for all spot/IV lookups and performance_attribution (historical data is 1m only)
         entry_dt = entry_dt.replace(second=0, microsecond=0)
         exit_dt = exit_dt.replace(second=0, microsecond=0)
+        # Effective-open positions use live exit-side lookup (as_of=None); closed positions use as_of=exit_dt.
+        exit_lookup_time: Optional[dt.datetime] = None if effective_open else exit_dt
 
         legs = _parse_combo_symbol(combo_symbol)
         if len(legs) == 0:
@@ -1096,24 +831,6 @@ def calculate_attribution_for_trade(
 
         entry_qty = row["entry_quantity"]
 
-        # Resolve get_spot_price_fn: normalized(spot_prices) or from broker/row, or no-op
-        get_spot_price_fn = _normalize_spot_prices(spot_prices, entry_dt, exit_dt)
-        if get_spot_price_fn is None:
-            get_spot_price_fn = _build_spot_fn_from_row_broker(
-                row, broker, entry_dt, exit_dt, entry_price, exit_price, legs
-            )
-        if get_spot_price_fn is None:
-            get_spot_price_fn = lambda s, e, t: None  # noqa: E731
-
-        # Resolve get_leg_price_fn: normalized(leg_prices) or from broker+row for multi-leg
-        get_leg_price_fn = _normalize_leg_prices(leg_prices)
-        if get_leg_price_fn is None and len(legs) > 1 and broker is not None:
-
-            def _leg_fn(leg_symbol: str, price_type: str) -> Optional[float]:
-                return _get_leg_price_from_broker_row(broker, row, leg_symbol, price_type)
-
-            get_leg_price_fn = _leg_fn
-
         if has_stocks and not has_futures and not has_options:
             for leg_symbol, leg_qty in legs.items():
                 if is_stock_symbol(leg_symbol):
@@ -1123,9 +840,10 @@ def calculate_attribution_for_trade(
                         entry_price,
                         exit_price,
                         entry_dt,
-                        exit_dt,
+                        exit_lookup_time,
                         signed_qty,
-                        get_spot_price_fn,
+                        underlying_prices,
+                        broker,
                     )
                     result["spot_attrib"] += spot_attrib
 
@@ -1138,9 +856,10 @@ def calculate_attribution_for_trade(
                         entry_price,
                         exit_price,
                         entry_dt,
-                        exit_dt,
+                        exit_lookup_time,
                         signed_qty,
-                        get_spot_price_fn,
+                        underlying_prices,
+                        broker,
                     )
                     result["spot_attrib"] += spot_attrib
                     spread_attrib = calculate_spread_attribution(
@@ -1148,110 +867,61 @@ def calculate_attribution_for_trade(
                         entry_price,
                         exit_price,
                         entry_dt,
-                        exit_dt,
+                        exit_lookup_time,
                         signed_qty,
-                        get_spot_price_fn,
+                        underlying_prices,
+                        broker,
                     )
                     result["spread_attrib"] += spread_attrib
 
         elif has_options:
             adjusted_legs = {leg_symbol: int(leg_qty * float(entry_qty)) for leg_symbol, leg_qty in legs.items()}
-            spot_t0_dict = {}
-            spot_t1_dict = {}
+            underlying_t0_dict = {}
+            underlying_t1_dict = {}
             ivs_t0 = {}
             ivs_t1 = {}
 
             for leg_symbol in legs:
                 exchange_leg = get_exchange(leg_symbol)
-                # Derive the underlying futures symbol for this option leg
-                if is_options_symbol(leg_symbol):
-                    parts = leg_symbol.split("_")
-                    opt_root = parts[0]
-                    opt_expiry = parts[2] if len(parts) >= 3 else ""
-                    fut_expiry = _get_month_end_fut_expiry(opt_expiry, exchange_leg)
-                    underlying_fut_symbol = f"{opt_root}_FUT_{fut_expiry}___"
-                else:
-                    # For non-options, use leg_symbol directly
-                    underlying_fut_symbol = leg_symbol
 
-                spot_t0 = get_spot_price_fn(leg_symbol, exchange_leg, entry_dt)
-                spot_t1 = get_spot_price_fn(leg_symbol, exchange_leg, exit_dt)
-                if spot_t0 is None and broker is not None and is_options_symbol(leg_symbol):
-                    try:
-                        time_key_0 = entry_dt.replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
-                        cache_key_0 = (underlying_fut_symbol, exchange_leg, time_key_0)
-                        if cache_key_0 in _price_cache:
-                            spot_t0 = _price_cache[cache_key_0][0]
-                        else:
-                            parts = leg_symbol.split("_")
-                            if len(parts) >= 3:
-                                opt_expiry = parts[2]
-                                fut_expiry = _get_month_end_fut_expiry(opt_expiry, exchange_leg)
-                                p = get_option_underlying_price(
-                                    [cast(BrokerBase, broker)],
-                                    leg_symbol,
-                                    opt_expiry,
-                                    fut_expiry=fut_expiry,
-                                    exchange=exchange_leg,
-                                    as_of=entry_dt,
-                                )
-                                if p is not None and not pd.isna(p):
-                                    _price_cache[cache_key_0] = (float(p), _time.time())
-                                    spot_t0 = float(p)
-                    except Exception:
-                        pass
-                if spot_t1 is None and broker is not None and is_options_symbol(leg_symbol):
-                    try:
-                        time_key_1 = exit_dt.replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
-                        cache_key_1 = (underlying_fut_symbol, exchange_leg, time_key_1)
-                        if cache_key_1 in _price_cache:
-                            spot_t1 = _price_cache[cache_key_1][0]
-                        else:
-                            parts = leg_symbol.split("_")
-                            if len(parts) >= 3:
-                                opt_expiry = parts[2]
-                                fut_expiry = _get_month_end_fut_expiry(opt_expiry, exchange_leg)
-                                p = get_option_underlying_price(
-                                    [cast(BrokerBase, broker)],
-                                    leg_symbol,
-                                    opt_expiry,
-                                    fut_expiry=fut_expiry,
-                                    exchange=exchange_leg,
-                                    as_of=exit_dt,
-                                )
-                                if p is not None and not pd.isna(p):
-                                    _price_cache[cache_key_1] = (float(p), _time.time())
-                                    spot_t1 = float(p)
-                    except Exception:
-                        pass
-                if spot_t0 is None or spot_t1 is None:
+                underlying_t0 = _get_underlying_price(
+                    leg_symbol, exchange_leg, entry_dt, underlying_prices=underlying_prices, broker=broker
+                )
+                underlying_t1 = _get_underlying_price(
+                    leg_symbol, exchange_leg, exit_lookup_time, underlying_prices=underlying_prices, broker=broker
+                )
+                if underlying_t0 is None or underlying_t1 is None:
                     trading_logger.log_debug(
-                        f"Could not get spot prices for combo leg {leg_symbol}, skipping attribution"
+                        f"Could not get underlying prices for combo leg {leg_symbol}, skipping attribution"
                     )
                     return result
-                spot_t0_dict[leg_symbol] = spot_t0
-                spot_t1_dict[leg_symbol] = spot_t1
+                underlying_t0_dict[leg_symbol] = underlying_t0
+                underlying_t1_dict[leg_symbol] = underlying_t1
 
                 leg_entry_price = None
                 leg_exit_price = None
-                if entry_dt != original_entry_dt and broker is not None:
-                    p = get_spot_price_at_time(broker, leg_symbol, exchange_leg, entry_dt)
-                    if p is not None and not pd.isna(p):
+                if entry_time_shifted and broker is not None:
+                    p = get_price_at_time(cast(BrokerBase, broker), leg_symbol, exchange_leg, as_of=entry_dt, mds="mds")
+                    if p is not None:
                         leg_entry_price = p
-                if (exit_dt != original_exit_dt or no_exit_in_row) and broker is not None:
-                    p = get_spot_price_at_time(broker, leg_symbol, exchange_leg, exit_dt)
-                    if p is not None and not pd.isna(p):
+                if (exit_time_shifted or effective_open) and broker is not None:
+                    p = get_price_at_time(
+                        cast(BrokerBase, broker),
+                        leg_symbol,
+                        exchange_leg,
+                        as_of=None if effective_open else exit_dt,
+                        mds="mds",
+                    )
+                    if p is not None:
                         leg_exit_price = p
-                if leg_entry_price is None and get_leg_price_fn is not None:
-                    try:
-                        leg_entry_price = get_leg_price_fn(leg_symbol, "entry")
-                    except Exception as e:
-                        trading_logger.log_debug(f"Error getting per-leg entry price for {leg_symbol}: {e}")
-                if leg_exit_price is None and get_leg_price_fn is not None:
-                    try:
-                        leg_exit_price = get_leg_price_fn(leg_symbol, "exit")
-                    except Exception as e:
-                        trading_logger.log_debug(f"Error getting per-leg exit price for {leg_symbol}: {e}")
+                if leg_entry_price is None:
+                    leg_entry_price = _lookup_leg_price_from_map(leg_prices, leg_symbol, "entry")
+                if leg_exit_price is None:
+                    leg_exit_price = _lookup_leg_price_from_map(leg_prices, leg_symbol, "exit")
+                if leg_entry_price is None and len(legs) > 1 and broker is not None:
+                    leg_entry_price = _get_leg_price_from_broker_row(broker, row, leg_symbol, "entry")
+                if leg_exit_price is None and len(legs) > 1 and broker is not None:
+                    leg_exit_price = _get_leg_price_from_broker_row(broker, row, leg_symbol, "exit")
                 if leg_entry_price is None and len(legs) == 1:
                     leg_entry_price = entry_price
                 if leg_exit_price is None and len(legs) == 1:
@@ -1268,8 +938,8 @@ def calculate_attribution_for_trade(
                     )
                     return result
 
-                iv_0 = get_iv_fn(leg_symbol, leg_entry_price, spot_t0, entry_dt, exchange_leg)
-                iv_1 = get_iv_fn(leg_symbol, leg_exit_price, spot_t1, exit_dt, exchange_leg)
+                iv_0 = get_iv_fn(leg_symbol, leg_entry_price, underlying_t0, entry_dt, exchange_leg)
+                iv_1 = get_iv_fn(leg_symbol, leg_exit_price, underlying_t1, exit_dt, exchange_leg)
                 if iv_0 is None or iv_1 is None:
                     trading_logger.log_debug(f"Could not get IVs for combo leg {leg_symbol}, skipping attribution")
                     return result
@@ -1287,8 +957,8 @@ def calculate_attribution_for_trade(
             try:
                 attrib = performance_attribution(
                     combo_symbol=combo_symbol_str,
-                    spot_t0=spot_t0_dict[first_leg],
-                    spot_t1=spot_t1_dict[first_leg],
+                    spot_t0=underlying_t0_dict[first_leg],
+                    spot_t1=underlying_t1_dict[first_leg],
                     ivs_t0=ivs_t0,
                     ivs_t1=ivs_t1,
                     t0=entry_dt,
@@ -1299,9 +969,9 @@ def calculate_attribution_for_trade(
                 underlying_attrib = attrib.get("underlying_attrib", 0.0) or 0.0
                 vol_attrib = attrib.get("vol_attrib", 0.0) or 0.0
                 timedecay_attrib = attrib.get("timedecay_attrib", 0.0) or 0.0
-                result["spot_attrib"] = 0.0 if pd.isna(underlying_attrib) else underlying_attrib
-                result["vol_attrib"] = 0.0 if pd.isna(vol_attrib) else vol_attrib
-                result["timedecay_attrib"] = 0.0 if pd.isna(timedecay_attrib) else timedecay_attrib
+                result["spot_attrib"] = 0.0 if _is_missing_number(underlying_attrib) else underlying_attrib
+                result["vol_attrib"] = 0.0 if _is_missing_number(vol_attrib) else vol_attrib
+                result["timedecay_attrib"] = 0.0 if _is_missing_number(timedecay_attrib) else timedecay_attrib
                 # Per-leg breakdown (sums to total); keys match chameli per_leg
                 per_leg_raw = attrib.get("per_leg") or {}
                 for sym, leg_data in per_leg_raw.items():
@@ -1331,22 +1001,18 @@ def calculate_attribution_for_trades(
     rows: Union[pd.DataFrame, List[Union[pd.Series, Dict[str, Any]]]],
     broker: Optional[object] = None,
     *,
-    spot_prices: _SpotPricesArg = None,
+    underlying_prices: _UnderlyingPricesArg = None,
     leg_prices: _LegPricesArg = None,
     current_time: Optional[dt.datetime] = None,
     day: bool = True,
     refresh_mapping: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Calculate attribution for multiple trades with a shared historical_cache.
-
-    When day=True, a single historical_cache is reused across all rows so each
-    (symbol, date_str) is fetched at most once. Use this instead of looping
-    over calculate_attribution_for_trade when processing many trades.
+    Calculate attribution for multiple trades.
 
     Args:
         rows: DataFrame (iterated by rows) or list of row-like dicts/Series.
-        broker, spot_prices, leg_prices, current_time, day, refresh_mapping: same as calculate_attribution_for_trade.
+        broker, underlying_prices, leg_prices, current_time, day, refresh_mapping: same as calculate_attribution_for_trade.
 
     Returns:
         List of attribution dicts (one per row), in the same order as rows.
@@ -1355,18 +1021,16 @@ def calculate_attribution_for_trades(
         row_list = [rows.loc[i] for i in range(len(rows))]
     else:
         row_list = list(rows)
-    historical_cache: Dict[Tuple[str, str], Optional[float]] = {}
     out: List[Dict[str, Any]] = []
     for row in row_list:
         row_arg = cast(Union[pd.Series, Dict[str, Any]], row)
         attrib = calculate_attribution_for_trade(
             row_arg,
             broker=broker,
-            spot_prices=spot_prices,
+            underlying_prices=underlying_prices,
             leg_prices=leg_prices,
             current_time=current_time,
             day=day,
-            historical_cache=historical_cache,
             refresh_mapping=refresh_mapping,
         )
         out.append(attrib)
@@ -1413,7 +1077,7 @@ def fork_partial_trades_in_dataframe(pnl: pd.DataFrame, date_str: str) -> pd.Dat
                 other_entry_keys = other_entry_keys_str.split() if other_entry_keys_str else []
                 for other_ek in other_entry_keys:
                     if other_ek.startswith(ek) and len(other_ek) > len(ek):
-                        suffix = other_ek[len(ek) :]
+                        suffix = other_ek[len(ek):]
                         if suffix.startswith("F") and suffix[1:].isdigit():
                             max_fork = max(max_fork, int(suffix[1:]))
         fork_num = max_fork + 1
@@ -1453,7 +1117,6 @@ def mtm_entry_price(
     row: pd.Series,
     mtm_date: Union[dt.date, str],
     broker: Optional[object] = None,
-    historical_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
     *,
     refresh_mapping: bool = False,
 ) -> float:
@@ -1463,15 +1126,10 @@ def mtm_entry_price(
     For positions entered before mtm_date, returns the EOD close for the day before mtm_date.
     For positions entered on or after mtm_date, returns the entry_price.
 
-    When historical_cache is provided and a cache key exists with value None (e.g. a previous
-    lookup failed or no data was found), this function stores and returns entry_price for that
-    key so repeated lookups for the same (symbol, date) do not refetch.
-
     Args:
         row: DataFrame row with entry_price, entry_time, symbol
         mtm_date: Date for MTM (dt.date or YYYYMMDD str)
         broker: Broker instance for get_historical_close_price
-        historical_cache: Optional {(symbol, date_str): price} cache
         refresh_mapping: Passed to get_historical_close_price (default False).
 
     Returns:
@@ -1502,29 +1160,45 @@ def mtm_entry_price(
             if isinstance(prior, str)
             else (prior.strftime("%Y%m%d") if hasattr(prior, "strftime") else str(prior))
         )
+        if len(prior_date_str) == 10 and prior_date_str[4] == "-":
+            prior_date_str = prior_date_str.replace("-", "")
         symbol = str(row.get("symbol", ""))
         if not symbol:
             return entry_price
 
-        cache_key: Tuple[str, str] = (symbol, prior_date_str)
-        if historical_cache is not None and cache_key in historical_cache:
-            cached = historical_cache[cache_key]
-            if cached is not None:
-                return float(cached)
-            historical_cache[cache_key] = entry_price
-            return entry_price
-
         try:
             exchange = "BSE" if "SENSEX" in symbol else "NSE"
-            mtm_price = get_historical_close_price(
-                broker, symbol, prior_date_str, exchange, refresh_mapping=refresh_mapping
+            prior_eod_dt = dt.datetime.strptime(prior_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+
+            if ":" in symbol:
+                legs = parse_combo_symbol(symbol)
+                combo_price = 0.0
+                for leg_symbol, quantity in legs.items():
+                    leg_price = get_price_at_time(
+                        cast(BrokerBase, broker),
+                        leg_symbol,
+                        exchange,
+                        as_of=prior_eod_dt,
+                        mds="mds",
+                        refresh_mapping=refresh_mapping,
+                    )
+                    if leg_price is None:
+                        return entry_price
+                    combo_price += leg_price * quantity
+                return float(combo_price)
+
+            mtm_price = get_price_at_time(
+                cast(BrokerBase, broker),
+                symbol,
+                exchange,
+                as_of=prior_eod_dt,
+                mds="mds",
+                refresh_mapping=refresh_mapping,
             )
             if mtm_price is not None:
                 return float(mtm_price)
         except Exception:
             pass
-        if historical_cache is not None:
-            historical_cache[cache_key] = entry_price
         return entry_price
     except Exception:
         return entry_price
@@ -1534,7 +1208,6 @@ def mtm_exit_price(
     row: pd.Series,
     mtm_date: Union[dt.date, str],
     broker: Optional[object] = None,
-    historical_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
     *,
     refresh_mapping: bool = False,
 ) -> float:
@@ -1557,6 +1230,8 @@ def mtm_exit_price(
         mtm_date_obj = mtm_date
     else:
         mtm_date_str = str(mtm_date)
+        if len(mtm_date_str) == 10 and mtm_date_str[4] == "-":
+            mtm_date_str = mtm_date_str.replace("-", "")
         try:
             mtm_date_obj = dt.datetime.strptime(mtm_date_str, "%Y%m%d").date()
         except ValueError:
@@ -1580,49 +1255,59 @@ def mtm_exit_price(
         except (ValueError, TypeError):
             use_mtm_exit = False
 
+    def _combo_or_single_price(as_of: Optional[dt.datetime], *, last: bool = False) -> Optional[float]:
+        if ":" in symbol:
+            legs = parse_combo_symbol(symbol)
+            total = 0.0
+            for leg_symbol, quantity in legs.items():
+                leg_exch = "BSE" if "SENSEX" in leg_symbol else "NSE"
+                p = get_price_at_time(
+                    cast(BrokerBase, broker),
+                    leg_symbol,
+                    leg_exch,
+                    as_of=as_of,
+                    mds="mds",
+                    last=last,
+                    refresh_mapping=refresh_mapping,
+                )
+                if p is None:
+                    return None
+                total += p * quantity
+            return total
+        exch = "BSE" if "SENSEX" in symbol else "NSE"
+        return get_price_at_time(
+            cast(BrokerBase, broker), symbol, exch, as_of=as_of, mds="mds", last=last, refresh_mapping=refresh_mapping
+        )
+
     if use_mtm_exit:
         if mtm_date_obj and mtm_date_obj == today:
             current_time = dt.datetime.now().time()
             market_close_time = dt.time(15, 30, 0)
             if current_time < market_close_time:
                 try:
-                    price = get_mid_price(
-                        cast(List[BrokerBase], [broker]), symbol, exchange=exchange, mds=None, last=True
-                    )
-                    if price is not None and not pd.isna(price):
+                    price = _combo_or_single_price(None, last=True)
+                    if price is not None:
                         return float(price)
                 except Exception as e:
                     trading_logger.log_warning(
                         f"Error getting current market price for {symbol}: {e}, falling back to historical"
                     )
 
-            cache_key = (symbol, mtm_date_str)
-            if historical_cache and cache_key in historical_cache:
-                cached = historical_cache[cache_key]
-                if cached is not None:
-                    return float(cached)
             try:
-                mtm_price = get_historical_close_price(
-                    broker, symbol, mtm_date_str, exchange, refresh_mapping=refresh_mapping
-                )
+                mtm_eod_dt = dt.datetime.strptime(mtm_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+                mtm_price = _combo_or_single_price(mtm_eod_dt, last=False)
                 if mtm_price is not None:
-                    return mtm_price
+                    return float(mtm_price)
                 return entry_price
             except Exception as e:
                 trading_logger.log_warning(f"Error fetching historical data for {symbol} on {mtm_date_str}: {e}")
                 return entry_price
         else:
-            cache_key = (symbol, mtm_date_str)
-            if historical_cache and cache_key in historical_cache:
-                cached = historical_cache[cache_key]
-                if cached is not None:
-                    return float(cached)
             try:
-                mtm_price = get_historical_close_price(
-                    broker, symbol, mtm_date_str, exchange, refresh_mapping=refresh_mapping
-                )
+                mtm_eod_dt = dt.datetime.strptime(mtm_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+                mtm_price = _combo_or_single_price(mtm_eod_dt, last=False)
                 if mtm_price is not None:
-                    return mtm_price
+                    return float(mtm_price)
                 return entry_price
             except Exception as e:
                 trading_logger.log_warning(f"Error fetching historical data for {symbol} on {mtm_date_str}: {e}")
@@ -1635,7 +1320,6 @@ def mtm_df(
     pnl: pd.DataFrame,
     mtm_date: Union[dt.date, str],
     broker: Optional[object] = None,
-    historical_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
     *,
     refresh_mapping: bool = False,
 ) -> pd.DataFrame:
@@ -1647,7 +1331,6 @@ def mtm_df(
         pnl: P&L DataFrame with trades
         mtm_date: Date for MTM (dt.date or YYYYMMDD str)
         broker: Broker instance for historical/current prices
-        historical_cache: Optional {(symbol, date_str): price} cache
         refresh_mapping: Passed to mtm_entry_price/mtm_exit_price (default False).
 
     Returns:
@@ -1668,9 +1351,7 @@ def mtm_df(
             pnl[col] = pnl[col].astype(float)
 
     for index, row in pnl.iterrows():
-        pnl.at[index, "entry_price"] = mtm_entry_price(
-            row, mtm_date, broker, historical_cache, refresh_mapping=refresh_mapping
-        )
-        pnl.at[index, "mtm"] = mtm_exit_price(row, mtm_date, broker, historical_cache, refresh_mapping=refresh_mapping)
+        pnl.at[index, "entry_price"] = mtm_entry_price(row, mtm_date, broker, refresh_mapping=refresh_mapping)
+        pnl.at[index, "mtm"] = mtm_exit_price(row, mtm_date, broker, refresh_mapping=refresh_mapping)
         pnl.at[index, "exit_price"] = pnl.loc[index, "mtm"]  # type: ignore
     return pnl

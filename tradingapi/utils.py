@@ -1,4 +1,5 @@
 import datetime as dt
+import fcntl
 import glob
 import json
 import logging
@@ -7,6 +8,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -2680,36 +2682,168 @@ def get_price(
     return out
 
 
-# Cache for _get_historical_close_at_time: (symbol, exchange, date_str, time_key) -> (price, ts)
-# TTL only for "current" (within 60s of now); all other times kept indefinitely.
-_historical_close_at_time_cache: Dict[Tuple[str, str, str, str], Tuple[float, float]] = {}
-_CURRENT_THRESHOLD_SECONDS = 60
-_CURRENT_TTL_SECONDS = 60
+# ---------------------------------------------------------------------------
+# Unified price cache: (symbol, time_key) -> price. Used for EOD and intraday.
+# time_key: "YYYYMMDD_1529" for EOD, "YYYYMMDD_HHMM" for intraday. No TTL.
+# ---------------------------------------------------------------------------
+_price_cache: Dict[Tuple[str, str], float] = {}
+_GET_HISTORICAL_CALL_LOG_FILE = os.path.join(os.path.expanduser("~/logs"), "get_historical_calls.log")
+_get_historical_call_count = 0
+_get_historical_call_lock = threading.Lock()
+
+try:
+    from ohlcutils.data import load_symbol
+    from ohlcutils.enums import Periodicity
+
+    _OHLCUTILS_AVAILABLE = True
+except ImportError:
+    _OHLCUTILS_AVAILABLE = False
+    load_symbol = None  # type: ignore[assignment, misc]
+    Periodicity = None  # type: ignore[assignment, misc]
 
 
-def _get_historical_close_at_time(
+def get_price_cache(symbol: str, time_key: str) -> Optional[float]:
+    """Return cached price for (symbol, time_key) or None."""
+    return _price_cache.get((symbol, time_key))
+
+
+def set_price_cache(symbol: str, time_key: str, value: Optional[float]) -> None:
+    """Cache price for (symbol, time_key). No-op if value is None or nan."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return
+    _price_cache[(symbol, time_key)] = float(value)
+
+
+def get_historical_call_count() -> int:
+    """Return the process-level count of get_historical calls logged to get_historical_calls.log."""
+    with _get_historical_call_lock:
+        return _get_historical_call_count
+
+
+def _log_get_historical_call(
+    broker: object,
+    symbols: str,
+    date_start: str,
+    date_end: str,
+    periodicity: str,
+) -> None:
+    """Log get_historical call to get_historical_calls.log (used only from get_historical_close_at_time)."""
+    global _get_historical_call_count
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    broker_name = type(broker).__name__ if broker is not None else "None"
+    with _get_historical_call_lock:
+        try:
+            os.makedirs(os.path.dirname(_GET_HISTORICAL_CALL_LOG_FILE), exist_ok=True)
+            with open(_GET_HISTORICAL_CALL_LOG_FILE, "a+", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.seek(0)
+                lines = f.readlines()
+                if lines:
+                    last = lines[-1].strip().split(",", 1)[0]
+                    try:
+                        count = int(last) + 1
+                    except (TypeError, ValueError):
+                        count = 1
+                else:
+                    count = 1
+                _get_historical_call_count = count
+                line = f"{count},{ts},{broker_name},{symbols},{date_start},{date_end},{periodicity}\n"
+                f.write(line)
+                f.flush()
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            trading_logger.log_debug(f"Failed to log get_historical call: {e}")
+
+
+def get_historical_close_at_time(
     broker: BrokerBase,
     symbol: str,
     exchange: str,
-    as_of: dt.datetime,
+    at: Union[dt.datetime, dt.date, str, pd.Timestamp],
+    *,
+    refresh_mapping: bool = False,
 ) -> float:
-    """Get historical close price at or just before as_of. Returns float('nan') on failure. Cached by (symbol, exchange, date_str, time_key)."""
-    date_str = as_of.strftime("%Y-%m-%d")
-    time_key = as_of.replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
-    cache_key: Tuple[str, str, str, str] = (symbol, exchange, date_str, time_key)
-    now_ts = time.time()
-    now_dt = dt.datetime.now()
-    as_of_naive = as_of.replace(tzinfo=None) if as_of.tzinfo else as_of
-    delta_seconds = (now_dt - as_of_naive).total_seconds()
-    is_current = abs(delta_seconds) <= _CURRENT_THRESHOLD_SECONDS
-    if cache_key in _historical_close_at_time_cache:
-        cached_price, cache_ts = _historical_close_at_time_cache[cache_key]
-        if not is_current:
-            return cached_price
-        if now_ts - cache_ts < _CURRENT_TTL_SECONDS:
-            return cached_price
-        del _historical_close_at_time_cache[cache_key]
+    """
+    Get historical close price at a specific time or EOD for a date.
+
+    - If `at` is a date (or date-only str): return EOD close (15:29 bar) for that date.
+    - If `at` is a datetime with time: return close of 1m bar at or just before that time.
+
+    Priority: (1) cache, (2) ohlcutils load_symbol if available, (3) broker.get_historical.
+    Logs to ~/logs/get_historical_calls.log only when broker API is used.
+    Returns float('nan') on failure.
+    """
+    target_dt: dt.datetime
+    date_str: str
+    time_key: str
     try:
+        if isinstance(at, pd.Timestamp):
+            at = at.to_pydatetime()
+        if isinstance(at, dt.date) and not isinstance(at, dt.datetime):
+            d = at
+            target_dt = dt.datetime.combine(d, dt.time(15, 29, 0))
+            date_str = d.strftime("%Y-%m-%d")
+            time_key = d.strftime("%Y%m%d") + "_1529"
+        elif isinstance(at, str):
+            at_parsed = parse_datetime(at)
+            if hasattr(at_parsed, "hour") and at_parsed.hour == 0 and at_parsed.minute == 0:
+                d = at_parsed.date()
+                target_dt = dt.datetime.combine(d, dt.time(15, 29, 0))
+                date_str = d.strftime("%Y-%m-%d")
+                time_key = d.strftime("%Y%m%d") + "_1529"
+            else:
+                target_dt = at_parsed.replace(tzinfo=None) if at_parsed.tzinfo else at_parsed
+                target_dt = target_dt.replace(second=0, microsecond=0)
+                date_str = target_dt.strftime("%Y-%m-%d")
+                time_key = target_dt.strftime("%Y%m%d_%H%M")
+        else:
+            at_dt = cast(dt.datetime, at)
+            target_dt = at_dt.replace(tzinfo=None) if at_dt.tzinfo else at_dt
+            target_dt = target_dt.replace(second=0, microsecond=0)
+            if target_dt.hour == 0 and target_dt.minute == 0:
+                target_dt = dt.datetime.combine(target_dt.date(), dt.time(15, 29, 0))
+                time_key = target_dt.strftime("%Y%m%d") + "_1529"
+            else:
+                time_key = target_dt.strftime("%Y%m%d_%H%M")
+            date_str = target_dt.strftime("%Y-%m-%d")
+    except Exception:
+        return float("nan")
+
+    cached = get_price_cache(symbol, time_key)
+    if cached is not None:
+        return cached
+
+    if _OHLCUTILS_AVAILABLE and load_symbol is not None and Periodicity is not None:
+        try:
+            date_str_fmt = date_str if "-" in date_str else f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            df = load_symbol(
+                symbol,
+                start_time=date_str_fmt,
+                end_time=date_str_fmt + " 23:59:59",
+                src=Periodicity.PERMIN,
+                exchange=exchange,
+                market_close_time="15:30:00",
+            )
+            if df is not None and not df.empty and "close" in df.columns:
+                import pytz
+
+                tz = pytz.timezone("Asia/Kolkata")
+                target_tz = tz.localize(target_dt) if target_dt.tzinfo is None else target_dt
+                index = df.index
+                if getattr(index, "tz", None) is None:
+                    df_index_tz = getattr(index, "tz_localize", lambda t: index)(tz)
+                else:
+                    df_index_tz = index
+                filtered = df[df_index_tz <= target_tz]
+                if not filtered.empty:
+                    close_price = float(filtered["close"].iloc[-1])
+                    set_price_cache(symbol, time_key, close_price)
+                    return close_price
+        except Exception:
+            pass
+
+    try:
+        _log_get_historical_call(broker, symbol, date_str, date_str, "1m")
         hist = broker.get_historical(
             symbols=symbol,
             date_start=date_str,
@@ -2717,7 +2851,7 @@ def _get_historical_close_at_time(
             exchange=exchange,
             periodicity="1m",
             market_close_time="15:30:00",
-            refresh_mapping=False,
+            refresh_mapping=refresh_mapping,
         )
         if symbol.startswith("NIFTY_"):
             keys_to_replace = [k for k in hist if k.startswith("NSENIFTY_")]
@@ -2728,7 +2862,7 @@ def _get_historical_close_at_time(
         if not data:
             return float("nan")
         data = sorted(data, key=lambda x: x.date)
-        target_naive = as_of.replace(tzinfo=None) if as_of.tzinfo else as_of
+        target_naive = target_dt.replace(tzinfo=None) if target_dt.tzinfo else target_dt
         candidates = []
         for x in data:
             x_naive = x.date
@@ -2740,10 +2874,53 @@ def _get_historical_close_at_time(
             result = float(candidates[-1][1].close)
         else:
             result = float(data[0].close)
-        _historical_close_at_time_cache[cache_key] = (result, now_ts)
+        set_price_cache(symbol, time_key, result)
         return result
     except Exception:
         return float("nan")
+
+
+def get_price_at_time(
+    broker: BrokerBase,
+    symbol: str,
+    exchange: str = "NSE",
+    as_of: Optional[dt.datetime] = None,
+    *,
+    mds: Optional[str] = None,
+    last: bool = True,
+    refresh_mapping: bool = False,
+) -> Optional[float]:
+    """Price of symbol at a time. as_of=None => live mid/last; as_of=datetime => historical close. Returns None on failure."""
+    if as_of is not None:
+        price = get_historical_close_at_time(broker, symbol, exchange, as_of, refresh_mapping=refresh_mapping)
+        return None if math.isnan(price) else float(price)
+    time_key = dt.datetime.now().replace(second=0, microsecond=0).strftime("%Y%m%d_%H%M")
+    cached = get_price_cache(symbol, time_key)
+    if cached is not None:
+        return float(cached)
+    price = get_mid_price([broker], symbol, exchange=exchange, mds=mds, last=last)
+    if math.isnan(price):
+        return None
+    set_price_cache(symbol, time_key, price)
+    return float(price)
+
+
+def get_future_underlying_price(
+    broker: BrokerBase,
+    future_symbol: str,
+    exchange: str = "NSE",
+    as_of: Optional[dt.datetime] = None,
+    *,
+    mds: Optional[str] = None,
+    last: bool = True,
+) -> Optional[float]:
+    """Underlying price for a future. Index future => IND; else => STK. No interpolation. Returns None on failure."""
+    if "_FUT_" not in future_symbol:
+        return None
+    base = future_symbol.split("_")[0]
+    is_index = "NIFTY" in future_symbol or "SENSEX" in future_symbol
+    underlying = f"{base}_IND___" if is_index else f"{base}_STK___"
+    return get_price_at_time(broker, underlying, exchange, as_of=as_of, mds=mds, last=last)
 
 
 def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds: Optional[str] = None, last=True):
@@ -2776,7 +2953,7 @@ def get_option_underlying_price(
     mds: Optional[str] = None,
     last=True,
     as_of: Optional[dt.datetime] = None,
-) -> float:
+) -> Optional[float]:
     """Retrieve underlying price for a symbol; interpolates for index options when fut_expiry given.
 
     When as_of is None: uses current mid (or last) price and now() for interpolation.
@@ -2793,7 +2970,7 @@ def get_option_underlying_price(
         as_of: If set, use historical close at this time; else current prices and now().
 
     Returns:
-        Price of underlying (float); nan on failure.
+        Price of underlying, or None on failure.
     """
     base = symbol.split("_")[0]
     is_index = "NIFTY" in symbol or "SENSEX" in symbol
@@ -2802,14 +2979,14 @@ def get_option_underlying_price(
         # Historical path: use close at as_of (via 1m bars)
         broker = brokers[0] if brokers else None
         if broker is None:
-            return float("nan")
+            return None
         if is_index and fut_expiry:
             underlying_ind = f"{base}_IND___"
             underlying_fut = f"{base}_FUT_{fut_expiry}__"
-            price_u = _get_historical_close_at_time(broker, underlying_ind, exchange, as_of)
-            price_f = _get_historical_close_at_time(broker, underlying_fut, exchange, as_of)
-            if math.isnan(price_u) or math.isnan(price_f):
-                return float("nan")
+            price_u = get_price_at_time(broker, underlying_ind, exchange, as_of=as_of)
+            price_f = get_price_at_time(broker, underlying_fut, exchange, as_of=as_of)
+            if price_u is None or price_f is None:
+                return None
             t_o = calc_fractional_business_days(
                 as_of, dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
             )
@@ -2821,10 +2998,10 @@ def get_option_underlying_price(
             return price_f
         if is_index and not fut_expiry:
             underlying_ind = f"{base}_IND___"
-            return _get_historical_close_at_time(broker, underlying_ind, exchange, as_of)
+            return get_price_at_time(broker, underlying_ind, exchange, as_of=as_of)
         # Non-index: FUT with expiry = option expiry
         underlying_fut = f"{base}_FUT_{opt_expiry}__"
-        return _get_historical_close_at_time(broker, underlying_fut, exchange, as_of)
+        return get_price_at_time(broker, underlying_fut, exchange, as_of=as_of)
 
     # Current path: mid (or last) and now()
     if not fut_expiry:
@@ -2839,13 +3016,15 @@ def get_option_underlying_price(
         underlying = base + "_FUT_" + fut_expiry + "__"
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
         if math.isnan(price_f):
-            return float("nan")
+            return None
         logger.debug(
             "get_option_underlying_price: fut_expiry=%s underlying=%s price_f (fut)=%s",
             fut_expiry,
             underlying,
             price_f,
         )
+    if math.isnan(price_f):
+        return None
 
     if is_index and fut_expiry:
         t_o = calc_fractional_business_days(
@@ -2860,6 +3039,10 @@ def get_option_underlying_price(
             price_u = last_price
         else:
             price_u = get_price(brokers, underlying_ind, checks=["prior_close"], exchange=exchange, mds=mds).prior_close
+            if math.isnan(price_u):
+                return None
+        if t_f is None or t_f == 0:
+            return None
         price_f = price_u + (price_f - price_u) * t_o / t_f
         logger.debug(
             "get_option_underlying_price: index interpolated price_u=%s t_o=%s t_f=%s price_f=%s",
@@ -2868,7 +3051,7 @@ def get_option_underlying_price(
             t_f,
             price_f,
         )
-    return price_f
+    return float(price_f)
 
 
 def calculate_delta(
@@ -3129,6 +3312,9 @@ def get_delta_strike(
             brokers, underlying_symbol, opt_expiry, fut_expiry, exchange=exchange, mds=mds
         )
         logger.debug("get_delta_strike: price_f from get_option_underlying_price=%s", price_f)
+        if price_f is None:
+            logger.debug("get_delta_strike: no underlying price available from get_option_underlying_price")
+            return None
     else:
         price_f = get_price(brokers, underlying_symbol, checks=["last"], exchange=exchange, mds=mds).last
         logger.debug("get_delta_strike: price_f from get_price(underlying).last=%s", price_f)
