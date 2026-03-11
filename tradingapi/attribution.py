@@ -725,6 +725,7 @@ def calculate_attribution_for_trade(
         combo_symbol = row["symbol"]
         entry_time = pd.to_datetime(row["entry_time"])
         exit_time_str = row.get("exit_time", "")
+        caller_provided_asof_time = current_time is not None
 
         if current_time is None:
             if exit_time_str == "" or exit_time_str == "0" or pd.isna(exit_time_str):
@@ -737,9 +738,9 @@ def calculate_attribution_for_trade(
         else:
             exit_time = pd.to_datetime(exit_time_str)
 
-        market_close_time = exit_time.replace(hour=15, minute=30, second=0, microsecond=0)
-        if exit_time > market_close_time:
-            exit_time = market_close_time
+        exit_day_market_close = exit_time.replace(hour=15, minute=30, second=0, microsecond=0)
+        if exit_time > exit_day_market_close:
+            exit_time = exit_day_market_close
 
         # Naive datetimes for chameli
         entry_dt = get_naive_dt(cast(Union[dt.datetime, pd.Timestamp], entry_time))
@@ -752,36 +753,68 @@ def calculate_attribution_for_trade(
         exit_dt = cast(dt.datetime, exit_dt)
         original_entry_dt = entry_dt
         original_exit_dt = exit_dt
-        entry_time_shifted = False
-        exit_time_shifted = False
-        no_exit_in_row = exit_time_str == "" or exit_time_str == "0" or pd.isna(exit_time_str)
-        effective_open = no_exit_in_row
+        entry_shifted_to_prior_eod = False
+        exit_shifted_from_row = False
+        is_open_position = exit_time_str == "" or exit_time_str == "0" or pd.isna(exit_time_str)
+        use_live_exit_price = is_open_position
 
         entry_price = row.get("entry_price", 0.0)
         exit_price = row.get("exit_price", 0.0)
         if exit_price == 0 or exit_price is None:
             exit_price = row.get("mtm", entry_price)
 
+        # Guard when day=False (same as spec: return default if entry>attr date, or both before attr date, or entry on attr date but current < entry)
+        if not day and current_time is not None:
+            attribution_date = (
+                current_time.date()
+                if hasattr(current_time, "date")
+                else get_naive_dt(current_time).date()  # type: ignore[union-attr]
+            )
+            current_naive = get_naive_dt(current_time)
+            current_dt = (
+                current_naive.to_pydatetime()
+                if isinstance(current_naive, pd.Timestamp)
+                else cast(dt.datetime, current_naive)
+            )
+            entry_date = entry_dt.date() if hasattr(entry_dt, "date") else entry_dt
+            if attribution_date < entry_date:
+                return result
+            if attribution_date == entry_date and current_dt < entry_dt:
+                return result
+            if not is_open_position and hasattr(exit_dt, "date"):
+                exit_date = exit_dt.date()
+                if entry_date < attribution_date and exit_date < attribution_date:
+                    return result
+            if exit_dt > current_dt:
+                exit_dt = current_dt
+                use_live_exit_price = True
+
+        legs = _parse_combo_symbol(combo_symbol)
+        if len(legs) == 0:
+            return result
+
         # Day-level attribution: compute effective attribution window and rely on as_of/live lookups downstream.
         if day and broker is not None and current_time is not None:
             attribution_date = current_time.date() if hasattr(current_time, "date") else get_naive_dt(current_time).date()  # type: ignore[union-attr]
             attribution_date_str = attribution_date.strftime("%Y%m%d")
-            entry_price = mtm_entry_price(row, attribution_date, broker, refresh_mapping=refresh_mapping)
-            exit_price = mtm_exit_price(row, attribution_date, broker, refresh_mapping=refresh_mapping)
+            # MTM entry/exit prices not used for options (performance_attribution uses per-leg prices and underlying/IV).
+            if not all(is_options_symbol(leg) for leg in legs.keys()):
+                entry_price = mtm_entry_price(row, attribution_date, broker, refresh_mapping=refresh_mapping)
+                exit_price = mtm_exit_price(row, attribution_date, broker, refresh_mapping=refresh_mapping)
             entry_date = entry_dt.date() if hasattr(entry_dt, "date") else entry_dt
             if attribution_date < entry_date:
                 return result  # Trade did not exist on attribution day; zero attribution for this day
             if entry_date < attribution_date:
-                prior = advance_by_biz_days(attribution_date_str, -1)
-                prior_date_str = (
-                    str(prior)
-                    if isinstance(prior, str)
-                    else (prior.strftime("%Y%m%d") if hasattr(prior, "strftime") else str(prior))
+                prior_biz_date = advance_by_biz_days(attribution_date_str, -1)
+                prior_biz_date_str = (
+                    str(prior_biz_date)
+                    if isinstance(prior_biz_date, str)
+                    else (prior_biz_date.strftime("%Y%m%d") if hasattr(prior_biz_date, "strftime") else str(prior_biz_date))
                 )
-                if len(prior_date_str) == 10 and prior_date_str[4] == "-":
-                    prior_date_str = prior_date_str.replace("-", "")
-                entry_dt = dt.datetime.strptime(prior_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
-            market_close_attr = dt.datetime.strptime(attribution_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
+                if len(prior_biz_date_str) == 10 and prior_biz_date_str[4] == "-":
+                    prior_biz_date_str = prior_biz_date_str.replace("-", "")
+                entry_dt = dt.datetime.strptime(prior_biz_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+            attribution_day_market_close = dt.datetime.strptime(attribution_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
             current_naive = get_naive_dt(current_time)
             current_dt = (
                 current_naive.to_pydatetime()
@@ -791,39 +824,42 @@ def calculate_attribution_for_trade(
             if attribution_date == entry_date and current_dt < entry_dt:
                 return result  # Current time is before trade entry; no attribution yet
 
-            if not no_exit_in_row and hasattr(exit_dt, "date"):
+            if not is_open_position and hasattr(exit_dt, "date"):
                 exit_date = exit_dt.date()
                 if exit_date < attribution_date:
                     return result  # Trade already closed before attribution day; zero attribution for this day
                 if exit_date == attribution_date:
                     if current_dt < exit_dt:
-                        effective_open = True
+                        use_live_exit_price = True
                         exit_dt = current_dt
                     else:
-                        effective_open = False
+                        use_live_exit_price = False
                 else:
-                    effective_open = True
+                    use_live_exit_price = True
                     exit_dt = (
                         current_dt
-                        if (attribution_date == dt.date.today() and current_dt < market_close_attr)
-                        else market_close_attr
+                        if (attribution_date == dt.date.today() and current_dt < attribution_day_market_close)
+                        else attribution_day_market_close
                     )
             else:
-                effective_open = True
-                exit_dt = current_dt if current_dt < market_close_attr else market_close_attr
+                use_live_exit_price = True
+                exit_dt = current_dt if current_dt < attribution_day_market_close else attribution_day_market_close
 
-            entry_time_shifted = entry_dt != original_entry_dt
-            exit_time_shifted = exit_dt != original_exit_dt
+            if exit_dt > current_dt:
+                exit_dt = current_dt
+                use_live_exit_price = True
+
+            entry_shifted_to_prior_eod = entry_dt != original_entry_dt
+            exit_shifted_from_row = exit_dt != original_exit_dt
 
         # Minute-align entry/exit for all spot/IV lookups and performance_attribution (historical data is 1m only)
         entry_dt = entry_dt.replace(second=0, microsecond=0)
         exit_dt = exit_dt.replace(second=0, microsecond=0)
         # Effective-open positions use live exit-side lookup (as_of=None); closed positions use as_of=exit_dt.
-        exit_lookup_time: Optional[dt.datetime] = None if effective_open else exit_dt
-
-        legs = _parse_combo_symbol(combo_symbol)
-        if len(legs) == 0:
-            return result
+        # Live exit (as_of=None) only when caller did not pass current_time; else use effective exit time.
+        exit_lookup_time: Optional[dt.datetime] = (
+            None if (use_live_exit_price and not caller_provided_asof_time) else exit_dt
+        )
 
         has_stocks = any(is_stock_symbol(leg) for leg in legs.keys())
         has_futures = any(is_futures_symbol(leg) for leg in legs.keys())
@@ -900,16 +936,16 @@ def calculate_attribution_for_trade(
 
                 leg_entry_price = None
                 leg_exit_price = None
-                if entry_time_shifted and broker is not None:
+                if entry_shifted_to_prior_eod and broker is not None:
                     p = get_price_at_time(cast(BrokerBase, broker), leg_symbol, exchange_leg, as_of=entry_dt, mds="mds")
                     if p is not None:
                         leg_entry_price = p
-                if (exit_time_shifted or effective_open) and broker is not None:
+                if (exit_shifted_from_row or use_live_exit_price) and broker is not None:
                     p = get_price_at_time(
                         cast(BrokerBase, broker),
                         leg_symbol,
                         exchange_leg,
-                        as_of=None if effective_open else exit_dt,
+                        as_of=None if (use_live_exit_price and not caller_provided_asof_time) else exit_dt,
                         mds="mds",
                     )
                     if p is not None:
@@ -1018,7 +1054,7 @@ def calculate_attribution_for_trades(
         List of attribution dicts (one per row), in the same order as rows.
     """
     if isinstance(rows, pd.DataFrame):
-        row_list = [rows.loc[i] for i in range(len(rows))]
+        row_list = [rows.iloc[i] for i in range(len(rows))]
     else:
         row_list = list(rows)
     out: List[Dict[str, Any]] = []
