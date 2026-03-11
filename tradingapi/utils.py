@@ -721,9 +721,7 @@ def get_pnl_table(
 
                 if eod:
                     # Handle option expiration
-                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(
-                        symbol, get_tradingapi_now().strftime("%Y%m%d"), market_close_time
-                    ):
+                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(symbol, market_close_time):
                         try:
                             # are options expiration needed?
                             get_open_position_by_order(
@@ -812,26 +810,6 @@ def get_pnl_table(
                 # Ensure entry_time/exit_time are string-like (historical contract for downstream .str accessor)
                 out["entry_time"] = out["entry_time"].astype(str)
                 out["exit_time"] = out["exit_time"].astype(str)
-                # Debug: Log trades with exit_keys before filtering
-                if "int_order_id" in out.columns and "exit_keys" in out.columns:
-                    trades_with_exits = out[out["exit_keys"].astype(str).str.strip() != ""]
-                    if len(trades_with_exits) > 0:
-                        for idx, row in trades_with_exits.iterrows():
-                            trading_logger.log_debug(
-                                "Trade with exit_keys in DataFrame before filter",
-                                {
-                                    "int_order_id": row.get("int_order_id", ""),
-                                    "symbol": row.get("symbol", ""),
-                                    "entry_time": str(row.get("entry_time", "")),
-                                    "exit_time": str(row.get("exit_time", "")),
-                                    "entry_time_type": str(type(row.get("entry_time", ""))),
-                                    "exit_time_type": str(type(row.get("exit_time", ""))),
-                                    "start_time": start_time,
-                                    "end_time": end_time,
-                                },
-                            )
-
-                # Handle mixed types in datetime columns by converting to string for comparison
 
                 mask = (
                     (safe_datetime_compare(out.entry_time, start_time, ">=")) | (out.entry_time.astype(str) == "")
@@ -882,95 +860,26 @@ def get_pnl_table(
 @log_execution_time
 @validate_inputs(
     input_string=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    comparison_date=lambda x: isinstance(x, str) and len(x.strip()) == 8,
     market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
 )
-def contains_earlier_date(input_string: str, comparison_date: str, market_close_time: str) -> bool:
-    """Check if input string contains dates earlier than comparison date.
-
-    Args:
-        input_string: String to search for dates
-        comparison_date: Date to compare against (YYYYMMDD format)
-        market_close_time: Market close time (HH:MM:SS format)
-
-    Returns:
-        bool: True if earlier date found, False otherwise
-
-    Raises:
-        ValidationError: If input parameters are invalid
-        DataError: If date parsing fails
-    """
-    try:
-        # Regular expressions to match dates in various formats
-        date_patterns = [
-            re.compile(r"\d{8}"),  # YYYYMMDD
-            re.compile(r"\d{4}-\d{2}-\d{2}"),  # YYYY-MM-DD
-            re.compile(r"\d{2}/\d{2}/\d{4}"),  # MM/DD/YYYY
-        ]
-
-        # Convert the comparison date to a datetime object
-        comparison_date_obj = dt.datetime.strptime(comparison_date, "%Y%m%d")
-
-        # Get the current datetime and convert market close time to datetime object
-        current_datetime = get_tradingapi_now()
-        market_close_time_obj = dt.datetime.strptime(market_close_time, "%H:%M:%S").time()
-
-        # Define the comparison operator function based on market close time
-        def comparison_operator(date_obj):
-            if current_datetime.time() < market_close_time_obj:
-                return date_obj < comparison_date_obj
-            else:
-                return date_obj <= comparison_date_obj
-
-        for pattern in date_patterns:
-            # Find all substrings that match the pattern
-            dates = pattern.findall(input_string)
-
-            for date_str in dates:
-                try:
-                    if pattern == date_patterns[0]:
-                        date_obj = dt.datetime.strptime(date_str, "%Y%m%d")
-                    elif pattern == date_patterns[1]:
-                        date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
-                    elif pattern == date_patterns[2]:
-                        date_obj = dt.datetime.strptime(date_str, "%m/%d/%Y")
-
-                    if comparison_operator(date_obj):
-                        trading_logger.log_debug(
-                            "Earlier date found",
-                            {
-                                "input_string": input_string[:100],
-                                "comparison_date": comparison_date,
-                                "found_date": date_str,
-                                "market_close_time": market_close_time,
-                            },
-                        )
-                        return True
-                except ValueError as e:
-                    trading_logger.log_debug(
-                        "Invalid date format skipped",
-                        {"date_string": date_str, "pattern": str(pattern), "error": str(e)},
-                    )
-                    continue
-
+def contains_earlier_date(input_string: str, market_close_time: str) -> bool:
+    """True if current time is after (expiry date from input_string + market_close_time)."""
+    if ":" in input_string:
+        segment = input_string.split(":", 1)[0].split("?", 1)[0].strip()
+    else:
+        segment = input_string.split("?", 1)[0].strip() if "?" in input_string else input_string
+    match = re.search(r"\d{8}", segment)
+    if not match:
         return False
-
-    except ValueError as e:
-        context = create_error_context(
-            input_string=input_string[:100],
-            comparison_date=comparison_date,
-            market_close_time=market_close_time,
-            error=str(e),
-        )
-        raise DataError(f"Date parsing error: {str(e)}", context)
-    except Exception as e:
-        context = create_error_context(
-            input_string=input_string[:100],
-            comparison_date=comparison_date,
-            market_close_time=market_close_time,
-            error_type=type(e).__name__,
-        )
-        raise DataError(f"Error in date comparison: {str(e)}", context)
+    expiry_date = match.group(0)
+    close_t = dt.datetime.strptime(market_close_time, "%H:%M:%S").time()
+    expiry_dt = dt.datetime.strptime(expiry_date, "%Y%m%d").replace(
+        hour=close_t.hour, minute=close_t.minute, second=close_t.second, microsecond=0
+    )
+    now = dt.datetime.now()
+    if now.tzinfo is not None:
+        expiry_dt = expiry_dt.replace(tzinfo=now.tzinfo)
+    return now > expiry_dt
 
 
 @log_execution_time
@@ -1187,10 +1096,10 @@ def get_open_position_by_order(
             expiry is not None
             and len(expiry) > 0
             and (
-                expiry < get_tradingapi_now().strftime("%Y%m%d")
+                expiry < dt.datetime.now().strftime("%Y%m%d")
                 or (
-                    expiry == get_tradingapi_now().strftime("%Y%m%d")
-                    and get_tradingapi_now().strftime("%H:%M:%S") > market_close_time
+                    expiry == dt.datetime.now().strftime("%Y%m%d")
+                    and dt.datetime.now().strftime("%H:%M:%S") > market_close_time
                 )
             )
         ):
@@ -1221,7 +1130,10 @@ def get_open_position_by_order(
             sq_off_order.long_symbol = symbol
             sq_off_order.scrip_code = int(hget_with_default(broker, entry_key, "scrip_code", "0"))  # type: ignore
             sq_off_order.price_type = 0.0  # LMT order type
-            _process_broker_order_update(broker, sq_off_order, symbol)
+            long_symbol_for_update = cast(
+                str, broker.redis_o.hget(internal_order_id, "long_symbol") or symbol
+            )
+            _process_broker_order_update(broker, sq_off_order, long_symbol_for_update)
         return expire
 
     positions: Dict[str, Position] = {}
@@ -2725,6 +2637,7 @@ def _log_get_historical_call(
     symbols: str,
     date_start: str,
     date_end: str,
+    time_key: str,
     periodicity: str,
 ) -> None:
     """Log get_historical call to get_historical_calls.log (used only from get_historical_close_at_time)."""
@@ -2747,7 +2660,7 @@ def _log_get_historical_call(
                 else:
                     count = 1
                 _get_historical_call_count = count
-                line = f"{count},{ts},{broker_name},{symbols},{date_start},{date_end},{periodicity}\n"
+                line = f"{count},{ts},{broker_name},{symbols},{date_start},{date_end},{time_key},{periodicity}\n"
                 f.write(line)
                 f.flush()
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
@@ -2843,7 +2756,7 @@ def get_historical_close_at_time(
             pass
 
     try:
-        _log_get_historical_call(broker, symbol, date_str, date_str, "1m")
+        _log_get_historical_call(broker, symbol, date_str, date_str, time_key = time_key,periodicity="1m")
         hist = broker.get_historical(
             symbols=symbol,
             date_start=date_str,
