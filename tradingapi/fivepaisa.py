@@ -3314,7 +3314,7 @@ class FivePaisa(BrokerBase):
                             req_list.append({"Exch": exch_for_symbol, "ExchType": exch_type, "ScripCode": scrip_code})
 
                     for symbol in symbols:
-                        if ":" in symbol and "?" in symbol:
+                        if "?" in symbol:
                             try:
                                 legs = parse_combo_symbol(symbol)
                                 for leg_symbol in legs:

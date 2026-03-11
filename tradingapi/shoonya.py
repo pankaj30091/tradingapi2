@@ -2345,7 +2345,7 @@ class Shoonya(BrokerBase):
                         )
 
                 for symbol in symbol_list:
-                    if ":" in symbol and "?" in symbol:
+                    if "?" in symbol:
                         try:
                             legs = parse_combo_symbol(symbol)
                             for leg_symbol in legs:

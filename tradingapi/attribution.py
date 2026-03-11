@@ -123,7 +123,7 @@ def get_historical_close_price(
         date_str = str(date_str)
 
     date_key: str = date_str if isinstance(date_str, str) else str(date_str)
-    if ":" in symbol:
+    if "?" in symbol:
         try:
             legs = parse_combo_symbol(symbol)
             combo_price = 0.0
@@ -301,7 +301,7 @@ def get_greeks_at_time(
 def get_iv_for_symbol(
     symbol: str,
     price: float,
-    spot: float,
+    underlying: float,
     time: dt.datetime,
     exchange: str,
 ) -> Optional[float]:
@@ -311,7 +311,7 @@ def get_iv_for_symbol(
     Args:
         symbol: Options symbol
         price: Option price
-        spot: Underlying spot price
+        underlying: Underlying price
         time: Time to calculate IV at
         exchange: Exchange name
 
@@ -331,7 +331,7 @@ def get_iv_for_symbol(
         greeks = calc_greeks(
             long_symbol=symbol,
             opt_price=price,
-            underlying=spot,
+            underlying=underlying,
             calc_time=time,
             greeks=["vol"],
             risk_free_rate=0,
@@ -1170,7 +1170,7 @@ def mtm_entry_price(
             exchange = "BSE" if "SENSEX" in symbol else "NSE"
             prior_eod_dt = dt.datetime.strptime(prior_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
 
-            if ":" in symbol:
+            if "?" in symbol:
                 legs = parse_combo_symbol(symbol)
                 combo_price = 0.0
                 for leg_symbol, quantity in legs.items():
@@ -1256,7 +1256,7 @@ def mtm_exit_price(
             use_mtm_exit = False
 
     def _combo_or_single_price(as_of: Optional[dt.datetime], *, last: bool = False) -> Optional[float]:
-        if ":" in symbol:
+        if "?" in symbol:
             legs = parse_combo_symbol(symbol)
             total = 0.0
             for leg_symbol, quantity in legs.items():
