@@ -937,6 +937,7 @@ class FivePaisa(BrokerBase):
             if self.api:
                 self.api = None
                 trading_logger.log_info("API reference cleared", {"broker_type": self.broker.name})
+            self.subscribe_thread = None
 
             trading_logger.log_info("Successfully disconnected from FivePaisa", {"broker_type": self.broker.name})
             return True
@@ -3227,6 +3228,32 @@ class FivePaisa(BrokerBase):
                 context = create_error_context(symbols=symbols, exchange=exchange, error=str(e))
                 raise MarketDataError(f"Failed to map exchange: {str(e)}", context)
 
+            def resolve_symbol_and_exchange(json_data):
+                """Resolve a token to the correct symbol/exchange even when the tick exchange key is incomplete."""
+                token = json_data.get("Token")
+                exchange_candidates = []
+                tick_exchange = json_data.get("Exch")
+
+                if tick_exchange in self.exchange_mappings:
+                    exchange_candidates.append(tick_exchange)
+
+                if isinstance(tick_exchange, str) and tick_exchange:
+                    short_exchange = tick_exchange[0]
+                    if short_exchange in self.exchange_mappings and short_exchange not in exchange_candidates:
+                        exchange_candidates.append(short_exchange)
+
+                for exchange_key in exchange_candidates:
+                    symbol = self.exchange_mappings[exchange_key]["symbol_map_reversed"].get(token)
+                    if symbol is not None:
+                        return symbol, exchange_key
+
+                for exchange_key, exchange_mapping in self.exchange_mappings.items():
+                    symbol = exchange_mapping["symbol_map_reversed"].get(token)
+                    if symbol is not None:
+                        return symbol, exchange_key
+
+                return None, tick_exchange
+
             def map_to_price(json_data):
                 """Map JSON data to Price object."""
                 try:
@@ -3241,10 +3268,18 @@ class FivePaisa(BrokerBase):
                     price.high = json_data.get("High", float("nan"))
                     price.low = json_data.get("Low", float("nan"))
                     price.volume = json_data.get("TotalQty", float("nan"))
-                    price.symbol = self.exchange_mappings[json_data["Exch"]]["symbol_map_reversed"].get(
-                        json_data.get("Token")
-                    )
-                    price.exchange = self.map_exchange_for_db(price.symbol, json_data["Exch"])
+                    price.symbol, resolved_exchange = resolve_symbol_and_exchange(json_data)
+                    if price.symbol is None:
+                        trading_logger.log_warning(
+                            "Skipping price data with unmapped token",
+                            {
+                                "token": json_data.get("Token"),
+                                "exchange": json_data.get("Exch"),
+                                "exchange_type": json_data.get("ExchType"),
+                            },
+                        )
+                        return None
+                    price.exchange = self.map_exchange_for_db(price.symbol, resolved_exchange)
                     price.timestamp = self.convert_to_ist(json_data["TickDt"])
                     return price
                 except Exception as e:
@@ -3258,10 +3293,10 @@ class FivePaisa(BrokerBase):
                     json_data = json.loads(data_str)
                     if len(json_data) == 1:
                         price = map_to_price(json_data[0])
-                        if ext_callback:
+                        if price is not None and ext_callback:
                             ext_callback(price)
                 except Exception as e:
-                    trading_logger.log_error("Error processing WebSocket message", e, {"message": message})
+                    trading_logger.log_error("Error processing WebSocket message", e, {"ws_message": message})
 
             def error_data(ws, err):
                 """Handle WebSocket errors."""
@@ -3301,6 +3336,52 @@ class FivePaisa(BrokerBase):
                 except Exception as e:
                     trading_logger.log_error("Error in connect_and_receive", e, {"req_data": req_data})
                     raise
+
+            def has_live_stream():
+                """Return True only when the streaming thread and websocket are both usable."""
+                return (
+                    self.subscribe_thread is not None
+                    and self.subscribe_thread.is_alive()
+                    and self.api is not None
+                    and getattr(self.api, "ws", None) is not None
+                    and callable(getattr(self.api.ws, "send", None))
+                )
+
+            def reconnect_stream():
+                """Start a fresh websocket and restore all subscriptions."""
+                try:
+                    if self.api is not None and getattr(self.api, "ws", None) is not None:
+                        self.api.close_data()
+                except Exception:
+                    pass
+                self.subscribe_thread = None
+                req_list_full = expand_symbols_to_request(self.subscribed_symbols)
+                if not req_list_full:
+                    context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
+                    raise MarketDataError("No symbols to reconnect after socket closure", context)
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
+                req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
+                self.subscribe_thread = threading.Thread(
+                    target=connect_and_receive,
+                    args=(req_data_full,),
+                    name="MarketDataStreamer",
+                )
+                self.subscribe_thread.start()
+                time.sleep(2)
+                trading_logger.log_info(
+                    "Reconnected after socket closure",
+                    {"subscribed_count": len(self.subscribed_symbols)},
+                )
+
+            def send_stream_request(req_data):
+                """Send an incremental subscribe/unsubscribe over an existing websocket."""
+                if self.api is None:
+                    raise BrokerConnectionError("API client not initialized")
+                ws = getattr(self.api, "ws", None)
+                if ws is None or not callable(getattr(ws, "send", None)):
+                    raise AttributeError("WebSocket client does not support send")
+                ws.send(json.dumps(req_data))
 
             def resolve_exchange_from_symbology(long_symbol: str):
                 """Resolve API exchange code for a symbol from symbology (which exchange's symbol_map contains it)."""
@@ -3388,7 +3469,7 @@ class FivePaisa(BrokerBase):
                     req_data = self.api.Request_Feed("mf", operation, req_list)
 
                     # Start the connection and receiving data in a separate thread
-                    if self.subscribe_thread is None:
+                    if not has_live_stream():
                         self.subscribe_thread = threading.Thread(
                             target=connect_and_receive, args=(req_data,), name="MarketDataStreamer"
                         )
@@ -3400,36 +3481,13 @@ class FivePaisa(BrokerBase):
                             "Requesting streaming for existing connection", {"req_data": json.dumps(req_data)}
                         )
                         try:
-                            self.api.ws.send(json.dumps(req_data))
-                        except WebSocketConnectionClosedException:
+                            send_stream_request(req_data)
+                        except (AttributeError, WebSocketConnectionClosedException):
                             trading_logger.log_info(
                                 "WebSocket closed, reconnecting...",
                                 {"operation": operation, "symbols_count": len(symbols), "exchange": exchange},
                             )
-                            try:
-                                if self.api is not None:
-                                    self.api.close_data()
-                            except Exception:
-                                pass
-                            self.subscribe_thread = None
-                            req_list_full = expand_symbols_to_request(self.subscribed_symbols)
-                            if not req_list_full:
-                                context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
-                                raise MarketDataError("No symbols to reconnect after socket closure", context)
-                            if self.api is None:
-                                raise BrokerConnectionError("API client not initialized")
-                            req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
-                            self.subscribe_thread = threading.Thread(
-                                target=connect_and_receive,
-                                args=(req_data_full,),
-                                name="MarketDataStreamer",
-                            )
-                            self.subscribe_thread.start()
-                            time.sleep(2)
-                            trading_logger.log_info(
-                                "Reconnected after socket closure",
-                                {"subscribed_count": len(self.subscribed_symbols)},
-                            )
+                            reconnect_stream()
                             # New connection already has full subscription; no need to send again
                 else:
                     trading_logger.log_warning(
@@ -3461,6 +3519,7 @@ class FivePaisa(BrokerBase):
             try:
                 if self.api is not None:
                     self.api.close_data()
+                self.subscribe_thread = None
                 trading_logger.log_info("Streaming stopped successfully")
             except Exception as e:
                 context = create_error_context(error=str(e))
