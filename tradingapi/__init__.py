@@ -180,13 +180,26 @@ class TradingAPILogger:
             pass
         return {}
 
+    def _sanitize_extra(self, context: Optional[dict] = None) -> dict:
+        """Rename reserved LogRecord keys in extra context to avoid logging failures."""
+        extra = dict(context or {})
+        reserved_keys = set(logging.makeLogRecord({}).__dict__.keys()) | {
+            "message",
+            "asctime",
+        }
+        sanitized = {}
+        for key, value in extra.items():
+            new_key = f"context_{key}" if key in reserved_keys else key
+            sanitized[new_key] = value
+        return sanitized
+
     def log_error(
         self, message: str, error: Optional[Exception] = None, context: Optional[dict] = None, exc_info: bool = True
     ):
         """Log an error with structured context. Extra values are sanitized to single-line so
         parse_log_errors.py can reliably match the ERROR line (same format as other tradingapi logs).
         """
-        extra = context or {}
+        extra = self._sanitize_extra(context)
         if error:
             extra["error_type"] = type(error).__name__
             # Keep error_message single-line so the log line matches parse_log_errors structured format
@@ -206,7 +219,7 @@ class TradingAPILogger:
 
     def log_warning(self, message: str, context: Optional[dict] = None):
         """Log a warning with structured context."""
-        extra = context or {}
+        extra = self._sanitize_extra(context)
 
         # Add caller information
         caller_info = self._get_caller_info()
@@ -216,7 +229,7 @@ class TradingAPILogger:
 
     def log_info(self, message: str, context: Optional[dict] = None):
         """Log an info message with structured context."""
-        extra = context or {}
+        extra = self._sanitize_extra(context)
 
         # Add caller information
         caller_info = self._get_caller_info()
@@ -226,7 +239,7 @@ class TradingAPILogger:
 
     def log_debug(self, message: str, context: Optional[dict] = None):
         """Log a debug message with structured context."""
-        extra = context or {}
+        extra = self._sanitize_extra(context)
 
         # Add caller information
         caller_info = self._get_caller_info()
