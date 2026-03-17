@@ -902,16 +902,25 @@ class FlatTrade(BrokerBase):
 
             cash_float = float(cash)
             collateral = float(limits.get("collateral", 0))
+            used = 0.0
+            for field in ("usedmargin", "UsedMargin", "utilisedamount", "UtilisedAmount", "marginused", "MarginUsed"):
+                if field in limits:
+                    try:
+                        used = float(limits[field])
+                        break
+                    except (ValueError, TypeError):
+                        continue
 
             trading_logger.log_debug(
                 "Available capital retrieved",
                 {
                     "cash": cash_float,
                     "collateral": collateral,
+                    "used": used,
                     "total_capital": cash_float + collateral,
                 },
             )
-            return {"cash": cash_float, "collateral": collateral}
+            return {"cash": cash_float, "collateral": collateral, "used": used}
 
         except (BrokerConnectionError, MarketDataError):
             raise

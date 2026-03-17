@@ -875,6 +875,26 @@ class FivePaisa(BrokerBase):
                         except (ValueError, TypeError):
                             continue
 
+            used = 0.0
+            used_fields = [
+                "UtilizedMargin",
+                "UsedMargin",
+                "MarginUsed",
+                "BookedMargin",
+                "TotalMargin",
+                "utilizedmargin",
+                "usedmargin",
+                "marginused",
+                "MarginUtilized",
+            ]
+            for field in used_fields:
+                if field in margin_data[0]:
+                    try:
+                        used = float(margin_data[0][field])
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
             trading_logger.log_debug(
                 "Available capital retrieved",
                 {
@@ -882,10 +902,11 @@ class FivePaisa(BrokerBase):
                     "funds_payln": funds_payln,
                     "cash": cash,
                     "collateral": collateral,
+                    "used": used,
                     "total_capital": cash + collateral,
                 },
             )
-            return {"cash": cash, "collateral": collateral}
+            return {"cash": cash, "collateral": collateral, "used": used}
 
         except (BrokerConnectionError, MarketDataError):
             raise

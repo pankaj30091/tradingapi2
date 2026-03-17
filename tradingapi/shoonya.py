@@ -796,16 +796,36 @@ class Shoonya(BrokerBase):
                     except (ValueError, TypeError):
                         continue
 
+            used = 0.0
+            used_fields = [
+                "usedmargin",
+                "UsedMargin",
+                "utilisedamount",
+                "UtilisedAmount",
+                "marginused",
+                "MarginUsed",
+                "spanused",
+                "SpanUsed",
+            ]
+            for field in used_fields:
+                if field in limits:
+                    try:
+                        used = float(limits[field])
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
             trading_logger.log_debug(
                 "Available capital retrieved",
                 {
                     "cash": cash_float,
                     "collateral": collateral,
+                    "used": used,
                     "total_capital": cash_float + collateral,
                     "broker": self.broker.name,
                 },
             )
-            return {"cash": cash_float, "collateral": collateral}
+            return {"cash": cash_float, "collateral": collateral, "used": used}
 
         except (BrokerConnectionError, MarketDataError):
             raise
