@@ -11,8 +11,6 @@ import pandas as pd
 import pytz
 import redis
 
-from chameli.dateutils import parse_datetime
-
 logger = logging.getLogger(__name__)
 
 from .exceptions import (
@@ -26,6 +24,7 @@ from .exceptions import (
     create_error_context,
 )
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
+from chameli.dateutils import parse_datetime
 
 # Removed trading_logger import to avoid circular import issues
 

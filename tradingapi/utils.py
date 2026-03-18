@@ -368,6 +368,9 @@ def _safe_parse_json_or_dict(json_str):
                 }
                 return eval(json_str, safe_globals, {})
             except Exception as eval_error:
+                parsed_loose_info = _parse_loose_additional_info(json_str)
+                if parsed_loose_info is not None:
+                    return parsed_loose_info
                 raise DataError(
                     f"Cannot parse as JSON or Python dict: {str(e)}",
                     {
@@ -377,6 +380,57 @@ def _safe_parse_json_or_dict(json_str):
                         "eval_error": str(eval_error),
                     },
                 )
+
+
+def _parse_loose_additional_info(info_str):
+    info_str = str(info_str).strip()
+    if not info_str:
+        return {}
+
+    import shlex
+
+    def _coerce_value(value):
+        lower_value = value.lower()
+        if lower_value == "true":
+            return True
+        if lower_value == "false":
+            return False
+        if lower_value == "none":
+            return None
+        try:
+            if any(ch in value for ch in [".", "e", "E"]):
+                return float(value)
+            return int(value)
+        except ValueError:
+            return value
+
+    try:
+        tokens = shlex.split(info_str)
+    except ValueError:
+        tokens = info_str.split()
+
+    parsed = {}
+    message_tokens = []
+    for token in tokens:
+        token_parts = [part for part in token.split(",") if part]
+        consumed_key_value = False
+        for part in token_parts:
+            if "=" not in part:
+                if not consumed_key_value:
+                    message_tokens.append(part)
+                continue
+            key, value = part.split("=", 1)
+            if not key:
+                continue
+            parsed[key] = _coerce_value(value)
+            consumed_key_value = True
+        if "=" not in token and not token_parts:
+            message_tokens.append(token)
+
+    if message_tokens:
+        parsed["message"] = " ".join(message_tokens)
+
+    return parsed or {"message": info_str}
 
 
 @log_execution_time
