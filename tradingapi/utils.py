@@ -1004,7 +1004,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
                 entry_keys = []
                 for int_order_id in int_order_ids:
                     symbol = cast(str, broker.redis_o.hget(int_order_id, "long_symbol"))
-                    combo = True if ":" in symbol else False
+                    combo = True if ":" in symbol or "?" in symbol else False
                     entry_keys_str = cast(str, broker.redis_o.hget(int_order_id, "entry_keys"))
                     if entry_keys_str:
                         entry_keys.append(entry_keys_str.split()[0])
