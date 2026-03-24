@@ -253,6 +253,9 @@ class FivePaisa(BrokerBase):
             self._api_proxy_url = None
             self.subscribe_thread = None
             self.subscribed_symbols = []
+            self._is_connected_cache_ttl_secs = 3.0
+            self._last_is_connected_check_ts = 0.0
+            self._last_is_connected_result: Optional[bool] = None
 
             trading_logger.log_info(
                 "FivePaisa broker initialized", {"broker_type": "FivePaisa", "config_keys": list(kwargs.keys())}
@@ -776,8 +779,23 @@ class FivePaisa(BrokerBase):
             BrokerConnectionError: If connection check fails
         """
         try:
+            now = time.monotonic()
+            if (
+                self._last_is_connected_result is True
+                and now - self._last_is_connected_check_ts < self._is_connected_cache_ttl_secs
+            ):
+                trading_logger.log_debug(
+                    "Using cached connection check result",
+                    {
+                        "broker_type": "FivePaisa",
+                        "cache_age_secs": round(now - self._last_is_connected_check_ts, 3),
+                    },
+                )
+                return True
+
             if not self.api:
                 trading_logger.log_warning("API not initialized", {"broker_type": "FivePaisa"})
+                self._last_is_connected_result = False
                 return False
 
             # Check margin balance
@@ -785,6 +803,7 @@ class FivePaisa(BrokerBase):
                 margin_data = self.api.margin()
                 if not margin_data or len(margin_data) == 0:
                     trading_logger.log_warning("No margin data available", {"broker_type": "FivePaisa"})
+                    self._last_is_connected_result = False
                     return False
 
                 ledger_balance = float(margin_data[0]["Ledgerbalance"])
@@ -798,6 +817,7 @@ class FivePaisa(BrokerBase):
 
             except Exception as e:
                 trading_logger.log_error("Error checking margin", e, {"broker_type": "FivePaisa"})
+                self._last_is_connected_result = False
                 return False
 
             # Check quote availability
@@ -807,6 +827,7 @@ class FivePaisa(BrokerBase):
                     trading_logger.log_warning(
                         "Quote check failed", {"broker_type": "FivePaisa", "quote_last": quote.last if quote else None}
                     )
+                    self._last_is_connected_result = False
                     return False
 
                 trading_logger.log_debug("Quote check completed", {"quote_last": quote.last, "symbol": "NIFTY_IND___"})
@@ -815,6 +836,7 @@ class FivePaisa(BrokerBase):
                 trading_logger.log_error(
                     "Error checking quote", e, {"broker_type": "FivePaisa", "symbol": "NIFTY_IND___"}
                 )
+                self._last_is_connected_result = False
                 return False
 
             trading_logger.log_info(
@@ -825,11 +847,14 @@ class FivePaisa(BrokerBase):
                     "quote_last": quote.last if quote else None,
                 },
             )
+            self._last_is_connected_result = True
+            self._last_is_connected_check_ts = now
             return True
 
         except Exception as e:
             context = create_error_context(broker_type="FivePaisa", error=str(e))
             trading_logger.log_error("Connection check failed", e, context)
+            self._last_is_connected_result = False
             return False
 
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
@@ -3106,54 +3131,50 @@ class FivePaisa(BrokerBase):
 
                 snapshot = out["Data"][0]
 
-                # Fetch market depth
-                if self.api is None:
-                    raise BrokerConnectionError("API client not initialized")
-                out = self.api.fetch_market_depth_by_scrip(
-                    Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
-                )
-
-                if not out or "MarketDepthData" not in out:
-                    context = create_error_context(
-                        long_symbol=long_symbol,
-                        mapped_exchange=mapped_exchange,
-                        scrip_code=scrip_code,
-                        api_response=out,
+                if not long_symbol.endswith("_IND___"):
+                    # FivePaisa does not return market depth for index symbols.
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
+                    out = self.api.fetch_market_depth_by_scrip(
+                        Exchange=mapped_exchange, ExchangeType=exch_type, ScripCode=scrip_code
                     )
-                    raise MarketDataError("No market depth data received", context)
 
-                market_depth_data = cast(List[Dict[str, Any]], out["MarketDepthData"])
-                bids = [entry for entry in market_depth_data if cast(int, entry["BbBuySellFlag"]) == 66]
-                asks = [entry for entry in market_depth_data if cast(int, entry["BbBuySellFlag"]) == 83]
+                    if not out or "MarketDepthData" not in out:
+                        context = create_error_context(
+                            long_symbol=long_symbol,
+                            mapped_exchange=mapped_exchange,
+                            scrip_code=scrip_code,
+                            api_response=out,
+                        )
+                        raise MarketDataError("No market depth data received", context)
 
-                # Get the best bid and best ask
-                best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
-                best_ask = min(asks, key=lambda x: x["Price"]) if asks else None
+                    market_depth_data = cast(List[Dict[str, Any]], out["MarketDepthData"])
+                    bids = [entry for entry in market_depth_data if cast(int, entry["BbBuySellFlag"]) == 66]
+                    asks = [entry for entry in market_depth_data if cast(int, entry["BbBuySellFlag"]) == 83]
 
-                # Extract prices and quantities
-                best_bid_price = best_bid["Price"] if best_bid else None
-                best_bid_quantity = best_bid["Quantity"] if best_bid else None
+                    best_bid = max(bids, key=lambda x: x["Price"]) if bids else None
+                    best_ask = min(asks, key=lambda x: x["Price"]) if asks else None
+                    best_bid_price = best_bid["Price"] if best_bid else None
+                    best_bid_quantity = best_bid["Quantity"] if best_bid else None
+                    best_ask_price = best_ask["Price"] if best_ask else None
+                    best_ask_quantity = best_ask["Quantity"] if best_ask else None
 
-                best_ask_price = best_ask["Price"] if best_ask else None
-                best_ask_quantity = best_ask["Quantity"] if best_ask else None
-
-                # Update market_feed with fetched data
-                market_feed.ask = (
-                    best_ask_price if best_ask_price is not None and best_ask_price != 0 else market_feed.ask
-                )
-                market_feed.bid = (
-                    best_bid_price if best_bid_price is not None and best_bid_price != 0 else market_feed.bid
-                )
-                market_feed.bid_volume = (
-                    best_bid_quantity
-                    if best_bid_quantity is not None and best_bid_quantity > 0
-                    else market_feed.bid_volume
-                )
-                market_feed.ask_volume = (
-                    best_ask_quantity
-                    if best_ask_quantity is not None and best_ask_quantity > 0
-                    else market_feed.ask_volume
-                )
+                    market_feed.ask = (
+                        best_ask_price if best_ask_price is not None and best_ask_price != 0 else market_feed.ask
+                    )
+                    market_feed.bid = (
+                        best_bid_price if best_bid_price is not None and best_bid_price != 0 else market_feed.bid
+                    )
+                    market_feed.bid_volume = (
+                        best_bid_quantity
+                        if best_bid_quantity is not None and best_bid_quantity > 0
+                        else market_feed.bid_volume
+                    )
+                    market_feed.ask_volume = (
+                        best_ask_quantity
+                        if best_ask_quantity is not None and best_ask_quantity > 0
+                        else market_feed.ask_volume
+                    )
                 market_feed.exchange = snapshot["Exch"]
                 market_feed.high = snapshot["High"] if snapshot["High"] > 0 else market_feed.high
                 market_feed.low = snapshot["Low"] if snapshot["Low"] > 0 else market_feed.low
@@ -3231,6 +3252,10 @@ class FivePaisa(BrokerBase):
             def resolve_symbol_and_exchange(json_data):
                 """Resolve a token to the correct symbol/exchange even when the tick exchange key is incomplete."""
                 token = json_data.get("Token")
+                try:
+                    token_int = int(token) if token is not None else None
+                except (TypeError, ValueError):
+                    token_int = None
                 exchange_candidates = []
                 tick_exchange = json_data.get("Exch")
 
@@ -3243,12 +3268,18 @@ class FivePaisa(BrokerBase):
                         exchange_candidates.append(short_exchange)
 
                 for exchange_key in exchange_candidates:
-                    symbol = self.exchange_mappings[exchange_key]["symbol_map_reversed"].get(token)
+                    reverse_map = self.exchange_mappings[exchange_key]["symbol_map_reversed"]
+                    symbol = reverse_map.get(token_int) if token_int is not None else None
+                    if symbol is None:
+                        symbol = reverse_map.get(token)
                     if symbol is not None:
                         return symbol, exchange_key
 
                 for exchange_key, exchange_mapping in self.exchange_mappings.items():
-                    symbol = exchange_mapping["symbol_map_reversed"].get(token)
+                    reverse_map = exchange_mapping["symbol_map_reversed"]
+                    symbol = reverse_map.get(token_int) if token_int is not None else None
+                    if symbol is None:
+                        symbol = reverse_map.get(token)
                     if symbol is not None:
                         return symbol, exchange_key
 

@@ -355,6 +355,9 @@ class Shoonya(BrokerBase):
         self.subscribe_thread = None
         self.subscribed_symbols = []
         self.socket_opened = False
+        self._is_connected_cache_ttl_secs = 3.0
+        self._last_is_connected_check_ts = 0.0
+        self._last_is_connected_result: Optional[bool] = None
 
     def _get_adjusted_expiry_date(self, year, month) -> dt.datetime:
         """
@@ -693,9 +696,24 @@ class Shoonya(BrokerBase):
     @log_execution_time
     def is_connected(self) -> bool:
         try:
+            now = time.monotonic()
+            if (
+                self._last_is_connected_result is True
+                and now - self._last_is_connected_check_ts < self._is_connected_cache_ttl_secs
+            ):
+                trading_logger.log_debug(
+                    "Using cached connection check result",
+                    {
+                        "broker": self.broker.name,
+                        "cache_age_secs": round(now - self._last_is_connected_check_ts, 3),
+                    },
+                )
+                return True
+
             # Check if API object exists
             if not hasattr(self, "api") or self.api is None:
                 trading_logger.log_warning("API object not initialized", {"broker": self.broker.name})
+                self._last_is_connected_result = False
                 return False
 
             # Check limits
@@ -703,6 +721,7 @@ class Shoonya(BrokerBase):
                 limits = self.api.get_limits()
                 if not limits:
                     trading_logger.log_warning("Empty limits response", {"broker": self.broker.name})
+                    self._last_is_connected_result = False
                     return False
 
                 cash = limits.get("cash")
@@ -710,6 +729,7 @@ class Shoonya(BrokerBase):
                     trading_logger.log_warning(
                         "No cash information in limits", {"broker": self.broker.name, "limits": str(limits)}
                     )
+                    self._last_is_connected_result = False
                     return False
 
                 cash_float = float(cash)
@@ -717,10 +737,12 @@ class Shoonya(BrokerBase):
                     trading_logger.log_warning(
                         "Cash balance is zero or negative", {"broker": self.broker.name, "cash": cash_float}
                     )
+                    self._last_is_connected_result = False
                     return False
 
             except Exception as e:
                 trading_logger.log_error("Failed to get limits", e, {"broker": self.broker.name})
+                self._last_is_connected_result = False
                 return False
 
             # Test quote fetching with a known symbol
@@ -730,20 +752,25 @@ class Shoonya(BrokerBase):
                     trading_logger.log_warning(
                         "Quote test failed", {"broker": self.broker.name, "quote_last": quote.last if quote else None}
                     )
+                    self._last_is_connected_result = False
                     return False
 
             except Exception as e:
                 trading_logger.log_error("Quote test failed", e, {"broker": self.broker.name})
+                self._last_is_connected_result = False
                 return False
 
             trading_logger.log_info(
                 "Connection check successful",
                 {"broker": self.broker.name, "cash": cash_float},
             )
+            self._last_is_connected_result = True
+            self._last_is_connected_check_ts = now
             return True
 
         except Exception as e:
             trading_logger.log_error("Connection check failed", e, {"broker": self.broker.name})
+            self._last_is_connected_result = False
             return False
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)

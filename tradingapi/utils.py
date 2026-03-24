@@ -2594,16 +2594,25 @@ def get_price(
                         return out
                 except Exception as e:
                     err_msg = f"{type(e).__name__}: {getattr(e, 'message', str(e))}"
-                    trading_logger.log_warning(
-                        f"Failed to get price for {long_symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
-                        {
-                            "symbol": long_symbol,
-                            "exchange": exchange,
-                            "attempt": attempt + 1,
-                            "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
-                            "error": err_msg,
-                        },
-                    )
+                    context = {
+                        "symbol": long_symbol,
+                        "exchange": exchange,
+                        "attempt": attempt + 1,
+                        "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
+                        "error": err_msg,
+                    }
+                    is_final_attempt = attempt == attempts - 1 and broker == brokers[-1]
+                    if is_final_attempt:
+                        trading_logger.log_error(
+                            f"Failed to get price for {long_symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
+                            e,
+                            context,
+                        )
+                    else:
+                        trading_logger.log_info(
+                            f"Failed to get price for {long_symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
+                            context,
+                        )
                     continue
     else:
         out_list = []
@@ -2625,16 +2634,25 @@ def get_price(
                             break  # Stop attempts for this symbol if a valid price is found
                     except Exception as e:
                         err_msg = f"{type(e).__name__}: {getattr(e, 'message', str(e))}"
-                        trading_logger.log_warning(
-                            f"Failed to get price for {symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
-                            {
-                                "symbol": symbol,
-                                "exchange": exchange,
-                                "attempt": attempt + 1,
-                                "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
-                                "error": err_msg,
-                            },
-                        )
+                        context = {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "attempt": attempt + 1,
+                            "broker": broker.broker.name if hasattr(broker, "broker") else "unknown",
+                            "error": err_msg,
+                        }
+                        is_final_attempt = attempt == attempts - 1 and broker == brokers[-1]
+                        if is_final_attempt:
+                            trading_logger.log_error(
+                                f"Failed to get price for {symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
+                                e,
+                                context,
+                            )
+                        else:
+                            trading_logger.log_info(
+                                f"Failed to get price for {symbol} from {broker.broker.name if hasattr(broker, 'broker') else 'unknown'}",
+                                context,
+                            )
                         continue
                 if valid_price_found:
                     break  # Stop attempts for other brokers for this symbol

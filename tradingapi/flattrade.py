@@ -354,6 +354,9 @@ class FlatTrade(BrokerBase):
         self.subscribe_thread = None
         self.subscribed_symbols = []
         self.socket_opened = False
+        self._is_connected_cache_ttl_secs = 3.0
+        self._last_is_connected_check_ts = 0.0
+        self._last_is_connected_result: Optional[bool] = None
 
     def _get_adjusted_expiry_date(self, year, month):
         """
@@ -834,14 +837,30 @@ class FlatTrade(BrokerBase):
         """
         trading_logger.log_debug("Checking FlatTrade connection", {"broker_type": self.broker.name})
 
+        now = time.monotonic()
+        if (
+            self._last_is_connected_result is True
+            and now - self._last_is_connected_check_ts < self._is_connected_cache_ttl_secs
+        ):
+            trading_logger.log_debug(
+                "Using cached connection check result",
+                {
+                    "broker_type": self.broker.name,
+                    "cache_age_secs": round(now - self._last_is_connected_check_ts, 3),
+                },
+            )
+            return True
+
         if not self.api:
             trading_logger.log_warning("API not initialized", {"broker_type": self.broker.name})
+            self._last_is_connected_result = False
             return False
 
         # Check margin balance
         limits_data = self.api.get_limits()
         if not limits_data:
             trading_logger.log_warning("No limits data available", {"broker_type": self.broker.name})
+            self._last_is_connected_result = False
             return False
 
         cash_balance = float(limits_data.get("cash", 0))
@@ -850,6 +869,7 @@ class FlatTrade(BrokerBase):
 
         if cash_balance <= 0:
             trading_logger.log_warning("Insufficient cash balance", {"cash_balance": cash_balance})
+            self._last_is_connected_result = False
             return False
 
         # Check quote availability
@@ -858,6 +878,7 @@ class FlatTrade(BrokerBase):
             trading_logger.log_warning(
                 "Quote check failed", {"broker_type": self.broker.name, "quote_last": quote.last if quote else None}
             )
+            self._last_is_connected_result = False
             return False
 
         trading_logger.log_debug("Quote check completed", {"quote_last": quote.last, "symbol": "NIFTY_IND___"})
@@ -870,6 +891,8 @@ class FlatTrade(BrokerBase):
                 "quote_last": quote.last if quote else None,
             },
         )
+        self._last_is_connected_result = True
+        self._last_is_connected_check_ts = now
         return True
 
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
