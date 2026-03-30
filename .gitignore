@@ -19,6 +19,14 @@ temp/
 # IDE files
 .vscode/
 .idea/
+.cursor/
+
+# Ignore files other than Python source
+*.*
+!*.py
+
+# Ignore only root-level Python scripts (not subfolders)
+/*.py
 
 # dist
 dist/
