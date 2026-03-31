@@ -2504,51 +2504,148 @@ class FlatTrade(BrokerBase):
             )
 
     @log_execution_time
-    @validate_inputs(long_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0)
+    @validate_inputs(long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0))
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_position(self, long_symbol: str = "") -> Union[float, pd.DataFrame, int]:
+    def get_position(self, long_symbol: str = "") -> Union[pd.DataFrame, int]:
         if self.api is None:
             raise BrokerConnectionError("FlatTrade API is not initialized")
 
         try:
             trading_logger.log_debug("Getting position", {"long_symbol": long_symbol if long_symbol else "all"})
 
-            pos = pd.DataFrame(self.api.get_positions())
-            if len(pos) > 0:
+            # Get holdings (delivery positions) if API supports it
+            holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+            get_holdings_fn = getattr(self.api, "get_holdings", None)
+            if callable(get_holdings_fn):
                 try:
-                    # Resolve long_symbol from mappings using Scripcode + Exchange (columns: token, exch)
-                    pos["long_symbol"] = self.get_long_name_from_broker_identifier(
-                        Scripcode=pos["token"],
-                        Exchange=pos["exch"],
-                    )
-                except Exception as e:
-                    trading_logger.log_error("Error processing positions data", e, {"positions_count": len(pos)})
-                    return pd.DataFrame(columns=["long_symbol", "quantity"])
-
-                if long_symbol is None or long_symbol == "":
-                    trading_logger.log_debug("Returning all positions", {"position_count": len(pos)})
-                    return pos
-                else:
-                    pos_filtered = pos.loc[pos.long_symbol == long_symbol, "netqty"]
-                    if len(pos_filtered) == 0:
-                        trading_logger.log_debug("No position found for symbol", {"long_symbol": long_symbol})
-                        return 0
-                    elif len(pos_filtered) == 1:
-                        position_value = pos_filtered.item()
-                        trading_logger.log_debug(
-                            "Position retrieved for symbol", {"long_symbol": long_symbol, "quantity": position_value}
-                        )
-                        return position_value
+                    raw_holding = get_holdings_fn()
+                    if isinstance(raw_holding, list):
+                        holding = pd.DataFrame(raw_holding)
+                    elif isinstance(raw_holding, dict):
+                        holding = pd.DataFrame([raw_holding])
                     else:
-                        trading_logger.log_error(
-                            "Multiple positions found for symbol",
-                            None,
-                            {"long_symbol": long_symbol, "position_count": len(pos_filtered)},
-                        )
-                        raise MarketDataError(f"Multiple positions found for symbol: {long_symbol}")
+                        holding = pd.DataFrame(columns=["long_symbol", "quantity"])
+
+                    if len(holding) > 0:
+                        try:
+                            if "exch" not in holding.columns and "exch_tsym" not in holding.columns:
+                                raise ValidationError("Holdings require 'exch' or 'exch_tsym' for mapping")
+
+                            def _from_exch_tsym(x, key):
+                                if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict):
+                                    return x[0].get(key)
+                                return None
+
+                            exch_tsym_series = (
+                                holding["exch_tsym"] if "exch_tsym" in holding.columns else pd.Series([None] * len(holding))
+                            )
+                            token_col = (
+                                holding["token"]
+                                if "token" in holding.columns
+                                else exch_tsym_series.apply(lambda x: _from_exch_tsym(x, "token"))
+                            )
+                            exchange_col = (
+                                holding["exch"]
+                                if "exch" in holding.columns
+                                else exch_tsym_series.apply(lambda x: _from_exch_tsym(x, "exch"))
+                            )
+
+                            if token_col.isnull().all():
+                                raise ValidationError("Holdings require 'token' or 'exch_tsym[].token' for mapping")
+
+                            holding["long_symbol"] = self.get_long_name_from_broker_identifier(
+                                Scripcode=token_col,
+                                Exchange=exchange_col,
+                            )
+                            holding["quantity"] = (
+                                pd.to_numeric(holding["holdqty"], errors="coerce").fillna(0.0)
+                                if "holdqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = holding["quantity"] + (
+                                pd.to_numeric(holding["btstqty"], errors="coerce").fillna(0.0)
+                                if "btstqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = holding["quantity"] + (
+                                pd.to_numeric(holding["brkcolqty"], errors="coerce").fillna(0.0)
+                                if "brkcolqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = holding["quantity"] + (
+                                pd.to_numeric(holding["npoadqty"], errors="coerce").fillna(0.0)
+                                if "npoadqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = pd.to_numeric(holding["quantity"], errors="coerce").fillna(0.0).astype(float)
+                            holding = holding.loc[:, ["long_symbol", "quantity"]]
+                            holding = holding[holding["long_symbol"].notna()]
+                        except Exception as e:
+                            trading_logger.log_error(
+                                "Error processing holdings data", e, {"holdings_count": len(holding)}
+                            )
+                            holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+                except Exception as e:
+                    trading_logger.log_debug("Holdings not available, using positions only", {"error": str(e)})
+                    holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+
+            # Get positions (intraday/F&O)
+            position = pd.DataFrame(self.api.get_positions())
+            if len(position) == 0:
+                position = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+            if len(position) > 0:
+                try:
+                    position["long_symbol"] = self.get_long_name_from_broker_identifier(
+                        Scripcode=position["token"],
+                        Exchange=position["exch"],
+                    )
+                    position = position.loc[:, ["long_symbol", "netqty"]]
+                    position.columns = ["long_symbol", "quantity"]
+                    position["quantity"] = pd.to_numeric(position["quantity"], errors="coerce").fillna(0)
+                    position = position[position["long_symbol"].notna()]
+                except Exception as e:
+                    trading_logger.log_error("Error processing positions data", e, {"positions_count": len(position)})
+                    position = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+
+            # Merge holdings and positions (outer), sum quantities
+            merged = pd.merge(position, holding, on="long_symbol", how="outer")
+            if len(merged) == 0:
+                result = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+                if long_symbol is None or long_symbol == "":
+                    trading_logger.log_debug("Returning all positions", {"position_count": len(result)})
+                    return result
+                return 0
+
+            for col in ["quantity_x", "quantity_y"]:
+                if col in merged.columns:
+                    merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0).astype(float)
+            result = merged.groupby("long_symbol", as_index=False).agg({"quantity_x": "sum", "quantity_y": "sum"})
+            qty_x = pd.to_numeric(result["quantity_x"], errors="coerce").fillna(0).astype(float)
+            qty_y = pd.to_numeric(result["quantity_y"], errors="coerce").fillna(0).astype(float)
+            result["quantity"] = qty_x + qty_y
+            result = result.loc[:, ["long_symbol", "quantity"]]
+
+            if long_symbol is None or long_symbol == "":
+                trading_logger.log_debug("Returning all positions", {"position_count": len(result)})
+                return result
             else:
-                trading_logger.log_debug("No positions found")
-                return pos
+                pos_filtered = result.loc[result["long_symbol"] == long_symbol, "quantity"]
+                if len(pos_filtered) == 0:
+                    trading_logger.log_debug("No position found for symbol", {"long_symbol": long_symbol})
+                    return 0
+                elif len(pos_filtered) == 1:
+                    position_value = pos_filtered.item()
+                    trading_logger.log_debug(
+                        "Position retrieved for symbol", {"long_symbol": long_symbol, "quantity": position_value}
+                    )
+                    return position_value
+                else:
+                    trading_logger.log_error(
+                        "Multiple positions found for symbol",
+                        None,
+                        {"long_symbol": long_symbol, "position_count": len(pos_filtered)},
+                    )
+                    raise MarketDataError(f"Multiple positions found for symbol: {long_symbol}")
 
         except (ValidationError, MarketDataError, BrokerConnectionError):
             raise

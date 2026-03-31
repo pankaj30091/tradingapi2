@@ -2445,7 +2445,7 @@ class Shoonya(BrokerBase):
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0))
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def get_position(self, long_symbol: str = "") -> Union[float, pd.DataFrame, int]:
+    def get_position(self, long_symbol: str = "") -> Union[pd.DataFrame, int]:
         if self.api is None:
             raise BrokerConnectionError("Shoonya API is not initialized")
 
@@ -2458,37 +2458,67 @@ class Shoonya(BrokerBase):
             if callable(get_holdings_fn):
                 try:
                     raw_holding = get_holdings_fn()
-                    holding = (
-                        pd.DataFrame(raw_holding if isinstance(raw_holding, (list, dict)) else [])
-                        if raw_holding
-                        else pd.DataFrame(columns=["long_symbol", "quantity"])
-                    ).astype({"quantity": float})
+                    if isinstance(raw_holding, list):
+                        holding = pd.DataFrame(raw_holding)
+                    elif isinstance(raw_holding, dict):
+                        holding = pd.DataFrame([raw_holding])
+                    else:
+                        holding = pd.DataFrame(columns=["long_symbol", "quantity"])
                     if len(holding) > 0:
                         try:
                             # Resolve long_symbol from mappings using Scripcode + Exchange
-                            if "token" not in holding.columns:
-                                raise ValidationError("Holdings require 'token' column for mapping")
                             if "exch" not in holding.columns and "exch_tsym" not in holding.columns:
                                 raise ValidationError("Holdings require 'exch' or 'exch_tsym' for mapping")
-                            scripcode_col = holding["token"]
-                            if "exch" in holding.columns:
-                                exchange_col = holding["exch"]
-                            else:
-                                exchange_col = holding["exch_tsym"].apply(
-                                    lambda x: (
-                                        x[0].get("exch")
-                                        if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict)
-                                        else None
-                                    )
-                                )
+
+                            def _from_exch_tsym(x, key):
+                                if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict):
+                                    return x[0].get(key)
+                                return None
+
+                            exch_tsym_series = (
+                                holding["exch_tsym"] if "exch_tsym" in holding.columns else pd.Series([None] * len(holding))
+                            )
+                            token_col = (
+                                holding["token"]
+                                if "token" in holding.columns
+                                else exch_tsym_series.apply(lambda x: _from_exch_tsym(x, "token"))
+                            )
+                            exchange_col = (
+                                holding["exch"]
+                                if "exch" in holding.columns
+                                else exch_tsym_series.apply(lambda x: _from_exch_tsym(x, "exch"))
+                            )
+
+                            if token_col.isnull().all():
+                                raise ValidationError("Holdings require 'token' or 'exch_tsym[].token' for mapping")
+
                             holding["long_symbol"] = self.get_long_name_from_broker_identifier(
-                                Scripcode=scripcode_col,
+                                Scripcode=token_col,
                                 Exchange=exchange_col,
                             )
-                            qty_col = "brkcolqty"
-                            holding = holding.loc[:, ["long_symbol", qty_col]]
-                            holding.columns = ["long_symbol", "quantity"]
-                            holding["quantity"] = pd.to_numeric(holding["quantity"], errors="coerce").fillna(0)
+                            holding["quantity"] = (
+                                pd.to_numeric(holding["holdqty"], errors="coerce").fillna(0.0)
+                                if "holdqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = holding["quantity"] + (
+                                pd.to_numeric(holding["btstqty"], errors="coerce").fillna(0.0)
+                                if "btstqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = holding["quantity"] + (
+                                pd.to_numeric(holding["brkcolqty"], errors="coerce").fillna(0.0)
+                                if "brkcolqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = holding["quantity"] + (
+                                pd.to_numeric(holding["npoadqty"], errors="coerce").fillna(0.0)
+                                if "npoadqty" in holding.columns
+                                else 0.0
+                            )
+                            holding["quantity"] = pd.to_numeric(holding["quantity"], errors="coerce").fillna(0.0).astype(float)
+                            holding = holding.loc[:, ["long_symbol", "quantity"]]
+                            holding = holding[holding["long_symbol"].notna()]
                         except Exception as e:
                             trading_logger.log_error(
                                 "Error processing holdings data", e, {"holdings_count": len(holding)}
@@ -2516,12 +2546,19 @@ class Shoonya(BrokerBase):
                     position = position.loc[:, ["long_symbol", "netqty"]]
                     position.columns = ["long_symbol", "quantity"]
                     position["quantity"] = pd.to_numeric(position["quantity"], errors="coerce").fillna(0)
+                    position = position[position["long_symbol"].notna()]
                 except Exception as e:
                     trading_logger.log_error("Error processing positions data", e, {"positions_count": len(position)})
                     position = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
 
             # Merge holdings and positions (outer), sum quantities
             merged = pd.merge(position, holding, on="long_symbol", how="outer")
+            if len(merged) == 0:
+                result = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
+                if long_symbol is None or long_symbol == "":
+                    trading_logger.log_debug("Returning all positions", {"position_count": len(result)})
+                    return result
+                return 0
             # Ensure numeric before groupby (API may return quantity as str; sum on str causes concatenation error)
             for col in ["quantity_x", "quantity_y"]:
                 if col in merged.columns:
