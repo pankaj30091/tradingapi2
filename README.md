@@ -240,6 +240,19 @@ ICICIDIRECT:
   USERTOKEN_MAX_AGE_HOURS: 20
   AUTO_SESSION_TOKEN_CMD: "icicidirect-generate-session --api-key \"${ICICI_API_KEY}\" --user-id \"${ICICI_USER_ID}\" --password \"${ICICI_PASSWORD}\" --totp-token \"${ICICI_TOTP_TOKEN}\"" # Optional non-interactive token command
   SYMBOLCODES: "/path/to/icicidirect/symbols"
+
+# Dhan Broker Configuration
+DHAN:
+  CLIENT_ID: "your_client_id"
+  ACCESS_TOKEN: "your_access_token" # Optional fallback if TOTP/PIN flow is not used
+  TOTP_TOKEN: "your_totp_token" # Optional: used for auto token refresh
+  PIN: "your_pin" # Optional: used for auto token refresh
+  USERTOKEN: "/path/to/dhan_token.txt" # Optional token cache file
+  SYMBOLCODES: "/path/to/dhan/symbols"
+  QUOTE_RATE_LIMIT_REDIS_DB: 4 # Optional: dedicated Redis DB for global quote limiter
+  QUOTE_RATE_LIMIT_RPS: 1 # Optional: quote API limit in requests/second
+  HISTORICAL_RATE_LIMIT_RPS: 10 # Optional: historical API limit in requests/second
+  REQUEST_STREAMING_DATA_RATE_LIMIT_RPS: 10 # Optional: streaming subscription request rate in requests/second
 ```
 
 #### ICICIDirect fully automated session-token refresh (no copy/paste)

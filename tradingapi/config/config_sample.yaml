@@ -72,3 +72,16 @@ ICICIDIRECT:
   #   --totp-token "${ICICI_TOTP_TOKEN}"
   SYMBOL_MASTER_URL: # Optional: symbol master zip url
   SYMBOLCODES:
+
+DHAN:
+  USE_PROXY: false
+  CLIENT_ID:
+  ACCESS_TOKEN: # Optional fallback if TOTP/PIN flow is not used
+  TOTP_TOKEN: # Optional: used for auto token refresh
+  PIN: # Optional: used for auto token refresh
+  USERTOKEN: # Optional: token cache file path
+  SYMBOLCODES:
+  QUOTE_RATE_LIMIT_REDIS_DB: 4 # Optional: dedicated Redis DB for global quote limiter
+  QUOTE_RATE_LIMIT_RPS: 1 # Optional: quote API limit in requests/second
+  HISTORICAL_RATE_LIMIT_RPS: 10 # Optional: historical API limit in requests/second
+  REQUEST_STREAMING_DATA_RATE_LIMIT_RPS: 10 # Optional: streaming subscription request rate in requests/second

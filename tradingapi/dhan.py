@@ -321,9 +321,16 @@ class Dhan(BrokerBase):
             self._stream_ws: Optional[Any] = None
             self._quote_rate_limit_lock = threading.Lock()
             self._last_quote_api_call_ts = 0.0
+            self._quote_rate_limit_interval_secs = 1.0  # default: 1 request/second
             self._quote_rate_limit_redis = None
             self._global_quote_rate_limit_key = "dhan:quote:last_call_ts"
             self._global_quote_rate_limit_lock_key = "dhan:quote:lock"
+            self._historical_rate_limit_lock = threading.Lock()
+            self._last_historical_api_call_ts = 0.0
+            self._historical_rate_limit_interval_secs = 0.1  # Dhan historical limit: max 10 requests/second
+            self._global_historical_rate_limit_key = "dhan:historical:last_call_ts"
+            self._global_historical_rate_limit_lock_key = "dhan:historical:lock"
+            self._stream_request_rate_limit_interval_secs = 0.1  # default: 10 streaming requests/second
 
             trading_logger.log_info(
                 "Dhan broker initialized", {"broker_type": "Dhan", "config_keys": list(kwargs.keys())}
@@ -453,6 +460,28 @@ class Dhan(BrokerBase):
                 self._quote_rate_limit_redis.ping()
             else:
                 self._quote_rate_limit_redis = self.redis_o
+
+            # Optional rate-limit overrides from config (values are requests/second)
+            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            if quote_rate_limit_rps is not None:
+                quote_rate_limit_rps = float(quote_rate_limit_rps)
+                if quote_rate_limit_rps <= 0:
+                    raise ConfigurationError("DHAN.QUOTE_RATE_LIMIT_RPS must be > 0")
+                self._quote_rate_limit_interval_secs = 1.0 / quote_rate_limit_rps
+
+            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            if historical_rate_limit_rps is not None:
+                historical_rate_limit_rps = float(historical_rate_limit_rps)
+                if historical_rate_limit_rps <= 0:
+                    raise ConfigurationError("DHAN.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                self._historical_rate_limit_interval_secs = 1.0 / historical_rate_limit_rps
+
+            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            if stream_request_rate_limit_rps is not None:
+                stream_request_rate_limit_rps = float(stream_request_rate_limit_rps)
+                if stream_request_rate_limit_rps <= 0:
+                    raise ConfigurationError("DHAN.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                self._stream_request_rate_limit_interval_secs = 1.0 / stream_request_rate_limit_rps
 
             self.starting_order_ids_int = set_starting_internal_ids_int(redis_db=self.redis_o)
 
@@ -657,8 +686,8 @@ class Dhan(BrokerBase):
         with self._quote_rate_limit_lock:
             now = time.monotonic()
             elapsed = now - self._last_quote_api_call_ts
-            if elapsed < 1.0:
-                time.sleep(1.0 - elapsed)
+            if elapsed < self._quote_rate_limit_interval_secs:
+                time.sleep(self._quote_rate_limit_interval_secs - elapsed)
             self._last_quote_api_call_ts = time.monotonic()
 
     def _wait_for_quote_rate_limit_global(self, limiter_redis):
@@ -672,13 +701,50 @@ class Dhan(BrokerBase):
                     now = time.time()
                     if last_call_ts is not None:
                         elapsed = now - float(last_call_ts)
-                        if elapsed < 1.0:
-                            time.sleep(1.0 - elapsed)
+                        if elapsed < self._quote_rate_limit_interval_secs:
+                            time.sleep(self._quote_rate_limit_interval_secs - elapsed)
                     limiter_redis.set(self._global_quote_rate_limit_key, str(time.time()))
                     return
                 finally:
                     if limiter_redis.get(self._global_quote_rate_limit_lock_key) == token:
                         limiter_redis.delete(self._global_quote_rate_limit_lock_key)
+            time.sleep(0.05)
+
+    def _wait_for_historical_rate_limit(self):
+        limiter_redis = self._get_quote_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_historical_rate_limit_global(limiter_redis)
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global Dhan historical limiter unavailable, using local limiter", {"error": str(e)}
+                )
+        with self._historical_rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_historical_api_call_ts
+            if elapsed < self._historical_rate_limit_interval_secs:
+                time.sleep(self._historical_rate_limit_interval_secs - elapsed)
+            self._last_historical_api_call_ts = time.monotonic()
+
+    def _wait_for_historical_rate_limit_global(self, limiter_redis):
+        token = str(uuid4())
+        lock_ttl_ms = 1000
+        while True:
+            acquired = limiter_redis.set(self._global_historical_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
+            if acquired:
+                try:
+                    last_call_ts = limiter_redis.get(self._global_historical_rate_limit_key)
+                    now = time.time()
+                    if last_call_ts is not None:
+                        elapsed = now - float(last_call_ts)
+                        if elapsed < self._historical_rate_limit_interval_secs:
+                            time.sleep(self._historical_rate_limit_interval_secs - elapsed)
+                    limiter_redis.set(self._global_historical_rate_limit_key, str(time.time()))
+                    return
+                finally:
+                    if limiter_redis.get(self._global_historical_rate_limit_lock_key) == token:
+                        limiter_redis.delete(self._global_historical_rate_limit_lock_key)
             time.sleep(0.05)
 
     def _fetch_dhan_historical(
@@ -712,6 +778,7 @@ class Dhan(BrokerBase):
             payload["interval"] = interval
             url = self.api.base_url + "/charts/intraday"
 
+        self._wait_for_historical_rate_limit()
         response = self.api.session.post(url, headers=self.api.header, timeout=self.api.timeout, data=json.dumps(payload))
         return self.api._parse_response(response)
 
@@ -1361,15 +1428,22 @@ class Dhan(BrokerBase):
                 security_id = int(security_id)
 
                 # Determine instrument_type from exchange_segment
-                _INST_TYPE_MAP = {
-                    "NSE_EQ": "EQUITY",
-                    "BSE_EQ": "EQUITY",
-                    "NSE_FNO": "EQUITY",
-                    "BSE_FNO": "EQUITY",
-                    "MCX_COMM": "COMM", "IDX_I": "INDEX",
-                    "NSE_CURRENCY": "CURRENCY", "BSE_CURRENCY": "CURRENCY",
-                }
-                instrument_type = _INST_TYPE_MAP.get(exchange_segment, "EQUITY")
+                _INDEX_UNDERLYINGS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")
+                symbol_upper = str(long_symbol).upper()
+                if "_OPT_" in symbol_upper:
+                    is_index_derivative = symbol_upper.startswith(_INDEX_UNDERLYINGS)
+                    instrument_type = "OPTIDX" if is_index_derivative else "OPTSTK"
+                elif "_FUT_" in symbol_upper:
+                    is_index_derivative = symbol_upper.startswith(_INDEX_UNDERLYINGS)
+                    instrument_type = "FUTIDX" if is_index_derivative else "FUTSTK"
+                elif exchange_segment == "IDX_I" or "_IND___" in symbol_upper:
+                    instrument_type = dhanhq_sdk.INDEX
+                elif exchange_segment == "MCX_COMM":
+                    instrument_type = "FUTCOM"
+                elif exchange_segment in ("NSE_CURRENCY", "BSE_CURRENCY"):
+                    instrument_type = "FUTCUR"
+                else:
+                    instrument_type = "EQUITY"
 
                 data = None
                 include_oi = _symbol_supports_oi(long_symbol)
@@ -1408,13 +1482,15 @@ class Dhan(BrokerBase):
                     for i in range(len(timestamps)):
                         try:
                             epoch = int(timestamps[i])
-                            ts = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).astimezone(tz_ist)
+                            ts = pd.Timestamp(
+                                dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc).astimezone(tz_ist)
+                            )
 
                             if use_intraday:
                                 if not (market_open <= ts.time() < market_close):
                                     continue
                             else:
-                                ts = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+                                ts = ts.floor("D")
 
                             historical_data_list.append(HistoricalData(
                                 date=ts,
@@ -1431,8 +1507,7 @@ class Dhan(BrokerBase):
                             continue
                     historical_data_list.sort(key=lambda x: x.date)
                 else:
-                    trading_logger.log_warning("No data from Dhan historical API", {"symbol": long_symbol, "response": data})
-                    historical_data_list.append(self._build_historical_placeholder())
+                    trading_logger.log_info("No data from Dhan historical API", )
 
                 if periodicity in {"1d", "d"} and date_end_dt.date() == get_tradingapi_now().date():
                     today_present = any(
@@ -1491,7 +1566,7 @@ class Dhan(BrokerBase):
 
                             if day_rows:
                                 today_bar = HistoricalData(
-                                    date=tz_ist.localize(dt.datetime.combine(date_end_dt.date(), dt.time.min)),
+                                    date=pd.Timestamp(dt.datetime.combine(date_end_dt.date(), dt.time.min), tz=tz_ist),
                                     open=day_rows[0]["open"],
                                     high=max(row["high"] for row in day_rows),
                                     low=min(row["low"] for row in day_rows),
@@ -2021,6 +2096,7 @@ class Dhan(BrokerBase):
                             self._stream_ws = ws
                             for message in subscription_messages:
                                 await ws.send(json.dumps(message))
+                                await asyncio.sleep(self._stream_request_rate_limit_interval_secs)
                             while self._streaming:
                                 raw = await ws.recv()
                                 response = parser.process_data(raw)
