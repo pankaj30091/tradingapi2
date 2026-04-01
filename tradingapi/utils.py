@@ -2569,6 +2569,9 @@ def get_price(
     if isinstance(brokers, BrokerBase):
         brokers = [brokers]
 
+    if any(getattr(getattr(broker, "broker", None), "name", "") == "DHAN" for broker in brokers):
+        attempts = 1
+
     if "?" not in long_symbol:
         out = Price()
         out.symbol = long_symbol
