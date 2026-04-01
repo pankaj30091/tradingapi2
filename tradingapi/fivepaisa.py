@@ -704,6 +704,13 @@ class FivePaisa(BrokerBase):
                         e,
                         {"broker": self.broker.name, "susertoken_path": susertoken_path},
                     )
+                    if isinstance(e, AuthenticationError):
+                        trading_logger.log_error(
+                            "Fresh login already failed; not retrying again",
+                            e,
+                            {"broker": self.broker.name, "susertoken_path": susertoken_path},
+                        )
+                        raise
                     _fresh_login(susertoken_path)
                     return True
             else:
