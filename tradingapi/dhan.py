@@ -1,3 +1,4 @@
+import atexit
 import asyncio
 import datetime as dt
 import io
@@ -7,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -319,6 +321,8 @@ class Dhan(BrokerBase):
             self._stream_symbol_map: Dict[tuple[int, int], tuple[str, str]] = {}
             self._stream_loop: Optional[asyncio.AbstractEventLoop] = None
             self._stream_ws: Optional[Any] = None
+            self._stream_connected_event = threading.Event()
+            self._process_shutting_down = False
             self._quote_rate_limit_lock = threading.Lock()
             self._last_quote_api_call_ts = 0.0
             self._quote_rate_limit_interval_secs = 1.0  # default: 1 request/second
@@ -331,6 +335,7 @@ class Dhan(BrokerBase):
             self._global_historical_rate_limit_key = "dhan:historical:last_call_ts"
             self._global_historical_rate_limit_lock_key = "dhan:historical:lock"
             self._stream_request_rate_limit_interval_secs = 0.1  # default: 10 streaming requests/second
+            atexit.register(self._mark_process_shutting_down)
 
             trading_logger.log_info(
                 "Dhan broker initialized", {"broker_type": "Dhan", "config_keys": list(kwargs.keys())}
@@ -338,6 +343,13 @@ class Dhan(BrokerBase):
         except Exception as e:
             context = create_error_context(broker_type="Dhan", config_keys=list(kwargs.keys()), error=str(e))
             raise BrokerConnectionError(f"Failed to initialize Dhan broker: {str(e)}", context)
+
+    def _mark_process_shutting_down(self):
+        self._process_shutting_down = True
+        self._streaming = False
+
+    def _is_process_shutting_down(self) -> bool:
+        return self._process_shutting_down or bool(getattr(sys, "is_finalizing", lambda: False)())
 
     # ------------------------------------------------------------------
     # Symbology
@@ -622,7 +634,7 @@ class Dhan(BrokerBase):
         """Disconnect from Dhan (stops streaming, clears references)."""
         try:
             try:
-                self.stop_streaming()
+                self.stop_streaming(clear_state=False)
             except Exception:
                 pass
             self.api = None
@@ -1290,7 +1302,7 @@ class Dhan(BrokerBase):
                 "TRADED": OrderStatus.FILLED,
                 "PART_TRADED": OrderStatus.OPEN,
                 "TRANSIT": OrderStatus.PENDING,
-                "PENDING": OrderStatus.PENDING,
+                "PENDING": OrderStatus.OPEN,
                 "OPEN": OrderStatus.OPEN,
                 "CANCELLED": OrderStatus.CANCELLED,
                 "REJECTED": OrderStatus.REJECTED,
@@ -1935,6 +1947,10 @@ class Dhan(BrokerBase):
         ext_callback: callable(Price) called on each tick
         """
         try:
+            if self._is_process_shutting_down():
+                trading_logger.log_info("Skipping Dhan streaming start during interpreter shutdown")
+                return
+
             def _build_instruments(sym_list):
                 instruments = []
                 stream_symbol_map: Dict[tuple[int, int], tuple[str, str]] = {}
@@ -1948,17 +1964,18 @@ class Dhan(BrokerBase):
                         stream_symbol_map[(feed_segment, security_id_int)] = (sym, self.map_exchange_for_db(sym, exch_char))
                 return instruments, stream_symbol_map
 
-            def _build_subscription_messages(instruments):
+            def _build_subscription_messages(instruments, stream_operation: str = "s"):
                 grouped: Dict[int, List[tuple[int, str]]] = {}
                 for feed_segment, security_id, request_code in instruments:
                     grouped.setdefault(int(request_code), []).append((int(feed_segment), str(security_id)))
                 messages = []
                 for request_code, instrument_list in grouped.items():
+                    effective_request_code = int(request_code) if stream_operation == "s" else int(request_code) + 1
                     for i in range(0, len(instrument_list), 100):
                         batch = instrument_list[i : i + 100]
                         messages.append(
                             {
-                                "RequestCode": int(request_code),
+                                "RequestCode": effective_request_code,
                                 "InstrumentCount": len(batch),
                                 "InstrumentList": [
                                     {
@@ -2043,35 +2060,41 @@ class Dhan(BrokerBase):
                     if ask_qty:
                         price.ask_volume = ask_qty
                     _update_depth_fields(price, response)
-                    ltt = response.get("LTT")
-                    price.timestamp = (
-                        dt.datetime.now().strftime("%Y-%m-%d ") + str(ltt)
-                        if ltt
-                        else dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    )
+                    price.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self._stream_prices[symbol] = price
                     ext_callback(price)
                 except Exception as e:
                     trading_logger.log_error("Error in Dhan tick callback", e, {"response": response})
 
             if operation == "s":
-                self.subscribed_symbols.extend([s for s in symbols if s not in self.subscribed_symbols])
+                delta_symbols = [s for s in symbols if s not in self.subscribed_symbols]
+                self.subscribed_symbols.extend(delta_symbols)
             elif operation == "u":
-                self.subscribed_symbols = [s for s in self.subscribed_symbols if s not in symbols]
+                delta_symbols = [s for s in symbols if s in self.subscribed_symbols]
+                self.subscribed_symbols = [s for s in self.subscribed_symbols if s not in delta_symbols]
+            else:
+                delta_symbols = []
 
             all_instruments, stream_symbol_map = _build_instruments(self.subscribed_symbols)
+            delta_instruments, _ = _build_instruments(delta_symbols)
+            stream_prices = {symbol: self._stream_prices.get(symbol, Price()) for symbol, _ in stream_symbol_map.values()}
             self._stream_symbol_map = stream_symbol_map
-            self._stream_prices = {symbol: self._stream_prices.get(symbol, Price()) for symbol, _ in stream_symbol_map.values()}
+            self._stream_prices = stream_prices
             if not all_instruments:
+                if operation == "u":
+                    return
                 trading_logger.log_warning("No valid instruments for streaming")
                 self._stream_symbol_map = {}
                 self._stream_prices = {}
                 return
-            subscription_messages = _build_subscription_messages(all_instruments)
+            subscription_messages = _build_subscription_messages(all_instruments, "s")
+            delta_messages = _build_subscription_messages(delta_instruments, operation)
 
             def _run_feed():
                 loop = None
                 try:
+                    if self._is_process_shutting_down():
+                        return
                     if not self._stream_credentials:
                         raise BrokerConnectionError("Dhan streaming credentials not initialized")
                     loop = asyncio.new_event_loop()
@@ -2094,6 +2117,8 @@ class Dhan(BrokerBase):
                         )
                         async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                             self._stream_ws = ws
+                            self._stream_connected_event.set()
+                            parser.ws = ws
                             for message in subscription_messages:
                                 await ws.send(json.dumps(message))
                                 await asyncio.sleep(self._stream_request_rate_limit_interval_secs)
@@ -2105,7 +2130,12 @@ class Dhan(BrokerBase):
 
                     loop.run_until_complete(_stream_main())
                 except Exception as e:
-                    if isinstance(e, (ConnectionClosedOK, ConnectionClosed)) and not self._streaming:
+                    if (
+                        isinstance(e, RuntimeError)
+                        and "cannot schedule new futures after interpreter shutdown" in str(e)
+                    ) or self._is_process_shutting_down():
+                        trading_logger.log_info("Dhan streaming thread stopped during interpreter shutdown")
+                    elif isinstance(e, (ConnectionClosedOK, ConnectionClosed)) and not self._streaming:
                         trading_logger.log_info("Dhan streaming thread closed cleanly")
                     else:
                         trading_logger.log_error("Dhan streaming thread error", e, {})
@@ -2122,20 +2152,33 @@ class Dhan(BrokerBase):
                     except Exception:
                         pass
                     self._stream_ws = None
+                    self._stream_connected_event.clear()
                     self._stream_loop = None
                     self._market_feed = None
                     asyncio.set_event_loop(None)
 
             if self.subscribe_thread is None or not self.subscribe_thread.is_alive():
+                self._stream_connected_event.clear()
                 self.subscribe_thread = threading.Thread(target=_run_feed, name="DhanMarketFeed", daemon=True)
                 self.subscribe_thread.start()
                 trading_logger.log_info("Dhan streaming thread started")
             else:
-                # Restart with updated subscription list
-                self.stop_streaming()
-                time.sleep(1)
-                self.subscribe_thread = threading.Thread(target=_run_feed, name="DhanMarketFeed", daemon=True)
-                self.subscribe_thread.start()
+                if not delta_messages:
+                    return
+                if not self._stream_connected_event.wait(timeout=5.0):
+                    raise BrokerConnectionError("Dhan streaming websocket is not active")
+                ws = self._stream_ws
+                loop = self._stream_loop
+                if ws is None or loop is None or loop.is_closed():
+                    raise BrokerConnectionError("Dhan streaming websocket is not active")
+
+                async def _send_incremental_messages():
+                    for message in delta_messages:
+                        await ws.send(json.dumps(message))
+                        await asyncio.sleep(self._stream_request_rate_limit_interval_secs)
+
+                future = asyncio.run_coroutine_threadsafe(_send_incremental_messages(), loop)
+                future.result(timeout=5.0)
 
         except (ValidationError, MarketDataError, BrokerConnectionError):
             raise
@@ -2144,7 +2187,7 @@ class Dhan(BrokerBase):
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
-    def stop_streaming(self):
+    def stop_streaming(self, clear_state: bool = True):
         """Stop Dhan live market feed."""
         try:
             self._streaming = False
@@ -2164,8 +2207,9 @@ class Dhan(BrokerBase):
                             pass
                 except Exception:
                     pass
-            self._stream_symbol_map = {}
-            self._stream_prices = {}
+            if clear_state:
+                self._stream_symbol_map = {}
+                self._stream_prices = {}
             if self.subscribe_thread is not None and self.subscribe_thread.is_alive():
                 self.subscribe_thread.join(timeout=2.0)
             self.subscribe_thread = None
