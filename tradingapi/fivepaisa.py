@@ -283,11 +283,24 @@ class FivePaisa(BrokerBase):
             self.api.session = new_session
             self._api_proxy_url = proxy_url
             try:
-                old_session.close()
+                if old_session is not None and callable(getattr(old_session, "close", None)):
+                    old_session.close()
             except Exception:
                 pass
         except Exception:
             pass
+
+    def _safe_close_streaming_ws(self) -> None:
+        """py5paisa FivePaisaClient.close_data() calls self.ws.close() without checking ws is set."""
+        if self.api is None:
+            return
+        ws = getattr(self.api, "ws", None)
+        if ws is None:
+            return
+        try:
+            self.api.close_data()
+        except Exception as e:
+            trading_logger.log_debug("FivePaisa stream close ignored", {"error": str(e)})
 
     @log_execution_time
     @validate_inputs(any_object=lambda x: x is not None)
@@ -3388,8 +3401,7 @@ class FivePaisa(BrokerBase):
             def reconnect_stream():
                 """Start a fresh websocket and restore all subscriptions."""
                 try:
-                    if self.api is not None and getattr(self.api, "ws", None) is not None:
-                        self.api.close_data()
+                    self._safe_close_streaming_ws()
                 except Exception:
                     pass
                 self.subscribe_thread = None
@@ -3555,8 +3567,7 @@ class FivePaisa(BrokerBase):
             trading_logger.log_info("Stopping quotes streaming")
 
             try:
-                if self.api is not None:
-                    self.api.close_data()
+                self._safe_close_streaming_ws()
                 self.subscribe_thread = None
                 trading_logger.log_info("Streaming stopped successfully")
             except Exception as e:
