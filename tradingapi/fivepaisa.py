@@ -3031,7 +3031,7 @@ class FivePaisa(BrokerBase):
                 timestamp_ms = int(match.group(1))
                 # Treat negative timestamps (e.g. .NET min date) as invalid; substitute current time
                 if timestamp_ms < 0:
-                    trading_logger.log_warning(
+                    trading_logger.log_info(
                         "Invalid date (negative timestamp)",
                         {"date_string": date_string, "expected_format": "/Date(milliseconds)/"},
                     )
