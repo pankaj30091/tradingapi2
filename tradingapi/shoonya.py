@@ -1,5 +1,6 @@
 import calendar
 import datetime as dt
+import hashlib
 import inspect
 import io
 import json
@@ -14,6 +15,7 @@ import threading
 import time
 import traceback
 import zipfile
+from urllib.parse import parse_qs, urlparse
 from typing import Dict, List, Optional, TypeVar, Union, cast
 
 T = TypeVar("T")
@@ -25,6 +27,12 @@ import pytz
 import redis
 import requests
 from chameli.dateutils import format_datetime, get_expiry, parse_datetime
+from selenium import webdriver
+from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 
 def _validate_datetime_input(date_input):
@@ -79,6 +87,15 @@ class ShoonyaApiPy(NorenApi):
     def __init__(self):
         NorenApi.__init__(
             self, host="https://api.shoonya.com/NorenWClientTP/", websocket="wss://api.shoonya.com/NorenWSTP/"
+        )
+        global api
+        api = self
+
+
+class ShoonyaOAuthApiPy(NorenApi):
+    def __init__(self):
+        NorenApi.__init__(
+            self, host="https://trade.shoonya.com/NorenWClientAPI/", websocket="wss://api.shoonya.com/NorenWSTP/"
         )
         global api
         api = self
@@ -417,9 +434,200 @@ class Shoonya(BrokerBase):
         else:
             return reverse_split_cash(long_name, exchange).upper()
 
+    def _get_login_credentials(self) -> dict:
+        credentials = {
+            "user": config.get(f"{self.broker.name}.USER"),
+            "password": config.get(f"{self.broker.name}.PWD"),
+            "vendor_code": config.get(f"{self.broker.name}.VC"),
+            "api_secret": config.get(f"{self.broker.name}.APPKEY"),
+            "totp_token": config.get(f"{self.broker.name}.TOKEN"),
+            "imei": "abc12345",
+        }
+        missing = [name.upper() for name, value in credentials.items() if name != "imei" and not value]
+        if missing:
+            trading_logger.log_error(
+                "Missing required configuration",
+                context={"broker": self.broker.name, "missing_configs": missing},
+            )
+            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
+        return credentials
+
+    def _get_oauth_credentials(self) -> Optional[dict]:
+        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+        secret_code = config.get(f"{self.broker.name}.SECRET_CODE")
+        if not client_id or not secret_code:
+            return None
+        user = config.get(f"{self.broker.name}.USER")
+        return {
+            "client_id": client_id,
+            "secret_code": secret_code,
+            "oauth_base_url": "https://trade.shoonya.com/NorenWClientAPI/",
+            "login_url": (
+                "https://trade.shoonya.com/OAuthlogin/investor-entry-level/login"
+                f"?api_key={client_id}&route_to={user}+s+apikey"
+            ),
+            "geckodriver_path": os.path.expanduser("~/Downloads/geckodriver"),
+        }
+
+    def _extract_auth_code_from_url(self, value: Optional[str]) -> Optional[str]:
+        if not value or "code=" not in value:
+            return None
+        code = parse_qs(urlparse(value).query).get("code", [None])[0]
+        if code:
+            return code
+        match = re.search(r"[?&]code=([^&\"'\\s]+)", value)
+        if match:
+            return match.group(1)
+        return None
+
+    def _scan_browser_for_auth_code(self, driver) -> Optional[str]:
+        for candidate in [driver.current_url]:
+            code = self._extract_auth_code_from_url(candidate)
+            if code:
+                return code
+        return None
+
+    def _fill_browser_input(self, element, value: str) -> None:
+        element.click()
+        time.sleep(0.1)
+        element.clear()
+        element.send_keys(value)
+        time.sleep(0.1)
+
+    def _set_api_session_from_token(self, user: str, password: str, usertoken: str) -> None:
+        self.api = ShoonyaOAuthApiPy()
+        self.api.set_session(userid=user, password=password, usertoken=usertoken, accesstoken=usertoken)
+        if hasattr(self.api, "injectOAuthHeader"):
+            self.api.injectOAuthHeader(usertoken, user, user)
+
+    def _login_with_web_oauth(self) -> dict:
+        login_credentials = self._get_login_credentials()
+        oauth_credentials = self._get_oauth_credentials()
+        if oauth_credentials is None:
+            raise ValueError("Missing required configuration: CLIENT_ID, SECRET_CODE")
+
+        user = login_credentials["user"]
+        password = login_credentials["password"]
+        auth_code = None
+        options = webdriver.FirefoxOptions()
+        options.add_argument("--headless")
+        driver = None
+        try:
+            driver = webdriver.Firefox(
+                service=FirefoxService(oauth_credentials["geckodriver_path"]),
+                options=options,
+            )
+            wait = WebDriverWait(driver, 30)
+            driver.get(oauth_credentials["login_url"])
+
+            wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']")))
+            time.sleep(1)
+            all_inputs = driver.find_elements(
+                By.CSS_SELECTOR,
+                "input:not([type='hidden']):not([type='checkbox']):not([type='radio'])",
+            )
+            visible_inputs = [inp for inp in all_inputs if inp.is_displayed()]
+            if len(visible_inputs) < 3:
+                raise AuthenticationError(
+                    "Shoonya OAuth page did not expose expected login fields",
+                    create_error_context(broker=self.broker.name, inputs_found=len(visible_inputs)),
+                )
+
+            self._fill_browser_input(visible_inputs[0], user)
+            self._fill_browser_input(visible_inputs[1], password)
+            otp_value = pyotp.TOTP(login_credentials["totp_token"]).now()
+            self._fill_browser_input(visible_inputs[2], otp_value)
+            wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='LOGIN']"))).click()
+
+            start = time.time()
+            while True:
+                auth_code = self._scan_browser_for_auth_code(driver)
+                if auth_code:
+                    break
+                if time.time() - start > 60:
+                    new_otp = pyotp.TOTP(login_credentials["totp_token"]).now()
+                    if new_otp != otp_value:
+                        self._fill_browser_input(visible_inputs[2], new_otp)
+                        wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='LOGIN']"))).click()
+                        start = time.time()
+                        otp_value = new_otp
+                        continue
+                    break
+                time.sleep(0.5)
+        except (InvalidSessionIdException, WebDriverException) as e:
+            raise AuthenticationError(
+                "Shoonya OAuth browser automation failed",
+                create_error_context(broker=self.broker.name, error=str(e)),
+            ) from e
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+        if not auth_code:
+            raise AuthenticationError(
+                "Shoonya OAuth browser flow did not return auth code",
+                create_error_context(broker=self.broker.name),
+            )
+
+        checksum = hashlib.sha256(
+            (oauth_credentials["client_id"] + oauth_credentials["secret_code"] + auth_code).encode()
+        ).hexdigest()
+        token_response = None
+        last_http_error = None
+        for attempt in range(1, 4):
+            token_response = requests.post(
+                oauth_credentials["oauth_base_url"] + "GenAcsTok",
+                data=f'jData={json.dumps({"code": auth_code, "checksum": checksum})}',
+                headers={"Authorization": f"Bearer {checksum}"},
+                timeout=30,
+            )
+            try:
+                token_response.raise_for_status()
+                last_http_error = None
+                break
+            except requests.HTTPError as e:
+                last_http_error = e
+                if token_response.status_code not in {502, 503, 504} or attempt == 3:
+                    raise
+                time.sleep(2 * attempt)
+        if last_http_error is not None:
+            raise last_http_error
+        token_data = token_response.json()
+        usertoken = token_data.get("ActTok") or token_data.get("access_token") or token_data.get("token")
+        if not usertoken:
+            raise AuthenticationError(
+                "GenAcsTok did not return access token",
+                create_error_context(broker=self.broker.name, response=str(token_data)),
+            )
+
+        self._set_api_session_from_token(user, password, usertoken)
+        return token_data
+
+    def _login_with_fresh_totp(self) -> dict:
+        credentials = self._get_login_credentials()
+        api = ShoonyaApiPy()
+        response = api.login(  # type: ignore[attr-defined]
+            userid=credentials["user"],
+            password=credentials["password"],
+            twoFA=pyotp.TOTP(credentials["totp_token"]).now(),
+            vendor_code=credentials["vendor_code"],
+            api_secret=credentials["api_secret"],
+            imei=credentials["imei"],
+        )
+        if not response or "susertoken" not in response:
+            raise AuthenticationError(
+                "Login failed - invalid response from broker",
+                create_error_context(broker=self.broker.name, response=str(response)),
+            )
+        self.api = api
+        return response
+
     @retry_on_error(max_retries=2, delay=0.5, backoff_factor=2.0)
     @log_execution_time
-    def connect(self, redis_db: int, as_of_date=None) -> bool:
+    def connect(self, redis_db: int, as_of_date=None, max_attempts: int = 5) -> bool:
         """
         Connect to Shoonya trading platform with enhanced session management.
 
@@ -427,6 +635,7 @@ class Shoonya(BrokerBase):
             redis_db: Redis database number
             as_of_date: Optional date (date, datetime, or str YYYYMMDD/YYYY-MM-DD).
                 If provided, the broker loads the symbol file for that date.
+            max_attempts: Number of login retry attempts (default: 5).
 
         Raises:
             ValueError: If configuration is missing or connection fails
@@ -442,79 +651,32 @@ class Shoonya(BrokerBase):
         except Exception:
             pass
 
-        def _fresh_login(susertoken_path) -> None:
+        def _fresh_login(susertoken_path, max_attempts: int = max_attempts) -> None:
             """Perform fresh login with TOTP retry logic."""
             try:
                 trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
-                user = config.get(f"{self.broker.name}.USER")
-                pwd = config.get(f"{self.broker.name}.PWD")
-                vc = config.get(f"{self.broker.name}.VC")
-                app_key = config.get(f"{self.broker.name}.APPKEY")
-                token = config.get(f"{self.broker.name}.TOKEN")
-
-                # Validate required configuration
-                if not all([user, pwd, vc, app_key, token]):
-                    missing_configs = []
-                    if not user:
-                        missing_configs.append("USER")
-                    if not pwd:
-                        missing_configs.append("PWD")
-                    if not vc:
-                        missing_configs.append("VC")
-                    if not app_key:
-                        missing_configs.append("APPKEY")
-                    if not token:
-                        missing_configs.append("TOKEN")
-
-                    trading_logger.log_error(
-                        "Missing required configuration",
-                        context={"broker": self.broker.name, "missing_configs": missing_configs},
-                    )
-                    raise ValueError(f"Missing required configuration: {', '.join(missing_configs)}")
-
-                # TOTP retry logic to handle stale tokens
-                max_attempts = 5
+                credentials = self._get_login_credentials()
+                oauth_credentials = self._get_oauth_credentials()
                 for attempt in range(1, max_attempts + 1):
                     try:
                         trading_logger.log_info(
                             f"Fresh login attempt {attempt}/{max_attempts}", {"broker": self.broker.name}
                         )
-
-                        self.api = ShoonyaApiPy()
-                        out = self.api.login(
-                            userid=user,
-                            password=pwd,
-                            twoFA=pyotp.TOTP(token).now(),
-                            vendor_code=vc,
-                            api_secret=app_key,
-                            imei="abc12345",
-                        )
-
-                        if not out or "susertoken" not in out:
-                            trading_logger.log_warning(
-                                "Login attempt failed - invalid response",
-                                {
-                                    "broker": self.broker.name,
-                                    "attempt": attempt,
-                                    "max_attempts": max_attempts,
-                                    "response": str(out),
-                                },
+                        if oauth_credentials is not None:
+                            out = self._login_with_web_oauth()
+                            susertoken = (
+                                out.get("ActTok") or out.get("access_token") or out.get("token") or out.get("susertoken")
                             )
-                            if attempt < max_attempts:
-                                time.sleep(40)  # Wait for fresh TOTP
-                                continue
-                            else:
-                                trading_logger.log_error(
-                                    "Login failed after all attempts",
-                                    context={"broker": self.broker.name, "max_attempts": max_attempts},
-                                )
-                                raise ValueError("Login failed - invalid response from broker after all attempts")
+                        else:
+                            out = self._login_with_fresh_totp()
+                            susertoken = out["susertoken"]
 
-                        susertoken = out["susertoken"]
-
-                        # Ensure directory exists
+                        if not susertoken:
+                            raise AuthenticationError(
+                                "Login flow did not return a usable token",
+                                create_error_context(broker=self.broker.name, response=str(out)),
+                            )
                         os.makedirs(os.path.dirname(susertoken_path), exist_ok=True)
-
                         with open(susertoken_path, "w") as file:
                             file.write(susertoken)
 
@@ -527,7 +689,12 @@ class Shoonya(BrokerBase):
                         trading_logger.log_error(
                             f"Login attempt {attempt} failed",
                             e,
-                            {"broker": self.broker.name, "attempt": attempt, "max_attempts": max_attempts},
+                            {
+                                "broker": self.broker.name,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "user": credentials["user"],
+                            },
                         )
                         if attempt < max_attempts:
                             time.sleep(40)  # Wait for fresh TOTP
@@ -564,8 +731,10 @@ class Shoonya(BrokerBase):
                     trading_logger.log_warning("Empty token file", {"broker": self.broker.name})
                     return False
 
-                self.api = ShoonyaApiPy()
-                self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
+                self.api = ShoonyaOAuthApiPy()
+                self.api.set_session(userid=user, password=pwd, usertoken=susertoken, accesstoken=susertoken)
+                if hasattr(self.api, "injectOAuthHeader"):
+                    self.api.injectOAuthHeader(susertoken, user, user)
 
                 # Verify the session is actually working
                 if _verify_session(self):
@@ -894,6 +1063,20 @@ class Shoonya(BrokerBase):
                     # Note: The actual streaming stop logic would be in the streaming method
             except Exception as e:
                 trading_logger.log_warning("Failed to stop streaming thread during disconnect", {"error": str(e)})
+
+            # Log out from broker session if supported by API client
+            try:
+                if self.api and hasattr(self.api, "logout"):
+                    logout_response = self.api.logout()
+                    trading_logger.log_info(
+                        "Broker logout completed",
+                        {"broker_type": self.broker.name, "logout_response": str(logout_response)},
+                    )
+            except Exception as e:
+                trading_logger.log_warning("Failed broker logout during disconnect", {"error": str(e)})
+
+            self._last_is_connected_result = False
+            self._last_is_connected_check_ts = 0.0
 
             # Clear API reference
             if self.api:
