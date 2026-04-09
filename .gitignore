@@ -35,6 +35,8 @@ docs/
 !docs/ATTRIBUTION_REFACTOR_DESIGN.md
 examples/
 tradingapi.egg-info/
+# Root-level broker harness only; package tests live under tradingapi/tests/
+/tests/
 
 # environment
 setup.cfg
