@@ -35,7 +35,6 @@ docs/
 !docs/ATTRIBUTION_REFACTOR_DESIGN.md
 examples/
 tradingapi.egg-info/
-tests/
 
 # environment
 setup.cfg
