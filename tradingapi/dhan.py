@@ -1,5 +1,6 @@
 import atexit
 import asyncio
+import concurrent.futures.thread
 import datetime as dt
 import io
 import json
@@ -39,12 +40,14 @@ from chameli.dateutils import parse_datetime
 from .utils import (
     delete_broker_order_id,
     json_serializer_default,
+    parse_combo_symbol,
     set_starting_internal_ids_int,
     update_order_status,
 )
 from .exceptions import (
     ConfigurationError,
     DataError,
+    MarginError,
     RedisError,
     SymbolError,
     TradingAPIError,
@@ -69,6 +72,18 @@ def _is_nan(value: Any) -> bool:
         return bool(pd.isna(value))
     except Exception:
         return False
+
+
+def _historical_data_calendar_date(h: HistoricalData) -> Optional[dt.date]:
+    """Calendar date for a historical bar (datetime, date, or pandas Timestamp)."""
+    d = h.date
+    if d is None:
+        return None
+    if isinstance(d, dt.datetime):
+        return d.date()
+    if isinstance(d, dt.date):
+        return d
+    return None
 
 
 def _validate_datetime_input(date_input):
@@ -334,7 +349,11 @@ class Dhan(BrokerBase):
             self._historical_rate_limit_interval_secs = 0.1  # Dhan historical limit: max 10 requests/second
             self._global_historical_rate_limit_key = "dhan:historical:last_call_ts"
             self._global_historical_rate_limit_lock_key = "dhan:historical:lock"
+            self._stream_request_rate_limit_lock = threading.Lock()
+            self._last_stream_request_api_call_ts = 0.0
             self._stream_request_rate_limit_interval_secs = 0.1  # default: 10 streaming requests/second
+            self._global_stream_request_rate_limit_key = "dhan:stream:last_call_ts"
+            self._global_stream_request_rate_limit_lock_key = "dhan:stream:lock"
             atexit.register(self._mark_process_shutting_down)
 
             trading_logger.log_info(
@@ -398,7 +417,7 @@ class Dhan(BrokerBase):
                     "contractsize_map": dict(zip(group["long_symbol"], group["LotSize"])),
                     "exchange_map": dict(zip(group["long_symbol"], group["Exch"])),
                     "exchangetype_map": dict(zip(group["long_symbol"], group["ExchSeg"])),
-                    "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"])),
+                    "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"] / 100)),
                     "symbol_map_reversed": dict(zip(group["SecurityId"].astype(int), group["long_symbol"])),
                 }
 
@@ -656,7 +675,7 @@ class Dhan(BrokerBase):
             Returns dict with 'cash', 'collateral', and 'used' keys.
 
         Dhan's get_fund_limits() response data fields:
-            availabelBalance, collateralAmount, utilisedAmount, …
+            withdrawableBalance, sodLimit, availabelBalance, collateralAmount, utilizedAmount, …
         """
         try:
             if not self.is_connected():
@@ -667,9 +686,14 @@ class Dhan(BrokerBase):
                 raise MarketDataError(f"get_fund_limits failed: {result}")
 
             data = result.get("data", {})
-            cash = float(data.get("availabelBalance", 0) or 0)
+            # Cash should reflect "cash balance only" (excluding collateral).
+            # Dhan commonly provides this as withdrawableBalance (or sodLimit).
+            cash = float(data.get("withdrawableBalance", 0) or 0)
+            if cash <= 0:
+                cash = float(data.get("sodLimit", 0) or 0)
+
             collateral = float(data.get("collateralAmount", 0) or 0)
-            used = float(data.get("utilisedAmount", 0) or 0)
+            used = float(data.get("utilizedAmount", 0) or 0)
 
             trading_logger.log_debug("Available capital retrieved", {"cash": cash, "collateral": collateral, "used": used})
             return {"cash": cash, "collateral": collateral, "used": used}
@@ -679,6 +703,87 @@ class Dhan(BrokerBase):
         except Exception as e:
             context = create_error_context(error=str(e))
             raise MarketDataError(f"Failed to get available capital: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        order_size=lambda x: isinstance(x, (int, float)) and int(x) != 0,
+    )
+    def get_margin_requirement(self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds=None) -> float:
+        """Return basket margin required for a single-leg or multi-leg combo."""
+        try:
+            if self.api is None:
+                raise BrokerConnectionError("Dhan API not initialized")
+
+            combo_legs = parse_combo_symbol(combo_symbol)
+            scripts: List[Dict[str, Any]] = []
+
+            for long_symbol, leg_ratio in combo_legs.items():
+                net_qty = int(leg_ratio) * int(order_size)
+                if net_qty == 0:
+                    continue
+
+                exch_char, security_id, exchange_segment = self._resolve_symbol_lookup(long_symbol, exchange)
+                if security_id is None or exchange_segment is None:
+                    raise SymbolError(f"SecurityId not found for {long_symbol}")
+
+                from .utils import get_price
+
+                quote = get_price(self, long_symbol, exchange=exch_char or exchange, mds=mds)
+                price_candidates = [quote.last, quote.ask, quote.bid, quote.prior_close]
+                price = next((float(v) for v in price_candidates if not _is_nan(v) and float(v) > 0), None)
+                if price is None:
+                    raise MarginError(f"No usable market price found for {long_symbol}")
+
+                if exchange_segment in (dhanhq_sdk.NSE_FNO, dhanhq_sdk.BSE_FNO, dhanhq_sdk.MCX):
+                    product_type = dhanhq_sdk.MARGIN
+                else:
+                    product_type = dhanhq_sdk.CNC
+
+                scripts.append(
+                    {
+                        "exchangeSegment": str(exchange_segment).upper(),
+                        "transactionType": dhanhq_sdk.BUY if net_qty > 0 else dhanhq_sdk.SELL,
+                        "quantity": abs(int(net_qty)),
+                        "productType": str(product_type).upper(),
+                        "securityId": str(security_id),
+                        "price": float(price),
+                        "triggerPrice": 0.0,
+                    }
+                )
+
+            if not scripts:
+                return 0.0
+
+            payload = {
+                "dhanClientId": self.api.client_id,
+                "includePosition": False,
+                "includeOrder": False,
+                "includeOrders": False,
+                "scripList": scripts,
+                "scripts": scripts,
+            }
+            response = self.api.session.post(
+                self.api.base_url + "/margincalculator/multi",
+                headers=self.api.header,
+                timeout=self.api.timeout,
+                data=json.dumps(payload),
+            )
+            out = self.api._parse_response(response)
+            if not out or out.get("status") != "success":
+                raise MarginError(f"Dhan basket margin calculation failed: {_extract_dhan_error(out)}")
+
+            data = out.get("data", {}) or {}
+            total_margin = data.get("total_margin", data.get("totalMargin"))
+            if total_margin is None:
+                raise MarginError(f"Dhan basket margin response missing total margin: {data}")
+            return float(total_margin)
+
+        except (ValidationError, BrokerConnectionError, SymbolError, MarginError):
+            raise
+        except Exception as e:
+            context = create_error_context(combo_symbol=combo_symbol, order_size=order_size, exchange=exchange, error=str(e))
+            raise MarginError(f"Unexpected error in get_margin_requirement: {str(e)}", context)
 
     # ------------------------------------------------------------------
     # Exchange mapping helpers
@@ -757,6 +862,43 @@ class Dhan(BrokerBase):
                 finally:
                     if limiter_redis.get(self._global_historical_rate_limit_lock_key) == token:
                         limiter_redis.delete(self._global_historical_rate_limit_lock_key)
+            time.sleep(0.05)
+
+    def _wait_for_stream_request_rate_limit(self):
+        limiter_redis = self._get_quote_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_stream_request_rate_limit_global(limiter_redis)
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global Dhan stream request limiter unavailable, using local limiter", {"error": str(e)}
+                )
+        with self._stream_request_rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_stream_request_api_call_ts
+            if elapsed < self._stream_request_rate_limit_interval_secs:
+                time.sleep(self._stream_request_rate_limit_interval_secs - elapsed)
+            self._last_stream_request_api_call_ts = time.monotonic()
+
+    def _wait_for_stream_request_rate_limit_global(self, limiter_redis):
+        token = str(uuid4())
+        lock_ttl_ms = 1000
+        while True:
+            acquired = limiter_redis.set(self._global_stream_request_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
+            if acquired:
+                try:
+                    last_call_ts = limiter_redis.get(self._global_stream_request_rate_limit_key)
+                    now = time.time()
+                    if last_call_ts is not None:
+                        elapsed = now - float(last_call_ts)
+                        if elapsed < self._stream_request_rate_limit_interval_secs:
+                            time.sleep(self._stream_request_rate_limit_interval_secs - elapsed)
+                    limiter_redis.set(self._global_stream_request_rate_limit_key, str(time.time()))
+                    return
+                finally:
+                    if limiter_redis.get(self._global_stream_request_rate_limit_lock_key) == token:
+                        limiter_redis.delete(self._global_stream_request_rate_limit_lock_key)
             time.sleep(0.05)
 
     def _fetch_dhan_historical(
@@ -1449,7 +1591,7 @@ class Dhan(BrokerBase):
                     is_index_derivative = symbol_upper.startswith(_INDEX_UNDERLYINGS)
                     instrument_type = "FUTIDX" if is_index_derivative else "FUTSTK"
                 elif exchange_segment == "IDX_I" or "_IND___" in symbol_upper:
-                    instrument_type = dhanhq_sdk.INDEX
+                    instrument_type = "INDEX"
                 elif exchange_segment == "MCX_COMM":
                     instrument_type = "FUTCOM"
                 elif exchange_segment in ("NSE_CURRENCY", "BSE_CURRENCY"):
@@ -1522,79 +1664,88 @@ class Dhan(BrokerBase):
                     trading_logger.log_info("No data from Dhan historical API", )
 
                 if periodicity in {"1d", "d"} and date_end_dt.date() == get_tradingapi_now().date():
-                    today_present = any(
-                        isinstance(row.date, dt.datetime) and row.date.date() == date_end_dt.date() and not _is_nan(row.close)
-                        for row in historical_data_list
+                    # Refresh today's daily bar from 1m data (up-to-date partial OHLC), matching Shoonya-style behavior.
+                    # Always attempt when end date is today; replace any existing bar for that calendar day.
+                    tz_ist = pytz.timezone("Asia/Kolkata")
+                    target_d = date_end_dt.date()
+                    market_open_t = pd.to_datetime(market_open_time).time()
+                    market_close_t = pd.to_datetime(market_close_time).time()
+
+                    intraday_response = self._fetch_dhan_historical(
+                        security_id=security_id,
+                        exchange_segment=exchange_segment,
+                        instrument_type=instrument_type,
+                        from_date=date_end_dt.strftime("%Y-%m-%d"),
+                        to_date=date_end_dt.strftime("%Y-%m-%d"),
+                        periodicity="1m",
+                        include_oi=include_oi,
                     )
-                    if not today_present:
-                        intraday_response = self._fetch_dhan_historical(
-                            security_id=security_id,
-                            exchange_segment=exchange_segment,
-                            instrument_type=instrument_type,
-                            from_date=date_end_dt.strftime("%Y-%m-%d"),
-                            to_date=date_end_dt.strftime("%Y-%m-%d"),
-                            periodicity="1m",
-                            include_oi=include_oi,
-                        )
-                        if intraday_response and intraday_response.get("status") == "success":
-                            raw_intraday = intraday_response.get("data", {})
-                            timestamps = raw_intraday.get("timestamp", [])
-                            opens = raw_intraday.get("open", [])
-                            highs = raw_intraday.get("high", [])
-                            lows = raw_intraday.get("low", [])
-                            closes = raw_intraday.get("close", [])
-                            volumes = raw_intraday.get("volume", [])
-                            open_interest = raw_intraday.get("open_interest", [])
-                            tz_ist = pytz.timezone("Asia/Kolkata")
-                            cutoff_dt = date_end_dt if isinstance(date_end_dt, dt.datetime) else dt.datetime.combine(date_end_dt, dt.time.max)
-                            if cutoff_dt.tzinfo is None:
-                                cutoff_dt = tz_ist.localize(cutoff_dt)
+                    if intraday_response and intraday_response.get("status") == "success":
+                        raw_intraday = intraday_response.get("data", {})
+                        timestamps = raw_intraday.get("timestamp", [])
+                        opens = raw_intraday.get("open", [])
+                        highs = raw_intraday.get("high", [])
+                        lows = raw_intraday.get("low", [])
+                        closes = raw_intraday.get("close", [])
+                        volumes = raw_intraday.get("volume", [])
+                        open_interest = raw_intraday.get("open_interest", [])
 
-                            day_rows = []
-                            market_open = pd.to_datetime(market_open_time).time()
-                            market_close = pd.to_datetime(market_close_time).time()
-                            for i in range(len(timestamps)):
-                                try:
-                                    ts = dt.datetime.fromtimestamp(int(timestamps[i]), tz=dt.timezone.utc).astimezone(tz_ist)
-                                    if ts.date() != date_end_dt.date():
-                                        continue
-                                    if not (market_open <= ts.time() < market_close):
-                                        continue
-                                    if ts > cutoff_dt:
-                                        continue
-                                    day_rows.append(
-                                        {
-                                            "date": ts,
-                                            "open": float(opens[i]),
-                                            "high": float(highs[i]),
-                                            "low": float(lows[i]),
-                                            "close": float(closes[i]),
-                                            "volume": int(volumes[i]),
-                                            "oi": int(float(open_interest[i])) if i < len(open_interest) and not _is_nan(open_interest[i]) else 0,
-                                        }
-                                    )
-                                except Exception:
+                        # parse_datetime() yields midnight for YYYY-MM-DD; do not use that as cutoff (drops all session bars).
+                        now_ist = get_tradingapi_now()
+                        if now_ist.tzinfo is None:
+                            now_ist = tz_ist.localize(now_ist)
+                        else:
+                            now_ist = now_ist.astimezone(tz_ist)
+                        session_close_dt = tz_ist.localize(dt.datetime.combine(target_d, market_close_t))
+                        cutoff_dt = min(now_ist, session_close_dt)
+                        if date_end_dt.time() != dt.time.min:
+                            explicit_end = date_end_dt if date_end_dt.tzinfo else tz_ist.localize(date_end_dt)
+                            explicit_end = explicit_end.astimezone(tz_ist)
+                            if explicit_end.date() == target_d:
+                                cutoff_dt = min(cutoff_dt, explicit_end)
+
+                        day_rows = []
+                        for i in range(len(timestamps)):
+                            try:
+                                ts = dt.datetime.fromtimestamp(int(timestamps[i]), tz=dt.timezone.utc).astimezone(tz_ist)
+                                if ts.date() != target_d:
                                     continue
-
-                            if day_rows:
-                                today_bar = HistoricalData(
-                                    date=pd.Timestamp(dt.datetime.combine(date_end_dt.date(), dt.time.min), tz=tz_ist),
-                                    open=day_rows[0]["open"],
-                                    high=max(row["high"] for row in day_rows),
-                                    low=min(row["low"] for row in day_rows),
-                                    close=day_rows[-1]["close"],
-                                    volume=sum(row["volume"] for row in day_rows),
-                                    intoi=day_rows[-1]["oi"],
-                                    oi=day_rows[-1]["oi"],
+                                if not (market_open_t <= ts.time() < market_close_t):
+                                    continue
+                                if ts > cutoff_dt:
+                                    continue
+                                day_rows.append(
+                                    {
+                                        "date": ts,
+                                        "open": float(opens[i]),
+                                        "high": float(highs[i]),
+                                        "low": float(lows[i]),
+                                        "close": float(closes[i]),
+                                        "volume": int(volumes[i]),
+                                        "oi": int(float(open_interest[i])) if i < len(open_interest) and not _is_nan(open_interest[i]) else 0,
+                                    }
                                 )
-                                historical_data_list = [
-                                    row for row in historical_data_list
-                                    if not (
-                                        (isinstance(row.date, dt.datetime) and row.date.date() == date_end_dt.date())
-                                        or (row.date == dt.datetime(1970, 1, 1))
-                                    )
-                                ]
-                                historical_data_list.append(today_bar)
+                            except Exception:
+                                continue
+
+                        if day_rows:
+                            today_bar = HistoricalData(
+                                date=pd.Timestamp(dt.datetime.combine(target_d, dt.time.min), tz=tz_ist),
+                                open=day_rows[0]["open"],
+                                high=max(row["high"] for row in day_rows),
+                                low=min(row["low"] for row in day_rows),
+                                close=day_rows[-1]["close"],
+                                volume=sum(row["volume"] for row in day_rows),
+                                intoi=day_rows[-1]["oi"],
+                                oi=day_rows[-1]["oi"],
+                            )
+                            epoch_d = dt.date(1970, 1, 1)
+                            historical_data_list = [
+                                row
+                                for row in historical_data_list
+                                if _historical_data_calendar_date(row) not in (target_d, epoch_d)
+                            ]
+                            historical_data_list.append(today_bar)
 
                 out[long_symbol] = historical_data_list
 
@@ -2092,13 +2243,21 @@ class Dhan(BrokerBase):
 
             def _run_feed():
                 loop = None
+                executor = None
                 try:
                     if self._is_process_shutting_down():
                         return
                     if not self._stream_credentials:
                         raise BrokerConnectionError("Dhan streaming credentials not initialized")
+                    # Another component (e.g. FivePaisa cleanup) may have triggered
+                    # concurrent.futures.thread._python_exit, setting the global
+                    # _shutdown flag. Reset it so this thread's executor can work.
+                    if concurrent.futures.thread._shutdown and not self._is_process_shutting_down():
+                        concurrent.futures.thread._shutdown = False
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
+                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+                    loop.set_default_executor(executor)
                     self._stream_loop = loop
                     self._streaming = True
                     parser = MarketFeed(
@@ -2120,8 +2279,10 @@ class Dhan(BrokerBase):
                             self._stream_connected_event.set()
                             parser.ws = ws
                             for message in subscription_messages:
+                                # Call synchronously; avoids RuntimeError from asyncio.to_thread()
+                                # when concurrent.futures thread pool is torn down by another component.
+                                self._wait_for_stream_request_rate_limit()
                                 await ws.send(json.dumps(message))
-                                await asyncio.sleep(self._stream_request_rate_limit_interval_secs)
                             while self._streaming:
                                 raw = await ws.recv()
                                 response = parser.process_data(raw)
@@ -2130,11 +2291,17 @@ class Dhan(BrokerBase):
 
                     loop.run_until_complete(_stream_main())
                 except Exception as e:
-                    if (
-                        isinstance(e, RuntimeError)
-                        and "cannot schedule new futures after interpreter shutdown" in str(e)
-                    ) or self._is_process_shutting_down():
+                    if self._is_process_shutting_down():
+                        # Actual interpreter shutdown — expected, nothing to do.
                         trading_logger.log_info("Dhan streaming thread stopped during interpreter shutdown")
+                    elif isinstance(e, RuntimeError) and "cannot schedule new futures after interpreter shutdown" in str(e):
+                        # concurrent.futures thread pool was torn down by another component while
+                        # this process is still running (e.g. FivePaisa streaming cleanup triggered
+                        # _python_exit globally). This is an unexpected loss of streaming.
+                        trading_logger.log_warning(
+                            "Dhan streaming thread stopped: thread pool shutdown by external component",
+                            {"error": str(e)},
+                        )
                     elif isinstance(e, (ConnectionClosedOK, ConnectionClosed)) and not self._streaming:
                         trading_logger.log_info("Dhan streaming thread closed cleanly")
                     else:
@@ -2151,6 +2318,8 @@ class Dhan(BrokerBase):
                             loop.close()
                     except Exception:
                         pass
+                    if executor is not None:
+                        executor.shutdown(wait=False)
                     self._stream_ws = None
                     self._stream_connected_event.clear()
                     self._stream_loop = None
@@ -2174,8 +2343,8 @@ class Dhan(BrokerBase):
 
                 async def _send_incremental_messages():
                     for message in delta_messages:
+                        self._wait_for_stream_request_rate_limit()
                         await ws.send(json.dumps(message))
-                        await asyncio.sleep(self._stream_request_rate_limit_interval_secs)
 
                 future = asyncio.run_coroutine_threadsafe(_send_incremental_messages(), loop)
                 future.result(timeout=5.0)

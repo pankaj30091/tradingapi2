@@ -11,6 +11,7 @@ import sys
 import time
 import traceback
 import zipfile
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Union, cast
 
 import pandas as pd
@@ -24,6 +25,7 @@ try:
 except Exception:
     try:
         import urllib3.util.connection as _conn
+
         _conn.HAS_IPV6 = True
     except Exception:
         pass
@@ -76,6 +78,7 @@ def _temporarily_force_ipv4():
     except Exception:
         try:
             import urllib3.util.connection as conn
+
             old = getattr(conn, "HAS_IPV6", True)
             conn.HAS_IPV6 = False
             return old
@@ -92,6 +95,7 @@ def _restore_ipv6(previous):
     except Exception:
         try:
             import urllib3.util.connection as conn
+
             conn.HAS_IPV6 = previous
         except Exception:
             pass
@@ -128,16 +132,17 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
     _proxies = None
     try:
         from .proxy_utils import get_proxies_for_broker
+
         _proxies = get_proxies_for_broker("ICICIDIRECT")
     except Exception:
         pass
     _prev_ipv6 = _temporarily_force_ipv4()
     try:
         headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
         }
-        response = requests.get(url, headers=headers,allow_redirects=True, timeout=60, proxies=_proxies or {})
+        response = requests.get(url, headers=headers, allow_redirects=True, timeout=60, proxies=_proxies or {})
     finally:
         _restore_ipv6(_prev_ipv6)
     try:
@@ -151,10 +156,10 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
             all_names = set(zf.namelist())
             wanted_files = [
-                "NSEScripMaster.txt",   # NSE cash
-                "BSEScripMaster.txt",   # BSE cash
-                "FONSEScripMaster.txt", # NSE F&O
-                "FOBSEScripMaster.txt", # BSE F&O
+                "NSEScripMaster.txt",  # NSE cash
+                "BSEScripMaster.txt",  # BSE cash
+                "FONSEScripMaster.txt",  # NSE F&O
+                "FOBSEScripMaster.txt",  # BSE F&O
             ]
 
             parts: list[pd.DataFrame] = []
@@ -184,8 +189,8 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                 symbol_col = pick_column(["stock_code", "stockcode", "exchangecode", "securitysymbol", "short_name"])
                 lot_col = pick_column(["lot_size", "lotsize", "lot"])
                 tick_col = pick_column(["tick_size", "ticksize"])
-                scrip_code = pick_column(["shortname"]) # excluded scripcode
-                instrument_col = pick_column(["instrument", "instrumentname"]) # excluded "token"
+                scrip_code = pick_column(["shortname"])  # excluded scripcode
+                instrument_col = pick_column(["instrument", "instrumentname"])  # excluded "token"
 
                 expiry_col = pick_column(["expiry_date", "expirydate", "expiry"])
                 strike_col = pick_column(["strike_price", "strikeprice", "strike"])
@@ -202,7 +207,14 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                 # Breeze API methods expect stock_code (human-readable symbol), not token id.
                 part["stock_code"] = df[symbol_col].astype(str).str.strip().str.upper()
                 # Normalize index names in part: NIFTY 50 -> NIFTY, NIFTY BANK -> BANKNIFTY
-                part["stock_code"] = part["stock_code"].replace("NIFTY 50", "NIFTY").replace("NIFTY BANK", "BANKNIFTY").replace("NIFTY MIDCAP","MIDCPNIFTY").replace("NIFTY FINANCIAL","FINNIFTY").replace("NIFTY NEXT 50", "NIFTYNXT50")
+                part["stock_code"] = (
+                    part["stock_code"]
+                    .replace("NIFTY 50", "NIFTY")
+                    .replace("NIFTY BANK", "BANKNIFTY")
+                    .replace("NIFTY MIDCAP", "MIDCPNIFTY")
+                    .replace("NIFTY FINANCIAL", "FINNIFTY")
+                    .replace("NIFTY NEXT 50", "NIFTYNXT50")
+                )
 
                 # Assign exchange and segment based on file name
                 if fname == "NSEScripMaster.txt":
@@ -225,13 +237,13 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                     part["LotSize"] = pd.to_numeric(df[lot_col], errors="coerce").fillna(1).astype(int)
                 else:
                     part["LotSize"] = 1
-                
+
                 if fname in ["FONSEScripMaster.txt", "FOBSEScripMaster.txt"]:
                     if instrument_col and instrument_col in df.columns:
                         part["ExchType"] = df[instrument_col].astype(str).str.upper().str.strip().str[:3]
                     else:
                         part["ExchType"] = "DER"
-                    
+
                     if expiry_col and expiry_col in df.columns:
                         part["ExpiryDate"] = df[expiry_col]
                     if strike_col and strike_col in df.columns:
@@ -242,7 +254,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                 if tick_col and tick_col in df.columns:
                     part["TickSize"] = pd.to_numeric(df[tick_col], errors="coerce").fillna(0.05)
                     if fname in ["FONSEScripMaster.txt", "FOBSEScripMaster.txt"]:
-                         part["TickSize"] = part["TickSize"] / 100.0
+                        part["TickSize"] = part["TickSize"] / 100.0
                 else:
                     part["TickSize"] = 0.05
 
@@ -252,7 +264,9 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
 
                     # Cash: follow STK/IND pattern similar to other brokers
                     if row["ExchType"] == "CASH":
-                        if any(idx in sym_u for idx in ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX", "INDIAVIX", "INDEX"]):
+                        if any(
+                            idx in sym_u for idx in ["NIFTY", "BANKNIFTY", "SENSEX", "INDIA VIX", "INDIAVIX", "INDEX"]
+                        ):
                             return f"{sym_u}_IND___"
                         else:
                             return f"{sym_u}_STK___"
@@ -298,9 +312,19 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                                 return f"{sym_u}_OPT_{expiry_str}_{opt_type}_{strike_str}"
 
                         except Exception:
-                             return f"{sym_u}_DERIV___"
-                
+                            return f"{sym_u}_DERIV___"
+
                 part["long_symbol"] = part.apply(make_long_symbol, axis=1)
+                # Source tick sizes for NSE/BSE cash equities can be unreliable.
+                # Force equities to 0.05; keep F&O tick sizes from source.
+                part.loc[
+                    (part["ExchType"] == "CASH") & (part["long_symbol"].astype(str).str.endswith("_STK___")),
+                    "TickSize",
+                ] = 0.05
+                if "Token" in df.columns:
+                    part["Token"] = df["Token"].astype(str).str.strip()
+                else:
+                    part["Token"] = ""
                 if scrip_code and scrip_code in df.columns:
                     part["Scripcode"] = df[scrip_code].astype(str).str.strip()
                 else:
@@ -308,7 +332,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                     part["Scripcode"] = part["stock_code"]
 
                 # Drop extra columns (e.g. ExpiryDate, StrikePrice, OptionType) after long_symbol is constructed.
-                part = part[["stock_code", "Exch", "ExchType", "LotSize", "TickSize", "long_symbol", "Scripcode"]]
+                part = part[["stock_code", "Exch", "ExchType", "LotSize", "TickSize", "long_symbol", "Scripcode", "Token"]]
                 parts.append(part)
 
         if not parts:
@@ -320,7 +344,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
         codes = pd.concat(parts, ignore_index=True)
 
         # Reorder columns to the common schema
-        codes = codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize", "stock_code"]]
+        codes = codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize", "stock_code", "Token"]]
         codes = codes.drop_duplicates(subset=["long_symbol", "Exch"], keep="first").reset_index(drop=True)
 
         if saveToFolder:
@@ -328,7 +352,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                 f"{config.get('ICICIDIRECT.SYMBOLCODES')}/{dt.datetime.today().strftime('%Y%m%d')}_symbols.csv"
             )
             try:
-                codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize"]].to_csv(
+                codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize", "Token"]].to_csv(
                     dest_symbol_file, index=False
                 )
                 trading_logger.log_info(
@@ -336,9 +360,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
                     {"path": dest_symbol_file, "rows": len(codes)},
                 )
             except Exception as e:
-                trading_logger.log_error(
-                    "Error writing IciciDirect symbols CSV", e, {"path": dest_symbol_file}
-                )
+                trading_logger.log_error("Error writing IciciDirect symbols CSV", e, {"path": dest_symbol_file})
 
         return codes
 
@@ -360,6 +382,25 @@ def _format_expiry_for_breeze(expiry_yyyymmdd: str) -> str:
         return d.strftime("%Y-%m-%d") + "T06:00:00.000Z"
     except ValueError:
         return expiry_yyyymmdd
+
+
+def _format_expiry_for_breeze_stream(expiry_yyyymmdd: str) -> str:
+    """Convert YYYYMMDD to the token-map format used by Breeze websocket subscriptions."""
+    if not expiry_yyyymmdd or len(expiry_yyyymmdd) != 8:
+        return ""
+    try:
+        return dt.datetime.strptime(expiry_yyyymmdd, "%Y%m%d").strftime("%d-%b-%Y")
+    except ValueError:
+        return expiry_yyyymmdd
+
+
+def _format_decimal_string(value: object, places: int = 2, default: str = "0") -> str:
+    try:
+        dec = Decimal(str(value))
+        quant = Decimal("1").scaleb(-places)
+        return format(dec.quantize(quant).normalize(), "f")
+    except (InvalidOperation, ValueError, TypeError):
+        return default
 
 
 # Timezone for Breeze API responses (exchange times are India)
@@ -431,6 +472,7 @@ class IciciDirect(BrokerBase):
             self._stream_symbol_to_token: Dict[str, str] = {}
             self._stream_stock_code_to_symbol: Dict[str, str] = {}
             self._stream_symbol_meta: Dict[str, Dict[str, str]] = {}
+            self._stream_symbol_to_feed_token: Dict[str, str] = {}
             self._stream_external_callback = None
             self._stream_raw_tick_count = 0
             self._stream_mapped_tick_count = 0
@@ -661,12 +703,13 @@ class IciciDirect(BrokerBase):
 
         token_command = config.get("ICICIDIRECT.AUTO_SESSION_TOKEN_CMD")
         if not token_command and config.get("ICICIDIRECT.AUTO_LOGIN"):
+            py = sys.executable or "python3"
             token_command = (
-                "python -m tradingapi.icicidirect_generate_session "
-                "--api-key \"${ICICI_API_KEY}\" "
-                "--user-id \"${ICICI_USER_ID}\" "
-                "--password \"${ICICI_PASSWORD}\" "
-                "--totp-token \"${ICICI_TOTP_TOKEN}\""
+                f"{py} -m tradingapi.icicidirect_generate_session "
+                '--api-key "${ICICI_API_KEY}" '
+                '--user-id "${ICICI_USER_ID}" '
+                '--password "${ICICI_PASSWORD}" '
+                '--totp-token "${ICICI_TOTP_TOKEN}"'
             )
             # Optional selector / webdriver overrides from config.
             opt_map = {
@@ -682,7 +725,7 @@ class IciciDirect(BrokerBase):
             for conf_key, arg_name in opt_map.items():
                 v = config.get(f"ICICIDIRECT.{conf_key}")
                 if v not in [None, ""]:
-                    token_command += f" {arg_name} \"{v}\""
+                    token_command += f' {arg_name} "{v}"'
 
             if not bool(config.get("ICICIDIRECT.SELENIUM_HEADLESS", True)):
                 token_command += " --no-headless"
@@ -724,7 +767,8 @@ class IciciDirect(BrokerBase):
 
         previous_proxy_env = None
         try:
-            from .proxy_utils import set_proxy_env_for_broker, restore_proxy_env
+            from .proxy_utils import set_proxy_env_for_broker
+
             previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
         except Exception:
             pass
@@ -794,6 +838,7 @@ class IciciDirect(BrokerBase):
             _restore_ipv6(_prev_ipv6)
             try:
                 from .proxy_utils import restore_proxy_env
+
                 restore_proxy_env(previous_proxy_env)
             except Exception:
                 pass
@@ -843,13 +888,21 @@ class IciciDirect(BrokerBase):
                         {"symbols_path": symbols_path, "date": date_str},
                     )
                     codes = pd.read_csv(symbols_path)
+                    if "Token" not in codes.columns:
+                        trading_logger.log_info(
+                            "IciciDirect symbols file missing raw Token column, regenerating",
+                            {"symbols_path": symbols_path},
+                        )
+                        codes = save_symbol_data(saveToFolder=True)
                     self.codes = codes
                 else:
                     trading_logger.log_info(
                         "IciciDirect symbols file not found, generating",
-                        {"symbols_path": symbols_path},
+                        {"symbols_path": symbols_path, "requested_save_to_folder": save_to_folder},
                     )
-                    codes = save_symbol_data(saveToFolder=save_to_folder)
+                    # Persist the generated file when a symbol folder is configured so
+                    # subsequent starts can reuse it instead of redownloading.
+                    codes = save_symbol_data(saveToFolder=True)
                     self.codes = codes
             else:
                 codes = save_symbol_data(saveToFolder=False)
@@ -870,6 +923,9 @@ class IciciDirect(BrokerBase):
                         "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"])),
                         "symbol_map_reversed": dict(zip(group[scrip_col], group["long_symbol"])),
                         "brokerid_map_reversed": dict(zip(group[scrip_col], group["long_symbol"])),
+                        "stream_token_map": (
+                            dict(zip(group["long_symbol"], group["Token"])) if "Token" in group.columns else {}
+                        ),
                     }
 
                     trading_logger.log_debug(
@@ -926,6 +982,17 @@ class IciciDirect(BrokerBase):
         Map exchange for database usage. Currently same as API mapping.
         """
         return self.map_exchange_for_api(long_symbol, exchange)
+
+    def _resolve_direct_stream_token(self, long_symbol: str, mapped_exchange: str) -> str:
+        token = str(
+            self.exchange_mappings.get(mapped_exchange, {}).get("stream_token_map", {}).get(long_symbol, "") or ""
+        ).strip()
+        if not token or token.lower() == "nan":
+            return ""
+        prefix = self._stream_exchange_prefix(mapped_exchange)
+        if not prefix:
+            return ""
+        return f"{prefix}.1!{token}"
 
     def _call_api_method(self, method_name: str, payload: Dict[str, object]) -> dict:
         """
@@ -1051,7 +1118,9 @@ class IciciDirect(BrokerBase):
         if mapped_exchange not in self.exchange_mappings:
             raise SymbolError(
                 f"Exchange {mapped_exchange} not available for IciciDirect",
-                create_error_context(mapped_exchange=mapped_exchange, available_exchanges=list(self.exchange_mappings.keys())),
+                create_error_context(
+                    mapped_exchange=mapped_exchange, available_exchanges=list(self.exchange_mappings.keys())
+                ),
             )
 
         symbol_map = self.exchange_mappings[mapped_exchange].get("symbol_map", {})
@@ -1074,9 +1143,7 @@ class IciciDirect(BrokerBase):
             create_error_context(long_symbol=long_symbol, mapped_exchange=mapped_exchange),
         )
 
-    def _get_quotes_params_from_long_symbol(
-        self, long_symbol: str, exchange: str
-    ) -> Dict[str, str]:
+    def _get_quotes_params_from_long_symbol(self, long_symbol: str, exchange: str) -> Dict[str, str]:
         """
         Explode long_symbol into Breeze get_quotes(...) parameters.
 
@@ -1131,7 +1198,7 @@ class IciciDirect(BrokerBase):
         market_feed = Price()
         market_feed.symbol = long_symbol
         market_feed.exchange = exchange
-        market_feed.src = "ICICIDIRECT"
+        market_feed.src = "icicidirect"
         market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
@@ -1158,18 +1225,6 @@ class IciciDirect(BrokerBase):
                     else:
                         raise last_quote_error
 
-            success = resp.get("Success") if isinstance(resp, dict) else None
-            if isinstance(success, list):
-                md = success[0] if success else None
-            else:
-                md = success if success is not None else None
-            if md is None:
-                trading_logger.log_warning(
-                    "IciciDirect returned no quote data for this symbol",
-                    {"long_symbol": long_symbol, "exchange": exchange, "response": resp},
-                )
-                return market_feed
-
             def _float(v, default=float("nan")):
                 if v is None or v == "":
                     return default
@@ -1186,6 +1241,33 @@ class IciciDirect(BrokerBase):
                 except (ValueError, TypeError):
                     return default
 
+            success = resp.get("Success") if isinstance(resp, dict) else None
+            if isinstance(success, list):
+                md = None
+                target_exchange = str(params.get("exchange_code") or exchange).upper()
+                normalized_target = "BSE" if target_exchange == "B" else ("NSE" if target_exchange == "N" else target_exchange)
+                for row in success:
+                    row_exchange = str((row or {}).get("exchange_code") or "").upper()
+                    if row_exchange == normalized_target:
+                        md = row
+                        break
+                if md is None:
+                    for row in success:
+                        row_ltp = _float((row or {}).get("ltp"))
+                        if not pd.isna(row_ltp) and row_ltp > 0:
+                            md = row
+                            break
+                if md is None:
+                    md = success[0] if success else None
+            else:
+                md = success if success is not None else None
+            if md is None:
+                trading_logger.log_warning(
+                    "IciciDirect returned no quote data for this symbol",
+                    {"long_symbol": long_symbol, "exchange": exchange, "response": resp},
+                )
+                return market_feed
+
             bid = _float(md.get("best_bid_price"))
             ask = _float(md.get("best_offer_price") or md.get("best_ask_price"))
             last = _float(md.get("ltp"))
@@ -1195,6 +1277,15 @@ class IciciDirect(BrokerBase):
             bid_vol = _int(md.get("best_bid_quantity"))
             ask_vol = _int(md.get("best_offer_quantity") or md.get("best_ask_quantity"))
             prior_close = _float(md.get("previous_close"))
+
+            if not pd.isna(last) and last <= 0:
+                midpoint = float("nan")
+                if not pd.isna(bid) and not pd.isna(ask) and bid > 0 and ask > 0:
+                    midpoint = (bid + ask) / 2.0
+                for candidate in (midpoint, prior_close, high, low):
+                    if not pd.isna(candidate) and candidate > 0:
+                        last = candidate
+                        break
 
             ltt = md.get("ltt") or ""
             if ltt:
@@ -1217,7 +1308,7 @@ class IciciDirect(BrokerBase):
                 volume=volume,
                 symbol=long_symbol,
                 exchange=exchange,
-                src="ICICIDIRECT",
+                src="icicidirect",
                 timestamp=timestamp,
             )
         except Exception as e:
@@ -1312,9 +1403,8 @@ class IciciDirect(BrokerBase):
                             meta = self._stream_symbol_meta.get(s, {})
                             meta_stock_code = _norm(meta.get("stock_code", ""))
                             sym_root = _norm(str(s).split("_", 1)[0])
-                            if (
-                                (meta_stock_code and (meta_stock_code in token_key or token_key in meta_stock_code))
-                                or (sym_root and (sym_root in token_key or token_key in sym_root))
+                            if (meta_stock_code and (meta_stock_code in token_key or token_key in meta_stock_code)) or (
+                                sym_root and (sym_root in token_key or token_key in sym_root)
                             ):
                                 cands.append(s)
 
@@ -1360,9 +1450,26 @@ class IciciDirect(BrokerBase):
             return None
 
         market_feed = Price()
-        market_feed.src = "ICICIDIRECT"
+        market_feed.src = "icicidirect"
         market_feed.symbol = long_symbol
-        market_feed.exchange = str(tick.get("exchange") or "")
+        tick_exchange = str(tick.get("exchange") or "").upper().strip()
+        if tick_exchange in ("B", "BSE"):
+            resolved_exchange = "BSE"
+        elif tick_exchange in ("N", "NSE"):
+            resolved_exchange = "NSE"
+        else:
+            # Breeze stream payload often omits exchange; infer from token prefix/exchange mappings.
+            resolved_exchange = ""
+            if token.startswith("1."):
+                resolved_exchange = "BSE"
+            elif token.startswith("4."):
+                resolved_exchange = "NSE"
+            if not resolved_exchange:
+                for ex, mapping in self.exchange_mappings.items():
+                    if mapping.get("symbol_map", {}).get(long_symbol) is not None:
+                        resolved_exchange = "BSE" if ex.startswith("B") else ("NSE" if ex.startswith("N") else ex)
+                        break
+        market_feed.exchange = resolved_exchange
         market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         def _f(k: str, default=float("nan")):
@@ -1393,7 +1500,11 @@ class IciciDirect(BrokerBase):
         market_feed.prior_close = _f("close")
         market_feed.volume = _i("ttq")
         if isinstance(tick.get("ltt"), str) and tick.get("ltt"):
-            market_feed.timestamp = str(tick.get("ltt"))
+            ltt = str(tick.get("ltt"))
+            try:
+                market_feed.timestamp = format_datetime(ltt, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return market_feed
 
     @log_execution_time
@@ -1446,107 +1557,162 @@ class IciciDirect(BrokerBase):
                 params = self._get_quotes_params_from_long_symbol(symbol, exchange)
                 mapped_exchange = str(params.get("exchange_code") or self.map_exchange_for_api(symbol, exchange))
                 stock_code = str(params.get("stock_code") or "").strip()
+                stream_expiry_date = str(params.get("expiry_date") or "").strip()
+                if mapped_exchange in ["NFO", "BFO"] and stream_expiry_date:
+                    raw_expiry = str(symbol).strip().upper().split("_")[2] if len(str(symbol).split("_")) >= 3 else ""
+                    stream_expiry_date = _format_expiry_for_breeze_stream(raw_expiry)
                 if not stock_code:
                     raise MarketDataError(
                         "Unable to resolve stock_code for streaming subscription",
                         create_error_context(symbol=symbol, exchange=exchange),
                     )
 
-                if operation == "s":
-                    # Resolve Breeze websocket token for this instrument and cache mapping.
-                    try:
-                        exchange_token, _ = self._call_api_method(
-                            "get_stock_token_value",
-                            {
-                                "exchange_code": mapped_exchange,
-                                "stock_code": stock_code,
-                                "product_type": str(params.get("product_type") or "cash"),
-                                "expiry_date": str(params.get("expiry_date") or ""),
-                                "strike_price": str(params.get("strike_price") or ""),
-                                "right": str(params.get("right") or ""),
-                                "get_exchange_quotes": True,
-                                "get_market_depth": False,
-                            },
-                        )
-                        if exchange_token:
-                            self._stream_token_to_symbol[str(exchange_token)] = symbol
-                    except Exception:
-                        # Non-fatal: stream can still run; callback resolver has other fallbacks.
-                        pass
+                try:
+                    if operation == "s":
+                        direct_feed_token = ""
+                        # Resolve Breeze websocket token for this instrument and cache mapping.
+                        try:
+                            exchange_token, _ = self._call_api_method(
+                                "get_stock_token_value",
+                                {
+                                    "exchange_code": mapped_exchange,
+                                    "stock_code": stock_code,
+                                    "product_type": str(params.get("product_type") or "cash"),
+                                    "expiry_date": stream_expiry_date,
+                                    "strike_price": str(params.get("strike_price") or ""),
+                                    "right": str(params.get("right") or ""),
+                                    "get_exchange_quotes": True,
+                                    "get_market_depth": False,
+                                },
+                            )
+                            if exchange_token:
+                                self._stream_token_to_symbol[str(exchange_token)] = symbol
+                        except Exception:
+                            # Non-fatal: stream can still run; callback resolver has other fallbacks.
+                            pass
 
-                    sub_resp = self._call_api_method(
-                        "subscribe_feeds",
-                        {
+                        subscription_payload = {
                             "exchange_code": mapped_exchange,
                             "stock_code": stock_code,
+                            "product_type": str(params.get("product_type") or "cash"),
+                            "expiry_date": stream_expiry_date,
+                            "strike_price": str(params.get("strike_price") or ""),
+                            "right": str(params.get("right") or ""),
                             "get_exchange_quotes": True,
                             "get_market_depth": False,
-                        },
-                    )
-                    if isinstance(sub_resp, str) and "Exception while subscribing to feeds" in sub_resp:
-                        raise MarketDataError(
-                            f"IciciDirect subscribe failed: {sub_resp}",
-                            create_error_context(symbol=symbol, exchange=mapped_exchange, stock_code=stock_code),
-                        )
-                    self._stream_stock_code_to_symbol[stock_code.upper()] = symbol
-                    self._stream_symbol_to_token[symbol] = stock_code
-                    self._stream_symbol_meta[symbol] = {
-                        "exchange_code": mapped_exchange,
-                        "stock_code": stock_code,
-                        "product_type": str(params.get("product_type") or "cash"),
-                        "expiry_date": str(params.get("expiry_date") or ""),
-                        "right": str(params.get("right") or ""),
-                        "strike_price": str(params.get("strike_price") or ""),
-                    }
-                    if symbol not in self.subscribed_symbols:
-                        self.subscribed_symbols.append(symbol)
-                    trading_logger.log_info(
-                        "IciciDirect subscribed to market stream",
-                        {"symbol": symbol, "exchange": mapped_exchange, "stock_code": stock_code},
-                    )
-                else:
-                    unsub_stock_code = self._stream_symbol_to_token.get(symbol, stock_code)
-                    # Best-effort token lookup for cleanup map
-                    try:
-                        exchange_token, _ = self._call_api_method(
-                            "get_stock_token_value",
+                        }
+                        sub_resp = self._call_api_method("subscribe_feeds", subscription_payload)
+                        if isinstance(sub_resp, str) and "Exception while subscribing to feeds" in sub_resp:
+                            direct_feed_token = self._resolve_direct_stream_token(symbol, mapped_exchange)
+                            if direct_feed_token:
+                                sub_resp = self._call_api_method(
+                                    "subscribe_feeds",
+                                    {
+                                        "stock_token": direct_feed_token,
+                                        "get_exchange_quotes": True,
+                                        "get_market_depth": False,
+                                    },
+                                )
+                                if not (isinstance(sub_resp, str) and "Exception while subscribing to feeds" in sub_resp):
+                                    self._stream_token_to_symbol[direct_feed_token] = symbol
+                            if isinstance(sub_resp, str) and "Exception while subscribing to feeds" in sub_resp:
+                                raise MarketDataError(
+                                    f"IciciDirect subscribe failed: {sub_resp}",
+                                    create_error_context(symbol=symbol, exchange=mapped_exchange, stock_code=stock_code),
+                                )
+                        self._stream_stock_code_to_symbol[stock_code.upper()] = symbol
+                        self._stream_symbol_to_token[symbol] = stock_code
+                        self._stream_symbol_to_feed_token[symbol] = direct_feed_token
+                        self._stream_symbol_meta[symbol] = {
+                            "exchange_code": mapped_exchange,
+                            "stock_code": stock_code,
+                            "product_type": str(params.get("product_type") or "cash"),
+                            "expiry_date": stream_expiry_date,
+                            "right": str(params.get("right") or ""),
+                            "strike_price": str(params.get("strike_price") or ""),
+                        }
+                        if symbol not in self.subscribed_symbols:
+                            self.subscribed_symbols.append(symbol)
+                        trading_logger.log_info(
+                            "IciciDirect subscribed to market stream",
                             {
-                                "exchange_code": mapped_exchange,
-                                "stock_code": str(unsub_stock_code),
-                                "product_type": str(params.get("product_type") or "cash"),
-                                "expiry_date": str(params.get("expiry_date") or ""),
-                                "strike_price": str(params.get("strike_price") or ""),
-                                "right": str(params.get("right") or ""),
-                                "get_exchange_quotes": True,
-                                "get_market_depth": False,
+                                "symbol": symbol,
+                                "exchange": mapped_exchange,
+                                "stock_code": stock_code,
+                                "feed_token": direct_feed_token,
                             },
                         )
-                        if exchange_token:
-                            self._stream_token_to_symbol.pop(str(exchange_token), None)
-                    except Exception:
-                        pass
-                    unsub_resp = self._call_api_method(
-                        "unsubscribe_feeds",
+                    else:
+                        unsub_stock_code = self._stream_symbol_to_token.get(symbol, stock_code)
+                        direct_feed_token = self._stream_symbol_to_feed_token.get(symbol, "")
+                        # Best-effort token lookup for cleanup map
+                        try:
+                            exchange_token, _ = self._call_api_method(
+                                "get_stock_token_value",
+                                {
+                                    "exchange_code": mapped_exchange,
+                                    "stock_code": str(unsub_stock_code),
+                                    "product_type": str(params.get("product_type") or "cash"),
+                                    "expiry_date": stream_expiry_date,
+                                    "strike_price": str(params.get("strike_price") or ""),
+                                    "right": str(params.get("right") or ""),
+                                    "get_exchange_quotes": True,
+                                    "get_market_depth": False,
+                                },
+                            )
+                            if exchange_token:
+                                self._stream_token_to_symbol.pop(str(exchange_token), None)
+                        except Exception:
+                            pass
+                        if direct_feed_token:
+                            unsub_resp = self._call_api_method(
+                                "unsubscribe_feeds",
+                                {
+                                    "stock_token": direct_feed_token,
+                                    "get_exchange_quotes": True,
+                                    "get_market_depth": False,
+                                },
+                            )
+                            self._stream_token_to_symbol.pop(direct_feed_token, None)
+                        else:
+                            unsub_resp = self._call_api_method(
+                                "unsubscribe_feeds",
+                                {
+                                    "exchange_code": mapped_exchange,
+                                    "stock_code": unsub_stock_code,
+                                    "product_type": str(params.get("product_type") or "cash"),
+                                    "expiry_date": stream_expiry_date,
+                                    "strike_price": str(params.get("strike_price") or ""),
+                                    "right": str(params.get("right") or ""),
+                                    "get_exchange_quotes": True,
+                                    "get_market_depth": False,
+                                },
+                            )
+                        if isinstance(unsub_resp, str) and "Exception while unsubscribing to feeds" in unsub_resp:
+                            raise MarketDataError(
+                                f"IciciDirect unsubscribe failed: {unsub_resp}",
+                                create_error_context(symbol=symbol, stock_code=unsub_stock_code),
+                            )
+                        self._stream_stock_code_to_symbol.pop(str(unsub_stock_code).upper(), None)
+                        self._stream_symbol_to_token.pop(symbol, None)
+                        self._stream_symbol_to_feed_token.pop(symbol, None)
+                        self._stream_symbol_meta.pop(symbol, None)
+                        self.subscribed_symbols = [s for s in self.subscribed_symbols if s != symbol]
+                        trading_logger.log_info(
+                            "IciciDirect unsubscribed from market stream",
+                            {"symbol": symbol, "stock_code": unsub_stock_code},
+                        )
+                except Exception as stream_symbol_error:
+                    trading_logger.log_warning(
+                        "IciciDirect skipping unsupported stream symbol",
                         {
-                            "exchange_code": mapped_exchange,
-                            "stock_code": unsub_stock_code,
-                            "get_exchange_quotes": True,
-                            "get_market_depth": False,
+                            "symbol": symbol,
+                            "exchange": mapped_exchange,
+                            "stock_code": stock_code,
+                            "error": str(stream_symbol_error),
                         },
                     )
-                    if isinstance(unsub_resp, str) and "Exception while unsubscribing to feeds" in unsub_resp:
-                        raise MarketDataError(
-                            f"IciciDirect unsubscribe failed: {unsub_resp}",
-                            create_error_context(symbol=symbol, stock_code=unsub_stock_code),
-                        )
-                    self._stream_stock_code_to_symbol.pop(str(unsub_stock_code).upper(), None)
-                    self._stream_symbol_to_token.pop(symbol, None)
-                    self._stream_symbol_meta.pop(symbol, None)
-                    self.subscribed_symbols = [s for s in self.subscribed_symbols if s != symbol]
-                    trading_logger.log_info(
-                        "IciciDirect unsubscribed from market stream",
-                        {"symbol": symbol, "stock_code": unsub_stock_code},
-                    )
+                    continue
         except Exception as e:
             raise MarketDataError(
                 f"Error starting quotes streaming for IciciDirect: {str(e)}",
@@ -1574,6 +1740,7 @@ class IciciDirect(BrokerBase):
             self._stream_symbol_to_token = {}
             self._stream_stock_code_to_symbol = {}
             self._stream_symbol_meta = {}
+            self._stream_symbol_to_feed_token = {}
             self.subscribed_symbols = []
             self._call_api_method("ws_disconnect", {})
         except Exception as e:
@@ -1709,22 +1876,30 @@ class IciciDirect(BrokerBase):
                     rows_today = resp_today.get("Success") if isinstance(resp_today, dict) else []
                     if isinstance(rows_today, list) and len(rows_today) > 0:
                         df_t = pd.DataFrame(rows_today)
-                        ts_col = df_t["datetime"] if "datetime" in df_t.columns else (df_t["time"] if "time" in df_t.columns else df_t["date"])
+                        ts_col = (
+                            df_t["datetime"]
+                            if "datetime" in df_t.columns
+                            else (df_t["time"] if "time" in df_t.columns else df_t["date"])
+                        )
                         df_t["date"] = pd.to_datetime(ts_col)
                         if df_t["date"].dt.tz is not None:
                             df_t["date"] = df_t["date"].dt.tz_convert(ICICIDIRECT_TIMEZONE)
                         else:
                             df_t["date"] = df_t["date"].dt.tz_localize(ICICIDIRECT_TIMEZONE)
                         df_t = df_t.set_index("date")
-                        agg_map: Dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+                        agg_map: Dict[str, str] = {
+                            "open": "first",
+                            "high": "max",
+                            "low": "min",
+                            "close": "last",
+                            "volume": "sum",
+                        }
                         if "open_interest" in df_t.columns:
                             agg_map["open_interest"] = "last"
                         resampled = df_t.resample("D").agg(agg_map)  # type: ignore[arg-type]
                         for _, r in resampled.iterrows():
                             idx_val = r.name if r.name is not None else resampled.index[0]
-                            dt_val = _parse_api_date_to_kolkata(
-                                cast(Union[str, dt.datetime, pd.Timestamp], idx_val)
-                            )
+                            dt_val = _parse_api_date_to_kolkata(cast(Union[str, dt.datetime, pd.Timestamp], idx_val))
                             oi_val = int(float(r.get("open_interest", 0) or 0)) if "open_interest" in r.index else 0
                             today_bar = HistoricalData(
                                 date=dt_val,
@@ -1736,9 +1911,14 @@ class IciciDirect(BrokerBase):
                                 intoi=oi_val,
                                 oi=oi_val,
                             )
+
                             # Remove any existing bar for today from daily API, then append intraday-derived bar
                             def _day(d):
-                                return d.date() if hasattr(d, "date") and callable(getattr(d, "date", None)) else pd.to_datetime(d).date()
+                                return (
+                                    d.date()
+                                    if hasattr(d, "date") and callable(getattr(d, "date", None))
+                                    else pd.to_datetime(d).date()
+                                )
 
                             out = [x for x in out if _day(x.date) != today_date]
                             out.append(today_bar)
@@ -1828,18 +2008,26 @@ class IciciDirect(BrokerBase):
                 "action": action,
                 "order_type": mapped_order_type,
                 "quantity": str(int(order.quantity)),
-                "price": str(order.price if has_limit_price else 0),
+                "price": _format_decimal_string(order.price if has_limit_price else 0, places=2, default="0"),
                 "validity": str(kwargs.get("validity", "day")).lower(),
-                "user_remark": self._sanitize_user_remark(str(kwargs.get("user_remark") or order.internal_order_id or "")),
+                "user_remark": self._sanitize_user_remark(
+                    str(kwargs.get("user_remark") or order.internal_order_id or "")
+                ),
             }
 
             if has_trigger:
-                payload["stoploss"] = str(order.trigger_price)
+                payload["stoploss"] = _format_decimal_string(order.trigger_price, places=2, default="0")
 
             if product in ("options", "futures"):
                 payload["expiry_date"] = str(symbol_params.get("expiry_date") or kwargs.get("expiry_date") or "")
-                payload["right"] = str(symbol_params.get("right") or kwargs.get("right") or ("others" if product == "futures" else ""))
-                payload["strike_price"] = str(symbol_params.get("strike_price") or kwargs.get("strike_price") or ("0" if product == "futures" else ""))
+                payload["right"] = str(
+                    symbol_params.get("right") or kwargs.get("right") or ("others" if product == "futures" else "")
+                )
+                payload["strike_price"] = str(
+                    symbol_params.get("strike_price")
+                    or kwargs.get("strike_price")
+                    or ("0" if product == "futures" else "")
+                )
 
             # Allow explicitly provided kwargs only when accepted by installed SDK signature.
             payload.update({k: v for k, v in kwargs.items() if v is not None})
@@ -1859,7 +2047,9 @@ class IciciDirect(BrokerBase):
             )
 
             order.broker_order_id = str(broker_order_id or "")
-            order.exch_order_id = str(success_dict.get("exchange_order_id") or success_dict.get("exchangeOrderID") or "")
+            order.exch_order_id = str(
+                success_dict.get("exchange_order_id") or success_dict.get("exchangeOrderID") or ""
+            )
             order.orderRef = order.internal_order_id
             order.status = OrderStatus.PENDING if order.broker_order_id else OrderStatus.REJECTED
             error_message = ""
@@ -1910,7 +2100,9 @@ class IciciDirect(BrokerBase):
             if new_price < 0:
                 raise ValidationError("new_price cannot be negative", create_error_context(new_price=new_price))
             if new_quantity <= 0:
-                raise ValidationError("new_quantity must be greater than 0", create_error_context(new_quantity=new_quantity))
+                raise ValidationError(
+                    "new_quantity must be greater than 0", create_error_context(new_quantity=new_quantity)
+                )
 
             redis_order_data = self.redis_o.hgetall(broker_order_id)
             o = kwargs.get("order")
@@ -1944,7 +2136,7 @@ class IciciDirect(BrokerBase):
                 "order_type": str(mod_order_type or ""),
                 "stoploss": kwargs.get("stoploss", ""),
                 "quantity": str(new_quantity),
-                "price": str(new_price),
+                "price": _format_decimal_string(new_price, places=2, default="0"),
                 "validity": kwargs.get("validity", ""),
                 "disclosed_quantity": kwargs.get("disclosed_quantity", ""),
                 "validity_date": kwargs.get("validity_date", ""),
@@ -1983,7 +2175,9 @@ class IciciDirect(BrokerBase):
         except (ValidationError, BrokerConnectionError):
             raise
         except Exception as e:
-            raise OrderError(f"Error modifying IciciDirect order: {str(e)}", create_error_context(kwargs=kwargs, error=str(e)))
+            raise OrderError(
+                f"Error modifying IciciDirect order: {str(e)}", create_error_context(kwargs=kwargs, error=str(e))
+            )
 
     def cancel_order(self, **kwargs) -> Order:
         if self.api is None:
@@ -2021,7 +2215,9 @@ class IciciDirect(BrokerBase):
         except (ValidationError, BrokerConnectionError):
             raise
         except Exception as e:
-            raise OrderError(f"Error cancelling IciciDirect order: {str(e)}", create_error_context(kwargs=kwargs, error=str(e)))
+            raise OrderError(
+                f"Error cancelling IciciDirect order: {str(e)}", create_error_context(kwargs=kwargs, error=str(e))
+            )
 
     def get_order_info(self, **kwargs) -> OrderInfo:
         if self.api is None:
@@ -2050,7 +2246,9 @@ class IciciDirect(BrokerBase):
 
             book = self.get_orders_today()
             if book.empty:
-                raise OrderError(f"Order book is empty while searching for {order_id}", create_error_context(order_id=order_id))
+                raise OrderError(
+                    f"Order book is empty while searching for {order_id}", create_error_context(order_id=order_id)
+                )
             if "order_id" not in book.columns:
                 raise OrderError(
                     f"order_id column missing in order book while searching for {order_id}",
@@ -2063,14 +2261,12 @@ class IciciDirect(BrokerBase):
 
             rec = row.iloc[-1]
 
-            order_size = int(float(rec.get("quantity", rec.get("order_qty", 0)) or 0))
+            order_size = int(float(rec.get("ordered", rec.get("quantity", rec.get("order_qty", 0))) or 0))
             fill_size = int(
-                float(
-                    rec.get("filled_quantity", rec.get("executed_quantity", rec.get("filled_qty", 0))) or 0
-                )
+                float(rec.get("filled", rec.get("filled_quantity", rec.get("executed_quantity", rec.get("filled_qty", 0)))) or 0)
             )
-            order_price = float(rec.get("price", rec.get("order_price", float("nan"))))
-            fill_price = float(rec.get("average_price", rec.get("fill_price", 0)) or 0)
+            order_price = float(rec.get("order_price", rec.get("price", float("nan"))))
+            fill_price = float(rec.get("fill_price", rec.get("average_price", 0)) or 0)
             exchange_order_id = str(
                 rec.get("exchange_order_id", rec.get("exchangeOrderID", rec.get("exch_order_id", "")))
             )
@@ -2090,24 +2286,101 @@ class IciciDirect(BrokerBase):
         except (ValidationError, BrokerConnectionError, OrderError):
             raise
         except Exception as e:
-            raise OrderError(f"Error fetching IciciDirect order info: {str(e)}", create_error_context(kwargs=kwargs, error=str(e)))
+            raise OrderError(
+                f"Error fetching IciciDirect order info: {str(e)}", create_error_context(kwargs=kwargs, error=str(e))
+            )
 
-    def get_position(self, long_symbol: str) -> Union[pd.DataFrame, int]:
+    def get_position(self, long_symbol: str = "") -> Union[pd.DataFrame, int]:
         if self.api is None:
             raise BrokerConnectionError("IciciDirect not connected", create_error_context())
 
         try:
-            resp = self.api.get_portfolio_positions()
-            rows = resp.get("Success") if isinstance(resp, dict) else None
-            df = pd.DataFrame(rows or [])
-            if long_symbol:
+            def _resolve_long_symbol(df: pd.DataFrame) -> pd.Series:
                 if df.empty:
-                    return 0
-                key = "stock_code" if "stock_code" in df.columns else ("symbol" if "symbol" in df.columns else None)
-                if key:
-                    df = df[df[key].astype(str).str.upper() == str(long_symbol).split("_")[0].upper()]
-                return df if not df.empty else 0
-            return df
+                    return pd.Series(dtype="object")
+                stock_col = next(
+                    (c for c in ["stock_code", "symbol", "tradingsymbol", "stockCode", "security_id"] if c in df.columns),
+                    None,
+                )
+                exch_col = next((c for c in ["exchange_code", "exchange", "exchangeCode"] if c in df.columns), None)
+                if stock_col is None:
+                    return pd.Series([""] * len(df), index=df.index, dtype="object")
+
+                resolved: List[str] = []
+                for _, row in df.iterrows():
+                    stock_code = str(row.get(stock_col, "") or "").strip()
+                    exchange_code = str(row.get(exch_col, "NSE") or "NSE").upper().strip()
+                    rev = self.exchange_mappings.get(exchange_code, {}).get("symbol_map_reversed", {})
+                    long_sym = rev.get(stock_code)
+                    if long_sym is None:
+                        try:
+                            long_sym = rev.get(int(float(stock_code)))
+                        except Exception:
+                            long_sym = None
+                    if long_sym is None:
+                        stock_root = stock_code.upper().replace(" ", "")
+                        cands = [s for s in self.codes["long_symbol"].astype(str).tolist() if s.upper().startswith(stock_root + "_")]
+                        uniq_cands = sorted(set(cands))
+                        long_sym = uniq_cands[0] if len(uniq_cands) == 1 else ""
+                    resolved.append(str(long_sym or ""))
+                return pd.Series(resolved, index=df.index, dtype="object")
+
+            holdings_df = pd.DataFrame(columns=["long_symbol", "quantity"])
+            if hasattr(self.api, "get_portfolio_holdings"):
+                h_resp = self.api.get_portfolio_holdings()
+                h_rows = h_resp.get("Success") if isinstance(h_resp, dict) else None
+                h_raw = pd.DataFrame(h_rows or [])
+                if not h_raw.empty:
+                    h_raw["long_symbol"] = _resolve_long_symbol(h_raw)
+                    h_qty_col = next(
+                        (c for c in ["quantity", "available_quantity", "available_qty", "total_quantity"] if c in h_raw.columns),
+                        None,
+                    )
+                    h_raw["quantity"] = (
+                        pd.to_numeric(h_raw[h_qty_col], errors="coerce").fillna(0) if h_qty_col is not None else 0
+                    )
+                    holdings_df = h_raw[["long_symbol", "quantity"]]
+                    holdings_df = holdings_df[holdings_df["long_symbol"].astype(str).str.len() > 0]
+
+            # Fallback for accounts where holdings are exposed via demat endpoint.
+            if holdings_df.empty and hasattr(self.api, "get_demat_holdings"):
+                d_resp = self.api.get_demat_holdings()
+                d_rows = d_resp.get("Success") if isinstance(d_resp, dict) else None
+                d_raw = pd.DataFrame(d_rows or [])
+                if not d_raw.empty:
+                    d_raw["long_symbol"] = _resolve_long_symbol(d_raw)
+                    d_qty_col = next(
+                        (c for c in ["quantity", "demat_avail_quantity", "demat_allocated_quantity"] if c in d_raw.columns),
+                        None,
+                    )
+                    d_raw["quantity"] = (
+                        pd.to_numeric(d_raw[d_qty_col], errors="coerce").fillna(0) if d_qty_col is not None else 0
+                    )
+                    holdings_df = d_raw[["long_symbol", "quantity"]]
+                    holdings_df = holdings_df[holdings_df["long_symbol"].astype(str).str.len() > 0]
+
+            p_resp = self.api.get_portfolio_positions()
+            p_rows = p_resp.get("Success") if isinstance(p_resp, dict) else None
+            p_raw = pd.DataFrame(p_rows or [])
+            positions_df = pd.DataFrame(columns=["long_symbol", "quantity"])
+            if not p_raw.empty:
+                p_raw["long_symbol"] = _resolve_long_symbol(p_raw)
+                p_qty_col = next((c for c in ["net_quantity", "quantity", "net_qty", "netQuantity"] if c in p_raw.columns), None)
+                p_raw["quantity"] = (
+                    pd.to_numeric(p_raw[p_qty_col], errors="coerce").fillna(0) if p_qty_col is not None else 0
+                )
+                positions_df = p_raw[["long_symbol", "quantity"]]
+                positions_df = positions_df[positions_df["long_symbol"].astype(str).str.len() > 0]
+
+            merged = pd.merge(positions_df, holdings_df, on="long_symbol", how="outer")
+            result = merged.groupby("long_symbol", as_index=False).agg({"quantity_x": "sum", "quantity_y": "sum"})
+            result["quantity"] = result["quantity_x"].fillna(0) + result["quantity_y"].fillna(0)
+            result = result[["long_symbol", "quantity"]]
+
+            if not long_symbol:
+                return result
+            pos = result.loc[result.long_symbol == long_symbol, "quantity"]
+            return 0 if len(pos) == 0 else int(pos.iloc[0])
         except Exception as e:
             raise MarketDataError(f"Error fetching IciciDirect positions: {str(e)}", create_error_context(error=str(e)))
 
@@ -2119,7 +2392,9 @@ class IciciDirect(BrokerBase):
             from_date, to_date = self._today_window_utc()
             req_from = kwargs.get("from_date", from_date)
             req_to = kwargs.get("to_date", to_date)
-            exchange_codes = [str(kwargs["exchange_code"]).upper()] if kwargs.get("exchange_code") else ["NSE", "BSE", "NFO", "BFO"]
+            exchange_codes = (
+                [str(kwargs["exchange_code"]).upper()] if kwargs.get("exchange_code") else ["NSE", "BSE", "NFO", "BFO"]
+            )
             frames: list[pd.DataFrame] = []
 
             for exchange_code in exchange_codes:
@@ -2136,6 +2411,28 @@ class IciciDirect(BrokerBase):
                     frames.append(pd.DataFrame(rows))
 
             df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            all_columns = kwargs.get("all_columns", False)
+            if df.empty:
+                if all_columns:
+                    return df
+                return pd.DataFrame(
+                    columns=[
+                        "long_symbol",
+                        "internal_order_id",
+                        "order_time",
+                        "side",
+                        "broker_order_id",
+                        "exchange_order_id",
+                        "ordered",
+                        "filled",
+                        "price_type",
+                        "order_price",
+                        "fill_price",
+                        "status",
+                        "order_id",
+                    ]
+                )
+
             # normalize core columns used by get_order_info
             rename_map = {
                 "order_no": "order_id",
@@ -2150,9 +2447,89 @@ class IciciDirect(BrokerBase):
             present = {k: v for k, v in rename_map.items() if k in df.columns}
             if present:
                 df = df.rename(columns=present)
-            return df
+            if all_columns:
+                return df
+
+            if "broker_order_id" not in df.columns:
+                if "order_id" in df.columns:
+                    df["broker_order_id"] = df["order_id"]
+                else:
+                    df["broker_order_id"] = ""
+            if "exchange_order_id" not in df.columns:
+                df["exchange_order_id"] = ""
+            if "ordered" not in df.columns:
+                df["ordered"] = df.get("quantity", 0)
+            if "filled" not in df.columns:
+                df["filled"] = df.get("filled_quantity", 0)
+            if "order_price" not in df.columns:
+                df["order_price"] = df.get("price", float("nan"))
+            if "fill_price" not in df.columns:
+                df["fill_price"] = df.get("average_price", 0)
+            if "price_type" not in df.columns:
+                df["price_type"] = df.get("order_type", "")
+            if "side" not in df.columns:
+                side_col = df.get("action", "")
+                if isinstance(side_col, pd.Series):
+                    df["side"] = side_col.astype(str).str.title()
+                else:
+                    df["side"] = ""
+            if "order_time" not in df.columns:
+                # prefer broker timestamp columns, fallback to now-like empty value
+                for c in ["created_at", "order_datetime", "order_time", "exchange_time", "created_time"]:
+                    if c in df.columns:
+                        parsed = pd.to_datetime(df[c], errors="coerce")
+                        if parsed.isna().any():
+                            fallback = pd.to_datetime(df[c], format="%d-%b-%Y %H:%M:%S", errors="coerce")
+                            parsed = parsed.fillna(fallback)
+                        if parsed.isna().any():
+                            fallback = pd.to_datetime(df[c], format="%d-%b-%Y %H:%M", errors="coerce")
+                            parsed = parsed.fillna(fallback)
+                        df["order_time"] = parsed.dt.strftime("%Y-%m-%d %H:%M:%S")
+                        break
+                if "order_time" not in df.columns:
+                    df["order_time"] = ""
+
+            # Populate long_symbol/internal_order_id from redis links created at place_order time.
+            if "long_symbol" not in df.columns:
+                df["long_symbol"] = ""
+            if "internal_order_id" not in df.columns:
+                df["internal_order_id"] = ""
+
+            for idx, row in df.iterrows():
+                boid = str(row.get("broker_order_id") or row.get("order_id") or "").strip()
+                if not boid:
+                    continue
+                try:
+                    cached = self.redis_o.hgetall(boid)
+                except Exception:
+                    cached = {}
+                if not cached:
+                    continue
+                if not str(df.at[idx, "internal_order_id"] or "").strip():
+                    df.at[idx, "internal_order_id"] = str(cached.get("internal_order_id") or "")
+                if not str(df.at[idx, "long_symbol"] or "").strip():
+                    df.at[idx, "long_symbol"] = str(cached.get("long_symbol") or "")
+
+            keep = [
+                "long_symbol",
+                "internal_order_id",
+                "order_time",
+                "side",
+                "broker_order_id",
+                "exchange_order_id",
+                "ordered",
+                "filled",
+                "price_type",
+                "order_price",
+                "fill_price",
+                "status",
+                "order_id",
+            ]
+            return df.reindex(columns=[c for c in keep if c in df.columns], copy=False)
         except Exception as e:
-            raise OrderError(f"Error fetching IciciDirect orders: {str(e)}", create_error_context(error=str(e), kwargs=kwargs))
+            raise OrderError(
+                f"Error fetching IciciDirect orders: {str(e)}", create_error_context(error=str(e), kwargs=kwargs)
+            )
 
     def get_trades_today(self, **kwargs) -> pd.DataFrame:
         if self.api is None:
@@ -2162,7 +2539,9 @@ class IciciDirect(BrokerBase):
             from_date, to_date = self._today_window_utc()
             req_from = kwargs.get("from_date", from_date)
             req_to = kwargs.get("to_date", to_date)
-            exchange_codes = [str(kwargs["exchange_code"]).upper()] if kwargs.get("exchange_code") else ["NSE", "BSE", "NFO", "BFO"]
+            exchange_codes = (
+                [str(kwargs["exchange_code"]).upper()] if kwargs.get("exchange_code") else ["NSE", "BSE", "NFO", "BFO"]
+            )
 
             frames: list[pd.DataFrame] = []
             for exchange_code in exchange_codes:
@@ -2180,23 +2559,120 @@ class IciciDirect(BrokerBase):
                     frames.append(pd.DataFrame(rows))
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         except Exception as e:
-            raise MarketDataError(f"Error fetching IciciDirect trades: {str(e)}", create_error_context(error=str(e), kwargs=kwargs))
+            raise MarketDataError(
+                f"Error fetching IciciDirect trades: {str(e)}", create_error_context(error=str(e), kwargs=kwargs)
+            )
 
     def get_long_name_from_broker_identifier(self, **kwargs) -> pd.Series:
-        broker_identifier = str(kwargs.get("broker_identifier") or kwargs.get("scrip_code") or "")
-        if not broker_identifier:
-            raise ValidationError("broker_identifier or scrip_code is required", create_error_context(kwargs=kwargs))
-
         try:
             if self.codes is None or self.codes.empty:
                 self.update_symbology(saveToFolder=False)
 
-            matches = self.codes[self.codes["Scripcode"].astype(str) == broker_identifier]
-            return matches["long_symbol"] if not matches.empty else pd.Series(dtype="object")
+            scripcode = kwargs.get("Scripcode")
+            exchange = kwargs.get("Exchange")
+
+            if isinstance(scripcode, pd.Series):
+                if exchange is None or not isinstance(exchange, pd.Series):
+                    raise ValidationError(
+                        "Exchange must be a pandas Series when Scripcode is a Series",
+                        create_error_context(kwargs_keys=list(kwargs.keys())),
+                    )
+
+                def _norm_ex(ex_val: object) -> str:
+                    ex_raw = str(ex_val or "").upper().strip()
+                    if ex_raw in ("N", "NSE"):
+                        return "NSE"
+                    if ex_raw in ("B", "BSE"):
+                        return "BSE"
+                    if ex_raw in ("NFO", "NF"):
+                        return "NFO"
+                    if ex_raw in ("BFO", "BF"):
+                        return "BFO"
+                    return ex_raw
+
+                def lookup(sc, ex):
+                    try:
+                        if sc is None or (isinstance(sc, float) and pd.isna(sc)):
+                            return None
+                        ex_code = _norm_ex(ex)
+                        sc_str = str(sc).strip()
+                        candidate_ids = [sc_str]
+                        sc_int: Optional[int] = None
+                        try:
+                            sc_int = int(float(sc))
+                            candidate_ids.append(str(sc_int))
+                        except Exception:
+                            pass
+
+                        rev = self.exchange_mappings.get(ex_code, {}).get("symbol_map_reversed", {})
+                        for cid in candidate_ids:
+                            found = rev.get(cid)
+                            if found is not None:
+                                return found
+                        if sc_int is not None:
+                            found = rev.get(sc_int)
+                            if found is not None:
+                                return found
+
+                        # Fallback: resolve via codes table using Token/Scripcode/stock_code.
+                        df = self.codes.copy()
+                        if "Exch" in df.columns and ex_code:
+                            df = df[df["Exch"].astype(str).str.upper() == ex_code]
+                        for col in ("Token", "Scripcode", "stock_code"):
+                            if col in df.columns:
+                                for cid in candidate_ids:
+                                    sub = df[df[col].astype(str).str.strip() == str(cid)]
+                                    if not sub.empty:
+                                        return sub.iloc[0].get("long_symbol")
+                        return None
+                    except Exception:
+                        return None
+
+                return pd.Series(
+                    [lookup(scripcode.iloc[i], exchange.iloc[i]) for i in range(len(scripcode))],
+                    index=scripcode.index,
+                )
+
+            broker_identifier = str(
+                kwargs.get("broker_identifier") or kwargs.get("scrip_code") or kwargs.get("Scripcode") or ""
+            )
+            if not broker_identifier:
+                raise ValidationError(
+                    "broker_identifier/scrip_code/Scripcode is required",
+                    create_error_context(kwargs=kwargs),
+                )
+
+            ex_raw = str(kwargs.get("exchange") or kwargs.get("Exchange") or "").upper().strip()
+            if ex_raw:
+                ex_code = "NSE" if ex_raw.startswith("N") else ("BSE" if ex_raw.startswith("B") else ex_raw)
+                rev = self.exchange_mappings.get(ex_code, {}).get("symbol_map_reversed", {})
+                try:
+                    bid_int = int(float(broker_identifier))
+                    found = rev.get(bid_int) or rev.get(str(bid_int))
+                    if found is not None:
+                        return pd.Series([found])
+                except Exception:
+                    found = rev.get(broker_identifier)
+                    if found is not None:
+                        return pd.Series([found])
+
+            ids = [str(broker_identifier).strip()]
+            try:
+                ids.append(str(int(float(broker_identifier))))
+            except Exception:
+                pass
+            for col in ("Token", "Scripcode", "stock_code"):
+                if col in self.codes.columns:
+                    matches = self.codes[self.codes[col].astype(str).isin(ids)]
+                    if not matches.empty:
+                        return matches["long_symbol"]
+            return pd.Series(dtype="object")
+        except (ValidationError, SymbolError):
+            raise
         except Exception as e:
             raise SymbolError(
                 f"Error mapping broker identifier to long_symbol: {str(e)}",
-                create_error_context(broker_identifier=broker_identifier, error=str(e)),
+                create_error_context(kwargs=kwargs, error=str(e)),
             )
 
     def get_min_lot_size(self, long_symbol: str, exchange: str) -> int:
@@ -2235,8 +2711,43 @@ class IciciDirect(BrokerBase):
             if isinstance(data, list):
                 data = data[0] if data else {}
 
-            cash = float(data.get("available_margin", data.get("cash_limit", data.get("cash", 0))) or 0)
-            collateral = float(data.get("collateral", data.get("adhoc_margin", 0)) or 0)
+            def _num(*keys: str) -> float:
+                for key in keys:
+                    if key in data and data.get(key) not in (None, ""):
+                        try:
+                            return float(data.get(key) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                return 0.0
+
+            def _num_by_name_contains(*parts: str) -> float:
+                parts_l = tuple(str(p).lower() for p in parts if p)
+                for key, value in data.items():
+                    key_l = str(key).lower()
+                    if all(part in key_l for part in parts_l) and value not in (None, ""):
+                        try:
+                            return float(value or 0)
+                        except (TypeError, ValueError):
+                            continue
+                return 0.0
+
+            # Cash = F&O allocation + cash/equity allocation.
+            fno_allocation = _num("fno_allocation", "allocated_fno")
+            cash_allocation = _num("cash_allocation", "equity_allocation", "allocated_equity")
+            cash = fno_allocation + cash_allocation
+            if cash <= 0:
+                cash = _num("available_margin", "cash_limit", "cash", "unallocated_balance", "total_bank_balance")
+
+            # Collateral should come from pledge-like fields when present.
+            collateral = _num(
+                "pledge_collateral",
+                "pledged_collateral",
+                "collateral_pledge",
+                "collateral",
+                "adhoc_margin",
+            )
+            if collateral <= 0:
+                collateral = _num_by_name_contains("pledge")
             return {"cash": cash, "collateral": collateral}
         except Exception as e:
             raise MarketDataError(

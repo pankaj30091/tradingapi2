@@ -1070,3 +1070,18 @@ class BrokerBase(ABC):
             MarketDataError: If balance retrieval fails
         """
         pass
+
+    def get_margin_requirement(
+        self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds: Optional[str] = None
+    ) -> Optional[float]:
+        """Default broker margin hook. Brokers can override if supported."""
+        logger.warning(
+            "get_margin_requirement not implemented for broker",
+            extra={
+                "broker_type": self.__class__.__name__,
+                "combo_symbol": combo_symbol,
+                "order_size": order_size,
+                "exchange": exchange,
+            },
+        )
+        return None

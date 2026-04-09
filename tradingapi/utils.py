@@ -1456,7 +1456,12 @@ def get_combo_sub_order_type(order: Order, sub_order_qty: int) -> str:
 @log_execution_time
 @validate_inputs(strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0, paper=lambda x: isinstance(x, bool))
 def transmit_entry_order(
-    broker: BrokerBase, strategy: str, order: Order, paper: bool = True, price_broker: Optional[List[BrokerBase]] = None
+    broker: BrokerBase,
+    strategy: str,
+    order: Order,
+    paper: bool = True,
+    price_broker: Optional[List[BrokerBase]] = None,
+    mds: Optional[str] = None,
 ) -> str:
     """Transmit entry order to broker with enhanced error handling.
 
@@ -1544,6 +1549,7 @@ def transmit_entry_order(
             symbol=symbol,
             price_broker=price_broker,
             exchange=temp_order.exchange,
+            mds=mds,
         )
         temp_order.price = lmt_price
         out = broker.place_order(temp_order)
@@ -1558,6 +1564,7 @@ def transmit_exit_order(
     validate_db_position=True,
     paper=True,
     price_broker: Optional[List[BrokerBase]] = None,
+    mds: Optional[str] = None,
     int_order_id: str = "",
 ) -> None:
     """Exit order sent to broker
@@ -1654,6 +1661,7 @@ def transmit_exit_order(
                             symbol=exit_symbol,
                             price_broker=price_broker,
                             exchange=order_new.exchange,
+                            mds=mds,
                         )
                         order_new.price = lmt_price
                         out = broker.place_order(order=order_new)
@@ -2527,10 +2535,23 @@ def _get_price_mds(brok: BrokerBase, symbol: str, exchange: str = "NSE", channel
     if len(history) == 1:
         if is_within_60_seconds(history[0]):
             return Price.from_dict(history[0])
+        # Stale MDS data: request re-subscription, wait briefly for a fresh tick,
+        # then return whatever is available (avoids REST API rate-limit errors).
+        request = {
+            "action": "subscribe",
+            "symbol": symbol,
+            "exchange": mapped_exchange,
+            "channel": channel,
+        }
+        mds_history.publish("subscription_requests", json.dumps(request))
+        logger.info(
+            f"symbol:{symbol} MDS data stale, re-subscribing; returning last known price"
+        )
+        return Price.from_dict(history[0])
+    # No MDS history yet — subscribe and fall back to REST only for the first call
     logger.info(
         f"symbol:{symbol} subscription received by {brok.broker.name}. exchange received in request:{exchange}, exchange sent in broker request:{mapped_exchange}"
     )
-    # 'subscribe' or 'unsubscribe'
     out = get_price(brok, symbol, exchange=exchange)
     request = {
         "action": "subscribe",
@@ -3480,6 +3501,7 @@ def place_combo_order(
     price_broker: Optional[List[BrokerBase]] = None,
     price_types: list = [],
     trigger_prices: Union[Sequence[float], float, None] = None,
+    mds: Optional[str] = None,
     validate_db_position: bool = True,
     paper: bool = True,
 ) -> dict:
@@ -3599,10 +3621,17 @@ def place_combo_order(
             temp_order.is_stoploss_order = True
         logger.info(f"{symbol} {exch} {size} {side}")
         if entry:
-            temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper)
+            temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper, mds=mds)
             out[symbol] = temp
         else:
-            transmit_exit_order(execution_broker, strategy, temp_order, validate_db_position, paper=paper)
+            transmit_exit_order(
+                execution_broker,
+                strategy,
+                temp_order,
+                validate_db_position,
+                paper=paper,
+                mds=mds,
+            )
     return out
 
 
