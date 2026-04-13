@@ -2893,7 +2893,7 @@ def get_price_at_time(
     broker: BrokerBase,
     symbol: str,
     exchange: str = "NSE",
-    as_of: Optional[dt.datetime] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
     *,
     mds: Optional[str] = None,
     last: bool = True,
@@ -2918,7 +2918,7 @@ def get_future_underlying_price(
     broker: BrokerBase,
     future_symbol: str,
     exchange: str = "NSE",
-    as_of: Optional[dt.datetime] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
     *,
     mds: Optional[str] = None,
     last: bool = True,
@@ -2961,7 +2961,7 @@ def get_option_underlying_price(
     exchange="NSE",
     mds: Optional[str] = None,
     last=True,
-    as_of: Optional[dt.datetime] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ) -> Optional[float]:
     """Retrieve underlying price for a symbol; interpolates for index options when fut_expiry given.
 
@@ -2996,11 +2996,12 @@ def get_option_underlying_price(
             price_f = get_price_at_time(broker, underlying_fut, exchange, as_of=as_of)
             if price_u is None or price_f is None:
                 return None
+            as_of_dt = parse_datetime(as_of)
             t_o = calc_fractional_business_days(
-                as_of, dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+                as_of_dt, dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
             )
             t_f = calc_fractional_business_days(
-                as_of, dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+                as_of_dt, dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
             )
             if t_f and t_f > 0:
                 price_f = price_u + (price_f - price_u) * t_o / t_f
@@ -3063,6 +3064,21 @@ def get_option_underlying_price(
     return float(price_f)
 
 
+def _asof_to_ref_time_naive(as_of: Union[dt.datetime, dt.date, str, pd.Timestamp]) -> dt.datetime:
+    """Naive clock for time-to-expiry when using historical ``as_of`` (date-only -> 09:15)."""
+    if isinstance(as_of, pd.Timestamp):
+        ref = as_of.to_pydatetime()
+    elif isinstance(as_of, dt.date) and not isinstance(as_of, dt.datetime):
+        ref = dt.datetime.combine(as_of, dt.time(9, 15, 0))
+    elif isinstance(as_of, str):
+        ref = parse_datetime(as_of)
+    else:
+        ref = cast(dt.datetime, as_of)
+    if getattr(ref, "tzinfo", None):
+        ref = ref.replace(tzinfo=None)
+    return ref
+
+
 def calculate_delta(
     brokers: list[BrokerBase],
     long_symbol,
@@ -3070,17 +3086,34 @@ def calculate_delta(
     market_close_time="15:30:00",
     exchange="NSE",
     mds: Optional[str] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ):
     delta = float("nan")
-    ticker = get_price(brokers, long_symbol, checks=["bid", "ask", "prior_close"], exchange=exchange, mds=mds)
-    price = (ticker.bid + ticker.ask) / 2 if ticker.bid > 0 and ticker.ask > 0 else ticker.prior_close
-    t = (
-        calc_fractional_business_days(
-            get_tradingapi_now(),
-            dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
+    if as_of is None:
+        ticker = get_price(brokers, long_symbol, checks=["bid", "ask", "prior_close"], exchange=exchange, mds=mds)
+        price = (ticker.bid + ticker.ask) / 2 if ticker.bid > 0 and ticker.ask > 0 else ticker.prior_close
+        t = (
+            calc_fractional_business_days(
+                get_tradingapi_now(),
+                dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
+            )
+            / 252
+        )  # convert days number of years
+    else:
+        br: List[BrokerBase] = [brokers] if isinstance(brokers, BrokerBase) else brokers
+        broker = br[0]
+        price_at = get_price_at_time(broker, long_symbol, exchange, as_of=as_of, mds=mds, last=True)
+        if price_at is None or (isinstance(price_at, float) and (math.isnan(price_at) or price_at <= 0)):
+            return float("nan")
+        price = float(price_at)
+        ref_time = _asof_to_ref_time_naive(as_of)
+        t = (
+            calc_fractional_business_days(
+                ref_time,
+                dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
+            )
+            / 252
         )
-        / 252
-    )  # convert days number of years
     vol = BlackScholesIV(
         S=price_f,
         X=float(long_symbol.split("_")[4]),
@@ -3109,6 +3142,7 @@ def find_option_with_delta(
     market_close_time="15:30:00",
     exchange="NSE",
     mds: Optional[str] = "mds",
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ):
     # Determine the correct option exchange
     opt_exchange = "NFO" if exchange == "NSE" else "BFO" if exchange == "BSE" else exchange
@@ -3140,13 +3174,17 @@ def find_option_with_delta(
     # Find the first valid left-side delta
     i = mid
     while i >= left and math.isnan(delta_1):
-        delta_1 = calculate_delta(brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds)
+        delta_1 = calculate_delta(
+            brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
+        )
         i -= 1
 
     # Find the first valid right-side delta
     i = mid + 1
     while i <= right and math.isnan(delta_2):
-        delta_2 = calculate_delta(brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds)
+        delta_2 = calculate_delta(
+            brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
+        )
         i += 1
 
     # If we cannot determine a valid direction, return -1
@@ -3182,7 +3220,9 @@ def find_option_with_delta(
 
     while left <= right:
         mid = (left + right) // 2
-        delta = calculate_delta(brokers, option_chain[mid], price_f, market_close_time, exchange=opt_exchange, mds=mds)
+        delta = calculate_delta(
+            brokers, option_chain[mid], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
+        )
         delta = abs(delta)  # always select an option using the absolute value of delta.
 
         if math.isnan(delta):
@@ -3255,6 +3295,9 @@ def find_option_with_delta(
     option_type=lambda x: isinstance(x, str) and x in ["CALL", "PUT"],
     exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    as_of=lambda x: x is None
+    or isinstance(x, (dt.datetime, dt.date, str))
+    or isinstance(x, pd.Timestamp),
 )
 def get_delta_strike(
     brokers: list[BrokerBase],
@@ -3270,6 +3313,7 @@ def get_delta_strike(
     market_close_time="15:30:00",
     exchange="NSE",
     mds: Optional[str] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ) -> Union[str, None]:
     """Get option strike price for a given delta with enhanced error handling.
 
@@ -3288,6 +3332,9 @@ def get_delta_strike(
         exchange: Exchange name
         mds: Market data service channel name (str). If None or empty, uses broker quotes.
              If provided (e.g., "mds"), uses market data service with that channel.
+        as_of: Optional. When omitted (default), behavior matches pre-change realtime paths.
+            When set, underlying and option marks use historical OHLC at that time; T for IV/delta
+            uses ``as_of`` instead of now.
 
     Returns:
         Union[str, None]: Option symbol or None if not found
@@ -3318,12 +3365,16 @@ def get_delta_strike(
     exchange = brokers[0].map_exchange_for_api(underlying_symbol, exchange)
     if use_future:
         price_f = get_option_underlying_price(
-            brokers, underlying_symbol, opt_expiry, fut_expiry, exchange=exchange, mds=mds
+            brokers, underlying_symbol, opt_expiry, fut_expiry, exchange=exchange, mds=mds, as_of=as_of
         )
         logger.debug("get_delta_strike: price_f from get_option_underlying_price=%s", price_f)
         if price_f is None:
             logger.debug("get_delta_strike: no underlying price available from get_option_underlying_price")
             return None
+    elif as_of is not None:
+        price_at = get_price_at_time(brokers[0], underlying_symbol, exchange, as_of=as_of, mds=mds, last=True)
+        price_f = float(price_at) if price_at is not None else float("nan")
+        logger.debug("get_delta_strike: price_f from get_price_at_time(underlying)=%s", price_f)
     else:
         price_f = get_price(brokers, underlying_symbol, checks=["last"], exchange=exchange, mds=mds).last
         logger.debug("get_delta_strike: price_f from get_price(underlying).last=%s", price_f)
@@ -3339,8 +3390,19 @@ def get_delta_strike(
     if len(option_chain) == 0:
         logger.info(f"Option Chain not found for symbol: {underlying_symbol}")
         return None
+    if price_f is None or (isinstance(price_f, float) and math.isnan(price_f)):
+        logger.debug("get_delta_strike: invalid underlying price_f=%s", price_f)
+        return None
     index = find_option_with_delta(
-        brokers, price_f, option_chain, delta, return_lower_delta, market_close_time, exchange=exchange, mds=mds
+        brokers,
+        price_f,
+        option_chain,
+        delta,
+        return_lower_delta,
+        market_close_time,
+        exchange=exchange,
+        mds=mds,
+        as_of=as_of,
     )
     if index >= 0:
         return option_chain[index]
