@@ -190,6 +190,41 @@ def _extract_dhan_error(response: Any) -> str:
     return str(remarks or response)
 
 
+def _extract_dhan_error_details(response: Any) -> Dict[str, Any]:
+    details: Dict[str, Any] = {
+        "status": None,
+        "error_code": None,
+        "error_type": None,
+        "error_message": None,
+    }
+    if not isinstance(response, dict):
+        details["error_message"] = str(response)
+        return details
+
+    details["status"] = response.get("status")
+    remarks = response.get("remarks")
+    data = response.get("data")
+
+    if isinstance(remarks, dict):
+        details["error_code"] = remarks.get("error_code") or remarks.get("errorCode")
+        details["error_type"] = remarks.get("error_type") or remarks.get("errorType")
+        details["error_message"] = remarks.get("error_message") or remarks.get("errorMessage")
+
+    if isinstance(data, dict):
+        details["error_code"] = details["error_code"] or data.get("error_code") or data.get("errorCode")
+        details["error_type"] = details["error_type"] or data.get("error_type") or data.get("errorType")
+        details["error_message"] = details["error_message"] or data.get("error_message") or data.get("errorMessage")
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            details["error_code"] = details["error_code"] or nested.get("error_code") or nested.get("errorCode")
+            details["error_type"] = details["error_type"] or nested.get("error_type") or nested.get("errorType")
+            details["error_message"] = details["error_message"] or nested.get("error_message") or nested.get("errorMessage")
+
+    if not details["error_message"]:
+        details["error_message"] = _extract_dhan_error(response)
+    return details
+
+
 def _symbol_supports_oi(long_symbol: str) -> bool:
     return "_FUT_" in long_symbol or "_OPT_" in long_symbol
 
@@ -354,6 +389,10 @@ class Dhan(BrokerBase):
             self._stream_request_rate_limit_interval_secs = 0.1  # default: 10 streaming requests/second
             self._global_stream_request_rate_limit_key = "dhan:stream:last_call_ts"
             self._global_stream_request_rate_limit_lock_key = "dhan:stream:lock"
+            self._market_data_rate_limit_lock = threading.Lock()
+            self._last_market_data_api_call_ts = 0.0
+            self._global_market_data_rate_limit_key = "dhan:market_data:last_call_ts"
+            self._global_market_data_rate_limit_lock_key = "dhan:market_data:lock"
             atexit.register(self._mark_process_shutting_down)
 
             trading_logger.log_info(
@@ -792,6 +831,59 @@ class Dhan(BrokerBase):
     def _get_quote_rate_limit_redis(self):
         return self._quote_rate_limit_redis or getattr(self, "redis_o", None)
 
+    def _set_local_market_data_last_call_ts(self, ts: float) -> None:
+        self._last_market_data_api_call_ts = ts
+        self._last_quote_api_call_ts = ts
+        self._last_historical_api_call_ts = ts
+        self._last_stream_request_api_call_ts = ts
+
+    def _wait_for_market_data_rate_limit_local(self, interval_secs: float) -> None:
+        with self._market_data_rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_market_data_api_call_ts
+            if elapsed < interval_secs:
+                time.sleep(interval_secs - elapsed)
+                now = time.monotonic()
+            self._set_local_market_data_last_call_ts(now)
+
+    def _wait_for_market_data_rate_limit_global(self, limiter_redis, interval_secs: float) -> None:
+        token = str(uuid4())
+        lock_ttl_ms = 2000
+        while True:
+            acquired = limiter_redis.set(self._global_market_data_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
+            if acquired:
+                try:
+                    last_call_ts = limiter_redis.get(self._global_market_data_rate_limit_key)
+                    if last_call_ts is None:
+                        historical_ts = limiter_redis.get(self._global_historical_rate_limit_key)
+                        quote_ts = limiter_redis.get(self._global_quote_rate_limit_key)
+                        stream_ts = limiter_redis.get(self._global_stream_request_rate_limit_key)
+                        legacy_ts = []
+                        for value in (historical_ts, quote_ts, stream_ts):
+                            try:
+                                if value is not None:
+                                    legacy_ts.append(float(value))
+                            except (TypeError, ValueError):
+                                continue
+                        if legacy_ts:
+                            last_call_ts = str(max(legacy_ts))
+                    now = time.time()
+                    if last_call_ts is not None:
+                        elapsed = now - float(last_call_ts)
+                        if elapsed < interval_secs:
+                            time.sleep(interval_secs - elapsed)
+                            now = time.time()
+                    ts = str(now)
+                    limiter_redis.set(self._global_market_data_rate_limit_key, ts)
+                    limiter_redis.set(self._global_historical_rate_limit_key, ts)
+                    limiter_redis.set(self._global_quote_rate_limit_key, ts)
+                    limiter_redis.set(self._global_stream_request_rate_limit_key, ts)
+                    return
+                finally:
+                    if limiter_redis.get(self._global_market_data_rate_limit_lock_key) == token:
+                        limiter_redis.delete(self._global_market_data_rate_limit_lock_key)
+            time.sleep(0.05)
+
     def _wait_for_quote_rate_limit(self):
         limiter_redis = self._get_quote_rate_limit_redis()
         if limiter_redis is not None:
@@ -800,32 +892,10 @@ class Dhan(BrokerBase):
                 return
             except Exception as e:
                 trading_logger.log_warning("Global Dhan quote limiter unavailable, using local limiter", {"error": str(e)})
-        with self._quote_rate_limit_lock:
-            now = time.monotonic()
-            elapsed = now - self._last_quote_api_call_ts
-            if elapsed < self._quote_rate_limit_interval_secs:
-                time.sleep(self._quote_rate_limit_interval_secs - elapsed)
-            self._last_quote_api_call_ts = time.monotonic()
+        self._wait_for_market_data_rate_limit_local(self._quote_rate_limit_interval_secs)
 
     def _wait_for_quote_rate_limit_global(self, limiter_redis):
-        token = str(uuid4())
-        lock_ttl_ms = 2000
-        while True:
-            acquired = limiter_redis.set(self._global_quote_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
-            if acquired:
-                try:
-                    last_call_ts = limiter_redis.get(self._global_quote_rate_limit_key)
-                    now = time.time()
-                    if last_call_ts is not None:
-                        elapsed = now - float(last_call_ts)
-                        if elapsed < self._quote_rate_limit_interval_secs:
-                            time.sleep(self._quote_rate_limit_interval_secs - elapsed)
-                    limiter_redis.set(self._global_quote_rate_limit_key, str(time.time()))
-                    return
-                finally:
-                    if limiter_redis.get(self._global_quote_rate_limit_lock_key) == token:
-                        limiter_redis.delete(self._global_quote_rate_limit_lock_key)
-            time.sleep(0.05)
+        self._wait_for_market_data_rate_limit_global(limiter_redis, self._quote_rate_limit_interval_secs)
 
     def _wait_for_historical_rate_limit(self):
         limiter_redis = self._get_quote_rate_limit_redis()
@@ -837,32 +907,10 @@ class Dhan(BrokerBase):
                 trading_logger.log_warning(
                     "Global Dhan historical limiter unavailable, using local limiter", {"error": str(e)}
                 )
-        with self._historical_rate_limit_lock:
-            now = time.monotonic()
-            elapsed = now - self._last_historical_api_call_ts
-            if elapsed < self._historical_rate_limit_interval_secs:
-                time.sleep(self._historical_rate_limit_interval_secs - elapsed)
-            self._last_historical_api_call_ts = time.monotonic()
+        self._wait_for_market_data_rate_limit_local(self._historical_rate_limit_interval_secs)
 
     def _wait_for_historical_rate_limit_global(self, limiter_redis):
-        token = str(uuid4())
-        lock_ttl_ms = 1000
-        while True:
-            acquired = limiter_redis.set(self._global_historical_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
-            if acquired:
-                try:
-                    last_call_ts = limiter_redis.get(self._global_historical_rate_limit_key)
-                    now = time.time()
-                    if last_call_ts is not None:
-                        elapsed = now - float(last_call_ts)
-                        if elapsed < self._historical_rate_limit_interval_secs:
-                            time.sleep(self._historical_rate_limit_interval_secs - elapsed)
-                    limiter_redis.set(self._global_historical_rate_limit_key, str(time.time()))
-                    return
-                finally:
-                    if limiter_redis.get(self._global_historical_rate_limit_lock_key) == token:
-                        limiter_redis.delete(self._global_historical_rate_limit_lock_key)
-            time.sleep(0.05)
+        self._wait_for_market_data_rate_limit_global(limiter_redis, self._historical_rate_limit_interval_secs)
 
     def _wait_for_stream_request_rate_limit(self):
         limiter_redis = self._get_quote_rate_limit_redis()
@@ -874,32 +922,10 @@ class Dhan(BrokerBase):
                 trading_logger.log_warning(
                     "Global Dhan stream request limiter unavailable, using local limiter", {"error": str(e)}
                 )
-        with self._stream_request_rate_limit_lock:
-            now = time.monotonic()
-            elapsed = now - self._last_stream_request_api_call_ts
-            if elapsed < self._stream_request_rate_limit_interval_secs:
-                time.sleep(self._stream_request_rate_limit_interval_secs - elapsed)
-            self._last_stream_request_api_call_ts = time.monotonic()
+        self._wait_for_market_data_rate_limit_local(self._stream_request_rate_limit_interval_secs)
 
     def _wait_for_stream_request_rate_limit_global(self, limiter_redis):
-        token = str(uuid4())
-        lock_ttl_ms = 1000
-        while True:
-            acquired = limiter_redis.set(self._global_stream_request_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
-            if acquired:
-                try:
-                    last_call_ts = limiter_redis.get(self._global_stream_request_rate_limit_key)
-                    now = time.time()
-                    if last_call_ts is not None:
-                        elapsed = now - float(last_call_ts)
-                        if elapsed < self._stream_request_rate_limit_interval_secs:
-                            time.sleep(self._stream_request_rate_limit_interval_secs - elapsed)
-                    limiter_redis.set(self._global_stream_request_rate_limit_key, str(time.time()))
-                    return
-                finally:
-                    if limiter_redis.get(self._global_stream_request_rate_limit_lock_key) == token:
-                        limiter_redis.delete(self._global_stream_request_rate_limit_lock_key)
-            time.sleep(0.05)
+        self._wait_for_market_data_rate_limit_global(limiter_redis, self._stream_request_rate_limit_interval_secs)
 
     def _fetch_dhan_historical(
         self,
@@ -1148,7 +1174,8 @@ class Dhan(BrokerBase):
 
                     else:
                         # API returned failure
-                        err_msg = out.get("remarks", str(out)) if out else "None response"
+                        dhan_error = _extract_dhan_error_details(out)
+                        err_msg = dhan_error.get("error_message") or "None response"
                         context = create_error_context(order_data=order.to_dict(), api_response=out)
                         raise OrderError(f"Dhan place_order failed: {err_msg}", context)
 
@@ -1275,7 +1302,7 @@ class Dhan(BrokerBase):
                     trading_logger.log_error("Redis update failed after modify", e, {})
                 trading_logger.log_info("Order modified successfully", {"broker_order_id": broker_order_id})
             else:
-                err_msg = out.get("remarks", str(out)) if out else "None response"
+                err_msg = _extract_dhan_error_details(out).get("error_message") or "None response"
                 raise OrderError(f"Dhan modify_order failed: {err_msg}")
 
             self.log_and_return(order)
@@ -1357,8 +1384,11 @@ class Dhan(BrokerBase):
                     order.status = OrderStatus.CANCELLED
                 trading_logger.log_info("Order cancelled", {"broker_order_id": broker_order_id})
             else:
-                err_msg = out.get("remarks", str(out)) if out else "None response"
-                trading_logger.log_warning("Cancel order returned non-success", {"response": err_msg})
+                dhan_error = _extract_dhan_error_details(out)
+                trading_logger.log_warning(
+                    "Cancel order returned non-success",
+                    {"broker_order_id": broker_order_id, **dhan_error},
+                )
 
             self.log_and_return(order)
             return order
@@ -1661,7 +1691,14 @@ class Dhan(BrokerBase):
                             continue
                     historical_data_list.sort(key=lambda x: x.date)
                 else:
-                    trading_logger.log_info("No data from Dhan historical API", )
+                    trading_logger.log_error(
+                        "No data from Dhan historical API",
+                        None,
+                        {
+                            "symbol": long_symbol,
+                            **_extract_dhan_error_details(data),
+                        },
+                    )
 
                 if periodicity in {"1d", "d"} and date_end_dt.date() == get_tradingapi_now().date():
                     # Refresh today's daily bar from 1m data (up-to-date partial OHLC), matching Shoonya-style behavior.
@@ -1817,7 +1854,7 @@ class Dhan(BrokerBase):
 
             trading_logger.log_warning(
                 "Dhan quote_data unavailable",
-                {"long_symbol": long_symbol, "error": _extract_dhan_error(out)},
+                {"long_symbol": long_symbol, **_extract_dhan_error_details(out)},
             )
 
             return market_feed
