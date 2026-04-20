@@ -144,6 +144,13 @@ class TradingAPILogger:
         for handler in handlers:
             self.logger.addHandler(handler)
 
+        # Child loggers (e.g. tradingapi.utils) propagate here; without this, the same
+        # record also reaches root and duplicates when root has its own handlers.
+        if handlers:
+            self.logger.propagate = False
+        else:
+            self.logger.propagate = True
+
         self._configured = True
 
         # Log configuration
@@ -275,7 +282,9 @@ def configure_logging(
         backup_count: Number of log files to keep.
         format_string: Custom format string for log messages.
         enable_structured_logging: Enable structured logging with additional context.
-        configure_root_logger: Whether to configure the root logger (can cause duplicate logs if True).
+        configure_root_logger: If True, attach the same handlers to the root logger (for third-party
+            loggers). The ``tradingapi`` logger sets propagate=False when it has handlers, so package
+            messages are not written twice when root is also configured.
     """
     trading_logger.configure(
         level=level,

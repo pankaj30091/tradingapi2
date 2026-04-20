@@ -372,6 +372,9 @@ class Dhan(BrokerBase):
             self._stream_loop: Optional[asyncio.AbstractEventLoop] = None
             self._stream_ws: Optional[Any] = None
             self._stream_connected_event = threading.Event()
+            self._is_connected_cache_ttl_secs = 3.0
+            self._last_is_connected_check_ts = 0.0
+            self._last_is_connected_result: Optional[bool] = None
             self._process_shutting_down = False
             self._quote_rate_limit_lock = threading.Lock()
             self._last_quote_api_call_ts = 0.0
@@ -674,16 +677,34 @@ class Dhan(BrokerBase):
     def is_connected(self) -> bool:
         """Check connectivity by fetching fund limits."""
         try:
+            now = time.monotonic()
+            if (
+                self._last_is_connected_result is True
+                and now - self._last_is_connected_check_ts < self._is_connected_cache_ttl_secs
+            ):
+                trading_logger.log_debug(
+                    "Using cached connection check result",
+                    {
+                        "broker": self.broker.name,
+                        "cache_age_secs": round(now - self._last_is_connected_check_ts, 3),
+                    },
+                )
+                return True
             if self.api is None:
+                self._last_is_connected_result = False
                 return False
             result = self.api.get_fund_limits()
             if not result or result.get("status") == "failure":
                 trading_logger.log_warning("Dhan is_connected: fund limits check failed", {"result": result})
+                self._last_is_connected_result = False
                 return False
             trading_logger.log_debug("Dhan is_connected: OK", {"availabelBalance": result.get("data", {}).get("availabelBalance")})
+            self._last_is_connected_result = True
+            self._last_is_connected_check_ts = now
             return True
         except Exception as e:
             trading_logger.log_error("Dhan is_connected error", e, {})
+            self._last_is_connected_result = False
             return False
 
     @log_execution_time
