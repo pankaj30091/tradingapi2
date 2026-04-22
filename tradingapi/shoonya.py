@@ -1832,6 +1832,54 @@ class Shoonya(BrokerBase):
 
             out = {}  # Initialize the output dictionary
 
+            def _get_time_price_series_with_retry(
+                exch: str,
+                token: str,
+                start_time: float,
+                end_time: float,
+                interval: int,
+                symbol: str,
+            ) -> Optional[List]:
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
+                    try:
+                        return self.api.get_time_price_series(
+                            exchange=exch,
+                            token=token,
+                            starttime=start_time,
+                            endtime=end_time,
+                            interval=interval,
+                        )
+                    except json.JSONDecodeError as e:
+                        trading_logger.log_warning(
+                            "JSON decode error in get_time_price_series",
+                            {
+                                "long_symbol": symbol,
+                                "exchange": exch,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "error": str(e),
+                            },
+                        )
+                        if attempt == max_attempts:
+                            raise
+                        try:
+                            self.connect(redis_db=0, as_of_date=get_tradingapi_now())
+                            trading_logger.log_info(
+                                "Reconnected after JSON decode error",
+                                {"long_symbol": symbol, "attempt": attempt},
+                            )
+                        except Exception as reconnect_error:
+                            trading_logger.log_error(
+                                "Reconnect failed after JSON decode error",
+                                reconnect_error,
+                                {"long_symbol": symbol, "attempt": attempt},
+                            )
+                        time.sleep(0.4 * attempt)
+                return None
+
             for index, row_outer in symbols_pd.iterrows():
                 long_symbol = row_outer["long_symbol"]
                 trading_logger.log_debug(
@@ -1880,12 +1928,13 @@ class Shoonya(BrokerBase):
                     if self.api is None:
                         raise BrokerConnectionError("API client not initialized")
                     if periodicity.endswith("m"):
-                        data = self.api.get_time_price_series(
-                            exchange=exch,
+                        data = _get_time_price_series_with_retry(
+                            exch=exch,
                             token=str(row_outer["Scripcode"]),
-                            starttime=date_start_dt.timestamp(),
-                            endtime=date_end_dt.timestamp(),
+                            start_time=date_start_dt.timestamp(),
+                            end_time=date_end_dt.timestamp(),
                             interval=extract_number(periodicity),
+                            symbol=long_symbol,
                         )
                     elif periodicity == "1d":
                         if row_outer["long_symbol"] == "NSENIFTY_IND___":
