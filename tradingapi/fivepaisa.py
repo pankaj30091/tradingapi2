@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Union, cast
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -256,6 +257,26 @@ class FivePaisa(BrokerBase):
             self._is_connected_cache_ttl_secs = 3.0
             self._last_is_connected_check_ts = 0.0
             self._last_is_connected_result: Optional[bool] = None
+            self._quote_rate_limit_lock = threading.Lock()
+            self._last_quote_api_call_ts = 0.0
+            self._quote_rate_limit_interval_secs = 1.0
+            self._quote_rate_limit_redis = None
+            self._global_quote_rate_limit_key = "fivepaisa:quote:last_call_ts"
+            self._global_quote_rate_limit_lock_key = "fivepaisa:quote:lock"
+            self._historical_rate_limit_lock = threading.Lock()
+            self._last_historical_api_call_ts = 0.0
+            self._historical_rate_limit_interval_secs = 0.5
+            self._global_historical_rate_limit_key = "fivepaisa:historical:last_call_ts"
+            self._global_historical_rate_limit_lock_key = "fivepaisa:historical:lock"
+            self._stream_request_rate_limit_lock = threading.Lock()
+            self._last_stream_request_api_call_ts = 0.0
+            self._stream_request_rate_limit_interval_secs = 0.5
+            self._global_stream_request_rate_limit_key = "fivepaisa:stream:last_call_ts"
+            self._global_stream_request_rate_limit_lock_key = "fivepaisa:stream:lock"
+            self._market_data_rate_limit_lock = threading.Lock()
+            self._last_market_data_api_call_ts = 0.0
+            self._global_market_data_rate_limit_key = "fivepaisa:market_data:last_call_ts"
+            self._global_market_data_rate_limit_lock_key = "fivepaisa:market_data:lock"
 
             trading_logger.log_info(
                 "FivePaisa broker initialized", {"broker_type": "FivePaisa", "config_keys": list(kwargs.keys())}
@@ -770,6 +791,36 @@ class FivePaisa(BrokerBase):
                 )
             except Exception as e:
                 trading_logger.log_warning("Failed to set starting order IDs", {"error": str(e), "redis_db": redis_db})
+
+            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            if quote_rate_limit_redis_db is not None:
+                self._quote_rate_limit_redis = redis.Redis(
+                    db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
+                )
+                self._quote_rate_limit_redis.ping()
+            else:
+                self._quote_rate_limit_redis = self.redis_o
+
+            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            if quote_rate_limit_rps is not None:
+                v = float(quote_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                self._quote_rate_limit_interval_secs = 1.0 / v
+
+            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            if historical_rate_limit_rps is not None:
+                v = float(historical_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                self._historical_rate_limit_interval_secs = 1.0 / v
+
+            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            if stream_request_rate_limit_rps is not None:
+                v = float(stream_request_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info("Successfully connected to FivePaisa", {"redis_db": redis_db})
             return True
@@ -2394,6 +2445,104 @@ class FivePaisa(BrokerBase):
             context = create_error_context(kwargs=kwargs, error=str(e))
             raise OrderError(f"Unexpected error getting order info: {str(e)}", context)
 
+    # ------------------------------------------------------------------
+    # Rate limiting helpers
+    # ------------------------------------------------------------------
+
+    def _get_rate_limit_redis(self):
+        return self._quote_rate_limit_redis or getattr(self, "redis_o", None)
+
+    def _set_local_market_data_last_call_ts(self, ts: float) -> None:
+        self._last_market_data_api_call_ts = ts
+        self._last_quote_api_call_ts = ts
+        self._last_historical_api_call_ts = ts
+        self._last_stream_request_api_call_ts = ts
+
+    def _wait_for_market_data_rate_limit_local(self, interval_secs: float) -> None:
+        with self._market_data_rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_market_data_api_call_ts
+            if elapsed < interval_secs:
+                time.sleep(interval_secs - elapsed)
+                now = time.monotonic()
+            self._set_local_market_data_last_call_ts(now)
+
+    def _wait_for_market_data_rate_limit_global(self, limiter_redis, interval_secs: float) -> None:
+        token = str(uuid4())
+        lock_ttl_ms = 2000
+        while True:
+            acquired = limiter_redis.set(self._global_market_data_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
+            if acquired:
+                try:
+                    last_call_ts = limiter_redis.get(self._global_market_data_rate_limit_key)
+                    if last_call_ts is None:
+                        legacy_ts = []
+                        for key in (
+                            self._global_historical_rate_limit_key,
+                            self._global_quote_rate_limit_key,
+                            self._global_stream_request_rate_limit_key,
+                        ):
+                            value = limiter_redis.get(key)
+                            try:
+                                if value is not None:
+                                    legacy_ts.append(float(value))
+                            except (TypeError, ValueError):
+                                continue
+                        if legacy_ts:
+                            last_call_ts = str(max(legacy_ts))
+                    now = time.time()
+                    if last_call_ts is not None:
+                        elapsed = now - float(last_call_ts)
+                        if elapsed < interval_secs:
+                            time.sleep(interval_secs - elapsed)
+                            now = time.time()
+                    ts = str(now)
+                    limiter_redis.set(self._global_market_data_rate_limit_key, ts)
+                    limiter_redis.set(self._global_historical_rate_limit_key, ts)
+                    limiter_redis.set(self._global_quote_rate_limit_key, ts)
+                    limiter_redis.set(self._global_stream_request_rate_limit_key, ts)
+                    return
+                finally:
+                    if limiter_redis.get(self._global_market_data_rate_limit_lock_key) == token:
+                        limiter_redis.delete(self._global_market_data_rate_limit_lock_key)
+            time.sleep(0.05)
+
+    def _wait_for_quote_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(limiter_redis, self._quote_rate_limit_interval_secs)
+                return
+            except Exception as e:
+                trading_logger.log_warning("Global FivePaisa quote limiter unavailable, using local", {"error": str(e)})
+        self._wait_for_market_data_rate_limit_local(self._quote_rate_limit_interval_secs)
+
+    def _wait_for_historical_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(limiter_redis, self._historical_rate_limit_interval_secs)
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global FivePaisa historical limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._historical_rate_limit_interval_secs)
+
+    def _wait_for_stream_request_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(
+                    limiter_redis, self._stream_request_rate_limit_interval_secs
+                )
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global FivePaisa stream request limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._stream_request_rate_limit_interval_secs)
+
     @log_execution_time
     @validate_inputs(
         symbols=lambda x: x is not None,
@@ -2584,6 +2733,7 @@ class FivePaisa(BrokerBase):
                     try:
                         if self.api is None:
                             raise BrokerConnectionError("API client not initialized")
+                        self._wait_for_historical_rate_limit()
                         data = self.api.historical_data(
                             exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
                         )
@@ -2615,6 +2765,7 @@ class FivePaisa(BrokerBase):
                             self.connect(redis_db=int(redis_db))
                             if self.api is None:
                                 raise BrokerConnectionError("API client not initialized after reconnect")
+                            self._wait_for_historical_rate_limit()
                             data = self.api.historical_data(
                                 exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
                             )
@@ -3139,6 +3290,7 @@ class FivePaisa(BrokerBase):
                 # Fetch market feed
                 if self.api is None:
                     raise BrokerConnectionError("API client not initialized")
+                self._wait_for_quote_rate_limit()
                 out = self.api.fetch_market_feed_scrip(req_list)
                 if not out or "Data" not in out or len(out["Data"]) == 0:
                     context = create_error_context(
@@ -3431,6 +3583,7 @@ class FivePaisa(BrokerBase):
                 ws = getattr(self.api, "ws", None)
                 if ws is None or not callable(getattr(ws, "send", None)):
                     raise AttributeError("WebSocket client does not support send")
+                self._wait_for_stream_request_rate_limit()
                 ws.send(json.dumps(req_data))
 
             def resolve_exchange_from_symbology(long_symbol: str):

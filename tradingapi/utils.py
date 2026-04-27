@@ -616,6 +616,7 @@ def get_pnl_table(
                 exit_keys = hget_with_default(broker, int_order_id, "exit_keys", "").split()  # type: ignore
                 additional_info_entry = ""
                 additional_info_exit = ""
+                entry_order_type = ""
 
                 if len(entry_keys) == 0:
                     trading_logger.log_error(
@@ -629,6 +630,7 @@ def get_pnl_table(
                 if len(entry_keys) > 0:
                     try:
                         order_1 = Order(**cast(dict, broker.redis_o.hgetall(entry_keys[0])))
+                        entry_order_type = order_1.order_type
                         side = order_1.order_type if "?" not in symbol else "BUY"
                         try:
                             entry_time = parse_datetime(order_1.remote_order_id[:-2])
@@ -681,6 +683,7 @@ def get_pnl_table(
                 exit_quantity = 0
                 exit_price: float = 0.0
                 commission = 0
+                effective_symbol = symbol
 
                 # Refresh status if requested
                 if refresh_status:
@@ -699,7 +702,27 @@ def get_pnl_table(
                 # Calculate entry position
                 try:
                     entry_position = get_open_position_by_order(broker, int_order_id, exclude_zero=True, side=["entry"])
-                    base_position = parse_combo_symbol(symbol)
+                    if "?" in symbol and entry_position:
+                        try:
+                            expected_legs = parse_combo_symbol(symbol)
+                        except Exception:
+                            expected_legs = {}
+                        fully_filled = bool(expected_legs) and all(
+                            (entry_position.get(leg_symbol) is not None)
+                            and (entry_position[leg_symbol].size != 0)
+                            and (
+                                math.copysign(1, entry_position[leg_symbol].size)
+                                == math.copysign(1, expected_qty)
+                            )
+                            for leg_symbol, expected_qty in expected_legs.items()
+                        )
+                        if not fully_filled:
+                            derived_symbol = _build_effective_symbol_from_positions(entry_position)
+                            if derived_symbol:
+                                effective_symbol = derived_symbol
+                    if "?" not in effective_symbol and entry_order_type:
+                        side = entry_order_type
+                    base_position = parse_combo_symbol(effective_symbol)
                     position_combo_info = calculate_extra_combo_positions(entry_position, base_position)
                     entry_quantity = position_combo_info.get("total_in_progress", 0)
                     entry_price = (
@@ -736,7 +759,7 @@ def get_pnl_table(
                         exit_position = get_open_position_by_order(
                             broker, int_order_id, exclude_zero=True, side=["exit"]
                         )
-                        base_position = parse_combo_symbol(symbol)
+                        base_position = parse_combo_symbol(effective_symbol)
                         position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
                         exit_quantity = position_combo_info.get("total_in_progress", 0)
                         exit_price = (
@@ -768,14 +791,14 @@ def get_pnl_table(
                             "int_order_id": int_order_id,
                             "entry_quantity": entry_quantity,
                             "exit_quantity": exit_quantity,
-                            "symbol": symbol,
+                            "symbol": effective_symbol,
                         },
                     )
                     # raise ValueError("exit quantity greater than entry quantity")
 
                 if eod:
                     # Handle option expiration
-                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(symbol, market_close_time):
+                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(effective_symbol, market_close_time):
                         try:
                             # are options expiration needed?
                             get_open_position_by_order(
@@ -785,7 +808,7 @@ def get_pnl_table(
                             exit_position = get_open_position_by_order(
                                 broker, int_order_id, exclude_zero=True, side=["exit"]
                             )
-                            base_position = parse_combo_symbol(symbol)
+                            base_position = parse_combo_symbol(effective_symbol)
                             position_combo_info = calculate_extra_combo_positions(exit_position, base_position)
                             exit_quantity = position_combo_info.get("total_in_progress", 0)
                             exit_price = (
@@ -817,7 +840,7 @@ def get_pnl_table(
                     else str(exit_time or "")
                 )
                 row = {
-                    "symbol": symbol,
+                    "symbol": effective_symbol,
                     "side": side,
                     "entry_time": _entry_time_str,
                     "entry_quantity": entry_quantity,
@@ -839,7 +862,7 @@ def get_pnl_table(
                         "Trade with exit_keys added to trades list",
                         {
                             "int_order_id": int_order_id,
-                            "symbol": symbol,
+                            "symbol": effective_symbol,
                             "entry_time": str(entry_time),
                             "exit_time": str(exit_time),
                             "entry_time_type": type(entry_time).__name__,
@@ -962,6 +985,32 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
     try:
         int_order_ids = []
 
+        def _normalize_leg_symbol(symbol_value: str) -> str:
+            value = str(symbol_value or "").strip()
+            if not value:
+                return ""
+            if ":" in value:
+                value = value.split(":", 1)[0]
+            if "?" in value:
+                value = value.split("?", 1)[0]
+            return value.strip()
+
+        def _symbol_matches(requested_symbol: str, stored_symbol: str) -> bool:
+            """Match exact symbols and allow single-leg lookup within combo parents."""
+            if requested_symbol == stored_symbol:
+                return True
+            requested_leg = _normalize_leg_symbol(requested_symbol)
+            stored_leg = _normalize_leg_symbol(stored_symbol)
+            if requested_leg and requested_leg == stored_leg:
+                return True
+            if "?" in stored_symbol:
+                try:
+                    combo_legs = parse_combo_symbol(stored_symbol)
+                    return requested_leg in combo_legs
+                except Exception:
+                    return False
+            return False
+
         # Scan for internal order IDs
         try:
             # Use scan() with cursor 0 instead of scan_iter() to avoid cursor state issues
@@ -989,7 +1038,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
                 for int_order_id in int_order_ids
                 if cast(str, broker.redis_o.type(int_order_id)) == "hash"
                 and cast(bool, broker.redis_o.hexists(int_order_id, "long_symbol"))
-                and long_symbol == cast(str, broker.redis_o.hget(int_order_id, "long_symbol"))
+                and _symbol_matches(long_symbol, cast(str, broker.redis_o.hget(int_order_id, "long_symbol")))
             ]
         except Exception as e:
             context = create_error_context(
@@ -1213,6 +1262,25 @@ def get_open_position_by_order(
                     expired_contracts.append(symbol)
         positions = {key: value for key, value in positions.items() if value.symbol not in expired_contracts}
     return positions
+
+
+def _build_effective_symbol_from_positions(positions: Dict[str, Position]) -> str:
+    """Build a symbol/combo string from actual non-zero filled positions."""
+    non_zero = [(sym, pos.size) for sym, pos in positions.items() if pos.size != 0]
+    if not non_zero:
+        return ""
+    if len(non_zero) == 1:
+        return non_zero[0][0]
+    non_zero = sorted(non_zero, key=lambda x: x[0])
+    abs_sizes = [abs(size) for _, size in non_zero if size != 0]
+    if not abs_sizes:
+        return ""
+    norm = abs_sizes[0]
+    for value in abs_sizes[1:]:
+        norm = math.gcd(norm, value)
+    if norm == 0:
+        norm = 1
+    return ":".join(f"{sym}?{int(size / norm)}" for sym, size in non_zero)
 
 
 @log_execution_time

@@ -396,6 +396,8 @@ class Dhan(BrokerBase):
             self._last_market_data_api_call_ts = 0.0
             self._global_market_data_rate_limit_key = "dhan:market_data:last_call_ts"
             self._global_market_data_rate_limit_lock_key = "dhan:market_data:lock"
+            self._historical_audit_redis = None
+            self._historical_audit_redis_db = 1
             atexit.register(self._mark_process_shutting_down)
 
             trading_logger.log_info(
@@ -948,6 +950,76 @@ class Dhan(BrokerBase):
     def _wait_for_stream_request_rate_limit_global(self, limiter_redis):
         self._wait_for_market_data_rate_limit_global(limiter_redis, self._stream_request_rate_limit_interval_secs)
 
+    def _get_historical_audit_redis(self):
+        if self._historical_audit_redis is not None:
+            return self._historical_audit_redis
+        self._historical_audit_redis = redis.Redis(
+            db=self._historical_audit_redis_db, encoding="utf-8", decode_responses=True
+        )
+        self._historical_audit_redis.ping()
+        return self._historical_audit_redis
+
+    def _format_ist_datetime_string(self, value: Any, *, is_end: bool = False) -> str:
+        tz_ist = pytz.timezone("Asia/Kolkata")
+        parsed = parse_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = tz_ist.localize(parsed)
+        else:
+            parsed = parsed.astimezone(tz_ist)
+
+        # parse_datetime("YYYY-MM-DD") yields 00:00:00; use EOD for to_date for clearer audit intent.
+        if isinstance(value, str) and ":" not in value and is_end:
+            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999000)
+        return parsed.isoformat(timespec="milliseconds")
+
+    def _log_historical_request_audit(
+        self,
+        symbol: Optional[str],
+        security_id: int,
+        interval: str,
+        from_date: str,
+        to_date: str,
+    ) -> None:
+        try:
+            audit_redis = self._get_historical_audit_redis()
+            tz_ist = pytz.timezone("Asia/Kolkata")
+            now_ist = dt.datetime.now(tz_ist)
+            day_key = now_ist.strftime("%Y%m%d")
+            ts_ist = now_ist.isoformat(timespec="milliseconds")
+            symbol_str = str(symbol or "")
+
+            total_key = f"audit:dhan:historical:req:count:day:{day_key}"
+            per_symbol_key = f"audit:dhan:historical:req:count:symbol:{day_key}"
+            stream_key = f"audit:dhan:historical:req:v1:{day_key}"
+            ttl_seconds = 60 * 60 * 24 * 45
+
+            from_dt_ist = self._format_ist_datetime_string(from_date, is_end=False)
+            to_dt_ist = self._format_ist_datetime_string(to_date, is_end=True)
+
+            pipe = audit_redis.pipeline()
+            pipe.incr(total_key)
+            if symbol_str:
+                pipe.hincrby(per_symbol_key, symbol_str, 1)
+            pipe.xadd(
+                stream_key,
+                {
+                    "ts_ist": ts_ist,
+                    "symbol": symbol_str,
+                    "security_id": str(security_id),
+                    "interval": str(interval),
+                    "from_date": from_dt_ist,
+                    "to_date": to_dt_ist,
+                },
+                maxlen=500000,
+                approximate=True,
+            )
+            pipe.expire(total_key, ttl_seconds)
+            pipe.expire(per_symbol_key, ttl_seconds)
+            pipe.expire(stream_key, ttl_seconds)
+            pipe.execute()
+        except Exception as e:
+            trading_logger.log_warning("Failed to audit Dhan historical request", {"error": str(e), "symbol": symbol})
+
     def _fetch_dhan_historical(
         self,
         security_id: int,
@@ -957,6 +1029,7 @@ class Dhan(BrokerBase):
         to_date: str,
         periodicity: str,
         include_oi: bool,
+        symbol: Optional[str] = None,
     ) -> Dict[str, Any]:
         if self.api is None:
             raise BrokerConnectionError("Dhan API not initialized")
@@ -980,6 +1053,13 @@ class Dhan(BrokerBase):
             url = self.api.base_url + "/charts/intraday"
 
         self._wait_for_historical_rate_limit()
+        self._log_historical_request_audit(
+            symbol=symbol,
+            security_id=security_id,
+            interval=periodicity,
+            from_date=from_date,
+            to_date=to_date,
+        )
         response = self.api.session.post(url, headers=self.api.header, timeout=self.api.timeout, data=json.dumps(payload))
         return self.api._parse_response(response)
 
@@ -995,7 +1075,9 @@ class Dhan(BrokerBase):
             if broker_order_id not in existing.split():
                 new_val = f"{existing} {broker_order_id}".strip()
                 self.redis_o.hset(order.orderRef or order.internal_order_id, key_name, new_val)
-            self.redis_o.hset(order.internal_order_id, "long_symbol", order.long_symbol)
+            current_parent_symbol = str(self.redis_o.hget(order.internal_order_id, "long_symbol") or "").strip()
+            if not current_parent_symbol or ("?" not in current_parent_symbol and ":" not in current_parent_symbol):
+                self.redis_o.hset(order.internal_order_id, "long_symbol", order.long_symbol)
 
     def _build_historical_placeholder(self) -> HistoricalData:
         return HistoricalData(
@@ -1661,6 +1743,7 @@ class Dhan(BrokerBase):
                         to_date=date_end_str,
                         periodicity=periodicity,
                         include_oi=include_oi,
+                        symbol=long_symbol,
                     )
                 except Exception as e:
                     trading_logger.log_error("Dhan historical API error", e, {"symbol": long_symbol})
@@ -1737,6 +1820,7 @@ class Dhan(BrokerBase):
                         to_date=date_end_dt.strftime("%Y-%m-%d"),
                         periodicity="1m",
                         include_oi=include_oi,
+                        symbol=long_symbol,
                     )
                     if intraday_response and intraday_response.get("status") == "success":
                         raw_intraday = intraday_response.get("data", {})

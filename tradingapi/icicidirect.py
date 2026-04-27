@@ -8,11 +8,13 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Union, cast
+from uuid import uuid4
 
 import pandas as pd
 import redis
@@ -477,6 +479,26 @@ class IciciDirect(BrokerBase):
             self._stream_raw_tick_count = 0
             self._stream_mapped_tick_count = 0
             self._stream_last_tick_preview: Dict[str, object] = {}
+            self._quote_rate_limit_lock = threading.Lock()
+            self._last_quote_api_call_ts = 0.0
+            self._quote_rate_limit_interval_secs = 1.0
+            self._quote_rate_limit_redis = None
+            self._global_quote_rate_limit_key = "icicidirect:quote:last_call_ts"
+            self._global_quote_rate_limit_lock_key = "icicidirect:quote:lock"
+            self._historical_rate_limit_lock = threading.Lock()
+            self._last_historical_api_call_ts = 0.0
+            self._historical_rate_limit_interval_secs = 0.5
+            self._global_historical_rate_limit_key = "icicidirect:historical:last_call_ts"
+            self._global_historical_rate_limit_lock_key = "icicidirect:historical:lock"
+            self._stream_request_rate_limit_lock = threading.Lock()
+            self._last_stream_request_api_call_ts = 0.0
+            self._stream_request_rate_limit_interval_secs = 0.5
+            self._global_stream_request_rate_limit_key = "icicidirect:stream:last_call_ts"
+            self._global_stream_request_rate_limit_lock_key = "icicidirect:stream:lock"
+            self._market_data_rate_limit_lock = threading.Lock()
+            self._last_market_data_api_call_ts = 0.0
+            self._global_market_data_rate_limit_key = "icicidirect:market_data:last_call_ts"
+            self._global_market_data_rate_limit_lock_key = "icicidirect:market_data:lock"
 
             trading_logger.log_info(
                 "IciciDirect broker initialized",
@@ -820,6 +842,36 @@ class IciciDirect(BrokerBase):
                 )
             except Exception as e:
                 trading_logger.log_warning("Failed to update IciciDirect symbology", {"error": str(e)})
+
+            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            if quote_rate_limit_redis_db is not None:
+                self._quote_rate_limit_redis = redis.Redis(
+                    db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
+                )
+                self._quote_rate_limit_redis.ping()
+            else:
+                self._quote_rate_limit_redis = self.redis_o
+
+            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            if quote_rate_limit_rps is not None:
+                v = float(quote_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                self._quote_rate_limit_interval_secs = 1.0 / v
+
+            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            if historical_rate_limit_rps is not None:
+                v = float(historical_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                self._historical_rate_limit_interval_secs = 1.0 / v
+
+            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            if stream_request_rate_limit_rps is not None:
+                v = float(stream_request_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info(
                 "IciciDirect connected",
@@ -1216,6 +1268,7 @@ class IciciDirect(BrokerBase):
             resp: object = {}
             for attempt in range(2):
                 try:
+                    self._wait_for_quote_rate_limit()
                     resp = self._call_api_method("get_quotes", cast(Dict[str, object], quote_payload))
                     break
                 except Exception as quote_error:
@@ -1601,6 +1654,7 @@ class IciciDirect(BrokerBase):
                             "get_exchange_quotes": True,
                             "get_market_depth": False,
                         }
+                        self._wait_for_stream_request_rate_limit()
                         sub_resp = self._call_api_method("subscribe_feeds", subscription_payload)
                         if isinstance(sub_resp, str) and "Exception while subscribing to feeds" in sub_resp:
                             direct_feed_token = self._resolve_direct_stream_token(symbol, mapped_exchange)
@@ -1749,6 +1803,106 @@ class IciciDirect(BrokerBase):
                 create_error_context(error=str(e)),
             )
 
+    # ------------------------------------------------------------------
+    # Rate limiting helpers
+    # ------------------------------------------------------------------
+
+    def _get_rate_limit_redis(self):
+        return self._quote_rate_limit_redis or getattr(self, "redis_o", None)
+
+    def _set_local_market_data_last_call_ts(self, ts: float) -> None:
+        self._last_market_data_api_call_ts = ts
+        self._last_quote_api_call_ts = ts
+        self._last_historical_api_call_ts = ts
+        self._last_stream_request_api_call_ts = ts
+
+    def _wait_for_market_data_rate_limit_local(self, interval_secs: float) -> None:
+        with self._market_data_rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_market_data_api_call_ts
+            if elapsed < interval_secs:
+                time.sleep(interval_secs - elapsed)
+                now = time.monotonic()
+            self._set_local_market_data_last_call_ts(now)
+
+    def _wait_for_market_data_rate_limit_global(self, limiter_redis, interval_secs: float) -> None:
+        token = str(uuid4())
+        lock_ttl_ms = 2000
+        while True:
+            acquired = limiter_redis.set(self._global_market_data_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
+            if acquired:
+                try:
+                    last_call_ts = limiter_redis.get(self._global_market_data_rate_limit_key)
+                    if last_call_ts is None:
+                        legacy_ts = []
+                        for key in (
+                            self._global_historical_rate_limit_key,
+                            self._global_quote_rate_limit_key,
+                            self._global_stream_request_rate_limit_key,
+                        ):
+                            value = limiter_redis.get(key)
+                            try:
+                                if value is not None:
+                                    legacy_ts.append(float(value))
+                            except (TypeError, ValueError):
+                                continue
+                        if legacy_ts:
+                            last_call_ts = str(max(legacy_ts))
+                    now = time.time()
+                    if last_call_ts is not None:
+                        elapsed = now - float(last_call_ts)
+                        if elapsed < interval_secs:
+                            time.sleep(interval_secs - elapsed)
+                            now = time.time()
+                    ts = str(now)
+                    limiter_redis.set(self._global_market_data_rate_limit_key, ts)
+                    limiter_redis.set(self._global_historical_rate_limit_key, ts)
+                    limiter_redis.set(self._global_quote_rate_limit_key, ts)
+                    limiter_redis.set(self._global_stream_request_rate_limit_key, ts)
+                    return
+                finally:
+                    if limiter_redis.get(self._global_market_data_rate_limit_lock_key) == token:
+                        limiter_redis.delete(self._global_market_data_rate_limit_lock_key)
+            time.sleep(0.05)
+
+    def _wait_for_quote_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(limiter_redis, self._quote_rate_limit_interval_secs)
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global IciciDirect quote limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._quote_rate_limit_interval_secs)
+
+    def _wait_for_historical_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(limiter_redis, self._historical_rate_limit_interval_secs)
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global IciciDirect historical limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._historical_rate_limit_interval_secs)
+
+    def _wait_for_stream_request_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(
+                    limiter_redis, self._stream_request_rate_limit_interval_secs
+                )
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global IciciDirect stream request limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._stream_request_rate_limit_interval_secs)
+
     @log_execution_time
     def get_historical(
         self,
@@ -1823,6 +1977,7 @@ class IciciDirect(BrokerBase):
             else:
                 kwargs["product_type"] = "cash"
 
+            self._wait_for_historical_rate_limit()
             resp = self.api.get_historical_data_v2(**kwargs)
 
             rows = resp.get("Success") if isinstance(resp, dict) else None
@@ -1872,6 +2027,7 @@ class IciciDirect(BrokerBase):
                 else:
                     kwargs_today["product_type"] = "cash"
                 try:
+                    self._wait_for_historical_rate_limit()
                     resp_today = self.api.get_historical_data_v2(**kwargs_today)
                     rows_today = resp_today.get("Success") if isinstance(resp_today, dict) else []
                     if isinstance(rows_today, list) and len(rows_today) > 0:

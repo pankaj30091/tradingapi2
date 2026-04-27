@@ -17,6 +17,7 @@ import traceback
 import zipfile
 from urllib.parse import parse_qs, urlparse
 from typing import Dict, List, Optional, TypeVar, Union, cast
+from uuid import uuid4
 
 T = TypeVar("T")
 
@@ -375,6 +376,26 @@ class Shoonya(BrokerBase):
         self._is_connected_cache_ttl_secs = 3.0
         self._last_is_connected_check_ts = 0.0
         self._last_is_connected_result: Optional[bool] = None
+        self._quote_rate_limit_lock = threading.Lock()
+        self._last_quote_api_call_ts = 0.0
+        self._quote_rate_limit_interval_secs = 1.0
+        self._quote_rate_limit_redis = None
+        self._global_quote_rate_limit_key = "shoonya:quote:last_call_ts"
+        self._global_quote_rate_limit_lock_key = "shoonya:quote:lock"
+        self._historical_rate_limit_lock = threading.Lock()
+        self._last_historical_api_call_ts = 0.0
+        self._historical_rate_limit_interval_secs = 0.5
+        self._global_historical_rate_limit_key = "shoonya:historical:last_call_ts"
+        self._global_historical_rate_limit_lock_key = "shoonya:historical:lock"
+        self._stream_request_rate_limit_lock = threading.Lock()
+        self._last_stream_request_api_call_ts = 0.0
+        self._stream_request_rate_limit_interval_secs = 0.5
+        self._global_stream_request_rate_limit_key = "shoonya:stream:last_call_ts"
+        self._global_stream_request_rate_limit_lock_key = "shoonya:stream:lock"
+        self._market_data_rate_limit_lock = threading.Lock()
+        self._last_market_data_api_call_ts = 0.0
+        self._global_market_data_rate_limit_key = "shoonya:market_data:last_call_ts"
+        self._global_market_data_rate_limit_lock_key = "shoonya:market_data:lock"
 
     def _get_adjusted_expiry_date(self, year, month) -> dt.datetime:
         """
@@ -851,6 +872,36 @@ class Shoonya(BrokerBase):
                 )
             except Exception as e:
                 trading_logger.log_warning("Failed to set starting order IDs", {"error": str(e), "redis_db": redis_db})
+
+            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            if quote_rate_limit_redis_db is not None:
+                self._quote_rate_limit_redis = redis.Redis(
+                    db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
+                )
+                self._quote_rate_limit_redis.ping()
+            else:
+                self._quote_rate_limit_redis = self.redis_o
+
+            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            if quote_rate_limit_rps is not None:
+                v = float(quote_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                self._quote_rate_limit_interval_secs = 1.0 / v
+
+            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            if historical_rate_limit_rps is not None:
+                v = float(historical_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                self._historical_rate_limit_interval_secs = 1.0 / v
+
+            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            if stream_request_rate_limit_rps is not None:
+                v = float(stream_request_rate_limit_rps)
+                if v <= 0:
+                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info("Successfully connected to Shoonya", {"redis_db": redis_db})
             return True
@@ -1680,6 +1731,104 @@ class Shoonya(BrokerBase):
             order_info.status = OrderStatus.UNDEFINED
         return order_info
 
+    # ------------------------------------------------------------------
+    # Rate limiting helpers
+    # ------------------------------------------------------------------
+
+    def _get_rate_limit_redis(self):
+        return self._quote_rate_limit_redis or getattr(self, "redis_o", None)
+
+    def _set_local_market_data_last_call_ts(self, ts: float) -> None:
+        self._last_market_data_api_call_ts = ts
+        self._last_quote_api_call_ts = ts
+        self._last_historical_api_call_ts = ts
+        self._last_stream_request_api_call_ts = ts
+
+    def _wait_for_market_data_rate_limit_local(self, interval_secs: float) -> None:
+        with self._market_data_rate_limit_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_market_data_api_call_ts
+            if elapsed < interval_secs:
+                time.sleep(interval_secs - elapsed)
+                now = time.monotonic()
+            self._set_local_market_data_last_call_ts(now)
+
+    def _wait_for_market_data_rate_limit_global(self, limiter_redis, interval_secs: float) -> None:
+        token = str(uuid4())
+        lock_ttl_ms = 2000
+        while True:
+            acquired = limiter_redis.set(self._global_market_data_rate_limit_lock_key, token, nx=True, px=lock_ttl_ms)
+            if acquired:
+                try:
+                    last_call_ts = limiter_redis.get(self._global_market_data_rate_limit_key)
+                    if last_call_ts is None:
+                        legacy_ts = []
+                        for key in (
+                            self._global_historical_rate_limit_key,
+                            self._global_quote_rate_limit_key,
+                            self._global_stream_request_rate_limit_key,
+                        ):
+                            value = limiter_redis.get(key)
+                            try:
+                                if value is not None:
+                                    legacy_ts.append(float(value))
+                            except (TypeError, ValueError):
+                                continue
+                        if legacy_ts:
+                            last_call_ts = str(max(legacy_ts))
+                    now = time.time()
+                    if last_call_ts is not None:
+                        elapsed = now - float(last_call_ts)
+                        if elapsed < interval_secs:
+                            time.sleep(interval_secs - elapsed)
+                            now = time.time()
+                    ts = str(now)
+                    limiter_redis.set(self._global_market_data_rate_limit_key, ts)
+                    limiter_redis.set(self._global_historical_rate_limit_key, ts)
+                    limiter_redis.set(self._global_quote_rate_limit_key, ts)
+                    limiter_redis.set(self._global_stream_request_rate_limit_key, ts)
+                    return
+                finally:
+                    if limiter_redis.get(self._global_market_data_rate_limit_lock_key) == token:
+                        limiter_redis.delete(self._global_market_data_rate_limit_lock_key)
+            time.sleep(0.05)
+
+    def _wait_for_quote_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(limiter_redis, self._quote_rate_limit_interval_secs)
+                return
+            except Exception as e:
+                trading_logger.log_warning("Global Shoonya quote limiter unavailable, using local", {"error": str(e)})
+        self._wait_for_market_data_rate_limit_local(self._quote_rate_limit_interval_secs)
+
+    def _wait_for_historical_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(limiter_redis, self._historical_rate_limit_interval_secs)
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global Shoonya historical limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._historical_rate_limit_interval_secs)
+
+    def _wait_for_stream_request_rate_limit(self):
+        limiter_redis = self._get_rate_limit_redis()
+        if limiter_redis is not None:
+            try:
+                self._wait_for_market_data_rate_limit_global(
+                    limiter_redis, self._stream_request_rate_limit_interval_secs
+                )
+                return
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Global Shoonya stream request limiter unavailable, using local", {"error": str(e)}
+                )
+        self._wait_for_market_data_rate_limit_local(self._stream_request_rate_limit_interval_secs)
+
     @retry_on_error(max_retries=3, delay=1.0, backoff_factor=2.0)
     @log_execution_time
     @validate_inputs(
@@ -1845,6 +1994,7 @@ class Shoonya(BrokerBase):
                     if self.api is None:
                         raise BrokerConnectionError("API client not initialized")
                     try:
+                        self._wait_for_historical_rate_limit()
                         return self.api.get_time_price_series(
                             exchange=exch,
                             token=token,
@@ -1955,6 +2105,7 @@ class Shoonya(BrokerBase):
                             start_time = time.time()
                             signal.alarm(2)  # Trigger a timeout in 3 seconds
                             try:
+                                self._wait_for_historical_rate_limit()
                                 data = self.api.get_daily_price_series(
                                     exchange=exch,
                                     tradingsymbol=trading_symbol,
@@ -2043,6 +2194,7 @@ class Shoonya(BrokerBase):
                     else:
                         today_start = dt.datetime.combine(dt.datetime.today(), dt.datetime.min.time())
                     try:
+                        self._wait_for_historical_rate_limit()
                         intraday_data = self.api.get_time_price_series(
                             exchange=exch,
                             token=str(row_outer["Scripcode"]),
@@ -2270,6 +2422,7 @@ class Shoonya(BrokerBase):
                 return market_feed  # Return default Price object if no token is found
 
             try:
+                self._wait_for_quote_rate_limit()
                 tick_data = self.api.get_quotes(exchange=mapped_exchange, token=str(token))
 
                 if not tick_data:
@@ -2554,6 +2707,7 @@ class Shoonya(BrokerBase):
                                             "req_list": reconnect_req_list,
                                         },
                                     )
+                                    self._wait_for_stream_request_rate_limit()
                                     self.api.subscribe(reconnect_req_list)
                                 else:
                                     trading_logger.log_warning(
@@ -2670,6 +2824,7 @@ class Shoonya(BrokerBase):
                 if req_list:
                     if operation == "s":
                         trading_logger.log_info("Requesting streaming", {"req_list": req_list})
+                        self._wait_for_stream_request_rate_limit()
                         self.api.subscribe(req_list)
                     elif operation == "u":
                         trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
