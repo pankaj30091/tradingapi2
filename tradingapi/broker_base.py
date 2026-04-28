@@ -25,7 +25,6 @@ from .exceptions import (
 )
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from chameli.dateutils import parse_datetime
-
 # Removed trading_logger import to avoid circular import issues
 
 NEXT_DAY_TIMESTAMP = int((get_tradingapi_now() + dt.timedelta(days=1)).timestamp())
@@ -834,7 +833,11 @@ class BrokerBase(ABC):
         Modify an existing order.
 
         Args:
-            **kwargs: Order modification parameters
+            **kwargs:
+                broker_order_id (str): Broker order ID to modify.
+                new_price (float): New limit price (0 for market).
+                new_quantity (int): New total quantity.
+                order (Order, optional): Order object to bootstrap Redis state if not cached.
 
         Returns:
             Order: Updated order object

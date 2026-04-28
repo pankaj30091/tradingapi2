@@ -343,13 +343,14 @@ def save_symbol_data(saveToFolder: bool = True):
 
 
 class FlatTrade(BrokerBase):
-    def __init__(self, **kwargs):
+    def __init__(self, account: Optional[str] = None, **kwargs):
         """
         mandatory_keys = None
 
         """
         super().__init__()
         self.broker = Brokers.FLATTRADE
+        self.account_key: str = account if account is not None else self.broker.name
         self.codes = pd.DataFrame()
         self.api = None
         self.subscribe_thread = None
@@ -461,7 +462,7 @@ class FlatTrade(BrokerBase):
         previous_proxy_env = None
         try:
             from .proxy_utils import set_proxy_env_for_broker, restore_proxy_env
-            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+            previous_proxy_env = set_proxy_env_for_broker(self.account_key)
         except Exception:
             pass
 
@@ -469,11 +470,11 @@ class FlatTrade(BrokerBase):
             """Extract credentials from config with validation."""
             try:
                 credentials = {
-                    "user": config.get(f"{self.broker.name}.USER"),
-                    "pwd": config.get(f"{self.broker.name}.PWD"),
-                    "api_key": config.get(f"{self.broker.name}.APIKEY"),
-                    "api_secret": config.get(f"{self.broker.name}.SECRETKEY"),
-                    "token": config.get(f"{self.broker.name}.TOKEN"),
+                    "user": config.get(f"{self.account_key}.USER"),
+                    "pwd": config.get(f"{self.account_key}.PWD"),
+                    "api_key": config.get(f"{self.account_key}.APIKEY"),
+                    "api_secret": config.get(f"{self.account_key}.SECRETKEY"),
+                    "token": config.get(f"{self.account_key}.TOKEN"),
                 }
 
                 missing_keys = [key for key, value in credentials.items() if not value]
@@ -739,7 +740,7 @@ class FlatTrade(BrokerBase):
 
         def get_connected():
             """Main connection logic with robust session management."""
-            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            susertoken_path = config.get(f"{self.account_key}.USERTOKEN")
 
             if not susertoken_path:
                 context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
@@ -800,9 +801,9 @@ class FlatTrade(BrokerBase):
             trading_logger.log_info("Connecting to FlatTrade", {"redis_db": redis_db, "broker_name": self.broker.name})
 
             # Validate configuration
-            if config.get(f"{self.broker.name}") == {}:
-                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
-                raise BrokerConnectionError("Configuration file not found or empty", context)
+            if not config.get(self.account_key):
+                context = create_error_context(broker_name=self.account_key, config_keys=list(config.keys()))
+                raise BrokerConnectionError(f"Configuration section '{self.account_key}' not found or empty in config", context)
 
             # Update symbology
             try:
@@ -836,7 +837,7 @@ class FlatTrade(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to set starting order IDs", {"error": str(e), "redis_db": redis_db})
 
-            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            quote_rate_limit_redis_db = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_REDIS_DB")
             if quote_rate_limit_redis_db is not None:
                 self._quote_rate_limit_redis = redis.Redis(
                     db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
@@ -845,25 +846,25 @@ class FlatTrade(BrokerBase):
             else:
                 self._quote_rate_limit_redis = self.redis_o
 
-            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            quote_rate_limit_rps = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS")
             if quote_rate_limit_rps is not None:
                 v = float(quote_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS must be > 0")
                 self._quote_rate_limit_interval_secs = 1.0 / v
 
-            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            historical_rate_limit_rps = config.get(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS")
             if historical_rate_limit_rps is not None:
                 v = float(historical_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
                 self._historical_rate_limit_interval_secs = 1.0 / v
 
-            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            stream_request_rate_limit_rps = config.get(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
             if stream_request_rate_limit_rps is not None:
                 v = float(stream_request_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
                 self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info("Successfully connected to FlatTrade", {"redis_db": redis_db})
@@ -1061,7 +1062,7 @@ class FlatTrade(BrokerBase):
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def update_symbology(self, **kwargs):
         dt_today = get_tradingapi_now().date()
-        symbols_path = os.path.join(config.get(f"{self.broker.name}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
+        symbols_path = os.path.join(config.get(f"{self.account_key}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
         if not os.path.exists(symbols_path):
             codes = save_symbol_data(saveToFolder=False)
             codes = codes.dropna(subset=["long_symbol"])
@@ -1369,8 +1370,12 @@ class FlatTrade(BrokerBase):
     )
     def modify_order(self, **kwargs) -> Order:
         """
-        mandatory_keys = ['broker_order_id', 'new_price', 'new_quantity']
-
+        Args:
+            **kwargs:
+                broker_order_id (str): Broker order ID to modify.
+                new_price (float): New limit price (0 for market).
+                new_quantity (int): New total quantity.
+                order (Order, optional): Order object to bootstrap Redis state if not cached.
         """
         mandatory_keys = ["broker_order_id", "new_price", "new_quantity"]
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
@@ -1816,7 +1821,7 @@ class FlatTrade(BrokerBase):
                     date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
 
                     # Get symbol codes path from config
-                    symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
+                    symbol_codes_path = config.get(f"{self.account_key}.SYMBOLCODES")
                     if not symbol_codes_path:
                         context = create_error_context(broker_name=self.broker.name)
                         raise ConfigurationError(

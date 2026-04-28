@@ -350,9 +350,13 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
         codes = codes.drop_duplicates(subset=["long_symbol", "Exch"], keep="first").reset_index(drop=True)
 
         if saveToFolder:
-            dest_symbol_file = (
-                f"{config.get('ICICIDIRECT.SYMBOLCODES')}/{dt.datetime.today().strftime('%Y%m%d')}_symbols.csv"
-            )
+            symbol_codes_folder = config.get("ICICIDIRECT.SYMBOLCODES")
+            if not symbol_codes_folder:
+                raise ConfigurationError(
+                    "Missing 'ICICIDIRECT.SYMBOLCODES' in config for IciciDirect symbol data",
+                    create_error_context(),
+                )
+            dest_symbol_file = f"{symbol_codes_folder}/{dt.datetime.today().strftime('%Y%m%d')}_symbols.csv"
             try:
                 codes[["long_symbol", "LotSize", "Scripcode", "Exch", "ExchType", "TickSize", "Token"]].to_csv(
                     dest_symbol_file, index=False
@@ -453,9 +457,13 @@ class IciciDirect(BrokerBase):
     """
 
     @log_execution_time
-    def __init__(self, **kwargs):
+    def __init__(self, account: Optional[str] = None, **kwargs):
         """
         Initialize IciciDirect broker.
+
+        Args:
+            account: Optional config section name (e.g. "ICICIDIRECT_ACCOUNT2").
+                     Defaults to "ICICIDIRECT". Use to connect multiple accounts.
 
         Expected configuration keys (in config.py):
             - ICICIDIRECT.API_KEY
@@ -465,6 +473,7 @@ class IciciDirect(BrokerBase):
         try:
             super().__init__(**kwargs)
             self.broker = Brokers.ICICIDIRECT if hasattr(Brokers, "ICICIDIRECT") else Brokers.UNDEFINED
+            self.account_key: str = account if account is not None else self.broker.name
             self.api: BreezeConnect | None = None
             self.codes = pd.DataFrame()
             self.starting_order_ids_int: Dict[str, int] = {}
@@ -615,11 +624,11 @@ class IciciDirect(BrokerBase):
         # did not export them in shell.
         cmd_env.update(
             {
-                "ICICI_API_KEY": str(config.get("ICICIDIRECT.API_KEY") or ""),
-                "ICICI_API_SECRET": str(config.get("ICICIDIRECT.API_SECRET") or ""),
-                "ICICI_USER_ID": str(config.get("ICICIDIRECT.USER_ID") or config.get("ICICIDIRECT.USERNAME") or ""),
-                "ICICI_PASSWORD": str(config.get("ICICIDIRECT.PASSWORD") or ""),
-                "ICICI_TOTP_TOKEN": str(config.get("ICICIDIRECT.TOTP_TOKEN") or ""),
+                "ICICI_API_KEY": str(config.get(f"{self.account_key}.API_KEY") or ""),
+                "ICICI_API_SECRET": str(config.get(f"{self.account_key}.API_SECRET") or ""),
+                "ICICI_USER_ID": str(config.get(f"{self.account_key}.USER_ID") or config.get(f"{self.account_key}.USERNAME") or ""),
+                "ICICI_PASSWORD": str(config.get(f"{self.account_key}.PASSWORD") or ""),
+                "ICICI_TOTP_TOKEN": str(config.get(f"{self.account_key}.TOTP_TOKEN") or ""),
             }
         )
 
@@ -713,18 +722,18 @@ class IciciDirect(BrokerBase):
         2) ICICIDIRECT.USERTOKEN (cached token file)
         3) ICICIDIRECT.AUTO_SESSION_TOKEN_CMD (external non-interactive token fetch)
         """
-        configured_token = config.get("ICICIDIRECT.API_SESSION_TOKEN")
+        configured_token = config.get(f"{self.account_key}.API_SESSION_TOKEN")
         if configured_token:
             return configured_token.strip()
 
-        token_file_path = config.get("ICICIDIRECT.USERTOKEN")
-        max_age_hours = int(config.get("ICICIDIRECT.USERTOKEN_MAX_AGE_HOURS") or 20)
+        token_file_path = config.get(f"{self.account_key}.USERTOKEN")
+        max_age_hours = int(config.get(f"{self.account_key}.USERTOKEN_MAX_AGE_HOURS") or 20)
         cached_token = self._read_session_token_from_file(token_file_path, max_age_hours=max_age_hours)
         if cached_token:
             return cached_token
 
-        token_command = config.get("ICICIDIRECT.AUTO_SESSION_TOKEN_CMD")
-        if not token_command and config.get("ICICIDIRECT.AUTO_LOGIN"):
+        token_command = config.get(f"{self.account_key}.AUTO_SESSION_TOKEN_CMD")
+        if not token_command and config.get(f"{self.account_key}.AUTO_LOGIN"):
             py = sys.executable or "python3"
             token_command = (
                 f"{py} -m tradingapi.icicidirect_generate_session "
@@ -745,11 +754,11 @@ class IciciDirect(BrokerBase):
                 "REDIRECT_TIMEOUT": "--redirect-wait",
             }
             for conf_key, arg_name in opt_map.items():
-                v = config.get(f"ICICIDIRECT.{conf_key}")
+                v = config.get(f"{self.account_key}.{conf_key}")
                 if v not in [None, ""]:
                     token_command += f' {arg_name} "{v}"'
 
-            if not bool(config.get("ICICIDIRECT.SELENIUM_HEADLESS", True)):
+            if not bool(config.get(f"{self.account_key}.SELENIUM_HEADLESS", True)):
                 token_command += " --no-headless"
 
         command_token = self._get_session_token_from_command(token_command)
@@ -791,14 +800,14 @@ class IciciDirect(BrokerBase):
         try:
             from .proxy_utils import set_proxy_env_for_broker
 
-            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+            previous_proxy_env = set_proxy_env_for_broker(self.account_key)
         except Exception:
             pass
 
         _prev_ipv6 = _temporarily_force_ipv4()
         try:
-            api_key = config.get("ICICIDIRECT.API_KEY")
-            api_secret = config.get("ICICIDIRECT.API_SECRET")
+            api_key = config.get(f"{self.account_key}.API_KEY")
+            api_secret = config.get(f"{self.account_key}.API_SECRET")
             session_token = self._resolve_session_token()
 
             if not api_key or not api_secret:
@@ -827,7 +836,7 @@ class IciciDirect(BrokerBase):
                     create_error_context(response=customer_details),
                 )
 
-            token_file_path = config.get("ICICIDIRECT.USERTOKEN")
+            token_file_path = config.get(f"{self.account_key}.USERTOKEN")
             self._write_session_token_to_file(token_file_path, session_token)
 
             self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
@@ -843,7 +852,7 @@ class IciciDirect(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to update IciciDirect symbology", {"error": str(e)})
 
-            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            quote_rate_limit_redis_db = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_REDIS_DB")
             if quote_rate_limit_redis_db is not None:
                 self._quote_rate_limit_redis = redis.Redis(
                     db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
@@ -852,25 +861,25 @@ class IciciDirect(BrokerBase):
             else:
                 self._quote_rate_limit_redis = self.redis_o
 
-            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            quote_rate_limit_rps = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS")
             if quote_rate_limit_rps is not None:
                 v = float(quote_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS must be > 0")
                 self._quote_rate_limit_interval_secs = 1.0 / v
 
-            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            historical_rate_limit_rps = config.get(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS")
             if historical_rate_limit_rps is not None:
                 v = float(historical_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
                 self._historical_rate_limit_interval_secs = 1.0 / v
 
-            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            stream_request_rate_limit_rps = config.get(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
             if stream_request_rate_limit_rps is not None:
                 v = float(stream_request_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
                 self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info(
@@ -929,7 +938,7 @@ class IciciDirect(BrokerBase):
         """
         try:
             save_to_folder = kwargs.get("saveToFolder", True)
-            symbol_codes_path = config.get("ICICIDIRECT.SYMBOLCODES")
+            symbol_codes_path = config.get(f"{self.account_key}.SYMBOLCODES")
             date_str = get_tradingapi_now().strftime("%Y%m%d")
 
             if symbol_codes_path:
@@ -2234,6 +2243,20 @@ class IciciDirect(BrokerBase):
             raise OrderError(f"Error placing order via IciciDirect: {str(e)}", context)
 
     def modify_order(self, **kwargs) -> Order:
+        """
+        Args:
+            **kwargs:
+                broker_order_id (str): Broker order ID to modify. Alias: order_id.
+                new_price (float): New limit price (0 for market). Alias: price.
+                new_quantity (int): New total quantity. Alias: quantity.
+                order (Order, optional): Order object to bootstrap Redis state if not cached.
+                exchange_code (str, optional): Overrides auto-resolved exchange code.
+                order_type (str, optional): Overrides auto-detected order type (limit/market).
+                stoploss (str, optional): Stop-loss value for the payload.
+                validity (str, optional): Order validity (e.g. DAY, IOC).
+                disclosed_quantity (str, optional): Iceberg/disclosed quantity.
+                validity_date (str, optional): GTD date for the order.
+        """
         if self.api is None:
             raise BrokerConnectionError("IciciDirect not connected", create_error_context())
 

@@ -16,7 +16,7 @@ import time
 import traceback
 import zipfile
 from urllib.parse import parse_qs, urlparse
-from typing import Dict, List, Optional, TypeVar, Union, cast
+from typing import Any, Dict, List, Optional, TypeVar, Union, cast
 from uuid import uuid4
 
 T = TypeVar("T")
@@ -100,6 +100,14 @@ class ShoonyaOAuthApiPy(NorenApi):
         )
         global api
         api = self
+
+
+def _call_api_method(api_obj: object, method_name: str, **kwargs):
+    """Call a dynamic Shoonya API method if present; raise clear error otherwise."""
+    method = getattr(api_obj, method_name, None)
+    if not callable(method):
+        raise AttributeError(f"Shoonya API method '{method_name}' is unavailable")
+    return cast(Any, method)(**kwargs)
 
 
 @log_execution_time
@@ -361,13 +369,14 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
 
 
 class Shoonya(BrokerBase):
-    def __init__(self, **kwargs):
+    def __init__(self, account: Optional[str] = None, **kwargs):
         """
         mandatory_keys = None
 
         """
         super().__init__()
         self.broker = Brokers.SHOONYA
+        self.account_key: str = account if account is not None else self.broker.name
         self.codes = pd.DataFrame()
         self.api = None
         self.subscribe_thread = None
@@ -457,11 +466,11 @@ class Shoonya(BrokerBase):
 
     def _get_login_credentials(self) -> dict:
         credentials = {
-            "user": config.get(f"{self.broker.name}.USER"),
-            "password": config.get(f"{self.broker.name}.PWD"),
-            "vendor_code": config.get(f"{self.broker.name}.VC"),
-            "api_secret": config.get(f"{self.broker.name}.APPKEY"),
-            "totp_token": config.get(f"{self.broker.name}.TOKEN"),
+            "user": config.get(f"{self.account_key}.USER"),
+            "password": config.get(f"{self.account_key}.PWD"),
+            "vendor_code": config.get(f"{self.account_key}.VC"),
+            "api_secret": config.get(f"{self.account_key}.APPKEY"),
+            "totp_token": config.get(f"{self.account_key}.TOKEN"),
             "imei": "abc12345",
         }
         missing = [name.upper() for name, value in credentials.items() if name != "imei" and not value]
@@ -474,11 +483,11 @@ class Shoonya(BrokerBase):
         return credentials
 
     def _get_oauth_credentials(self) -> Optional[dict]:
-        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
-        secret_code = config.get(f"{self.broker.name}.SECRET_CODE")
+        client_id = config.get(f"{self.account_key}.CLIENT_ID")
+        secret_code = config.get(f"{self.account_key}.SECRET_CODE")
         if not client_id or not secret_code:
             return None
-        user = config.get(f"{self.broker.name}.USER")
+        user = config.get(f"{self.account_key}.USER")
         return {
             "client_id": client_id,
             "secret_code": secret_code,
@@ -517,9 +526,16 @@ class Shoonya(BrokerBase):
 
     def _set_api_session_from_token(self, user: str, password: str, usertoken: str) -> None:
         self.api = ShoonyaOAuthApiPy()
-        self.api.set_session(userid=user, password=password, usertoken=usertoken, accesstoken=usertoken)
+        _call_api_method(
+            self.api,
+            "set_session",
+            userid=user,
+            password=password,
+            usertoken=usertoken,
+            accesstoken=usertoken,
+        )
         if hasattr(self.api, "injectOAuthHeader"):
-            self.api.injectOAuthHeader(usertoken, user, user)
+            cast(Any, getattr(self.api, "injectOAuthHeader"))(usertoken, user, user)
 
     def _login_with_web_oauth(self) -> dict:
         login_credentials = self._get_login_credentials()
@@ -630,7 +646,9 @@ class Shoonya(BrokerBase):
     def _login_with_fresh_totp(self) -> dict:
         credentials = self._get_login_credentials()
         api = ShoonyaApiPy()
-        response = api.login(  # type: ignore[attr-defined]
+        response = _call_api_method(
+            api,
+            "login",
             userid=credentials["user"],
             password=credentials["password"],
             twoFA=pyotp.TOTP(credentials["totp_token"]).now(),
@@ -668,7 +686,7 @@ class Shoonya(BrokerBase):
         previous_proxy_env = None
         try:
             from .proxy_utils import set_proxy_env_for_broker, restore_proxy_env
-            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+            previous_proxy_env = set_proxy_env_for_broker(self.account_key)
         except Exception:
             pass
 
@@ -738,8 +756,8 @@ class Shoonya(BrokerBase):
         def _restore_session_from_token(susertoken_path) -> bool:
             """Attempt to restore session from existing token."""
             try:
-                user = config.get(f"{self.broker.name}.USER")
-                pwd = config.get(f"{self.broker.name}.PWD")
+                user = config.get(f"{self.account_key}.USER")
+                pwd = config.get(f"{self.account_key}.PWD")
 
                 if not user or not pwd:
                     trading_logger.log_warning("Missing credentials for session restore", {"broker": self.broker.name})
@@ -753,9 +771,16 @@ class Shoonya(BrokerBase):
                     return False
 
                 self.api = ShoonyaOAuthApiPy()
-                self.api.set_session(userid=user, password=pwd, usertoken=susertoken, accesstoken=susertoken)
+                _call_api_method(
+                    self.api,
+                    "set_session",
+                    userid=user,
+                    password=pwd,
+                    usertoken=susertoken,
+                    accesstoken=susertoken,
+                )
                 if hasattr(self.api, "injectOAuthHeader"):
-                    self.api.injectOAuthHeader(susertoken, user, user)
+                    cast(Any, getattr(self.api, "injectOAuthHeader"))(susertoken, user, user)
 
                 # Verify the session is actually working
                 if _verify_session(self):
@@ -773,7 +798,7 @@ class Shoonya(BrokerBase):
 
         def get_connected() -> bool:
             """Main connection logic with robust session management."""
-            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            susertoken_path = config.get(f"{self.account_key}.USERTOKEN")
 
             if not susertoken_path:
                 trading_logger.log_error("USERTOKEN path not configured", context={"broker": self.broker.name})
@@ -834,10 +859,10 @@ class Shoonya(BrokerBase):
         try:
             trading_logger.log_info("Connecting to Shoonya", {"redis_db": redis_db, "broker_name": self.broker.name})
 
-            if config.get(f"{self.broker.name}") == {}:
-                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.keys()))
+            if not config.get(self.account_key):
+                context = create_error_context(broker_name=self.account_key, config_keys=list(config.keys()))
                 trading_logger.log_error("Configuration file not found or empty", context=context)
-                raise ValueError("Configuration file not found or empty")
+                raise ValueError(f"Configuration section '{self.account_key}' not found or empty in config")
 
             try:
                 self.codes = self.update_symbology()
@@ -873,7 +898,7 @@ class Shoonya(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to set starting order IDs", {"error": str(e), "redis_db": redis_db})
 
-            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            quote_rate_limit_redis_db = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_REDIS_DB")
             if quote_rate_limit_redis_db is not None:
                 self._quote_rate_limit_redis = redis.Redis(
                     db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
@@ -882,25 +907,25 @@ class Shoonya(BrokerBase):
             else:
                 self._quote_rate_limit_redis = self.redis_o
 
-            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            quote_rate_limit_rps = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS")
             if quote_rate_limit_rps is not None:
                 v = float(quote_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS must be > 0")
                 self._quote_rate_limit_interval_secs = 1.0 / v
 
-            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            historical_rate_limit_rps = config.get(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS")
             if historical_rate_limit_rps is not None:
                 v = float(historical_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
                 self._historical_rate_limit_interval_secs = 1.0 / v
 
-            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            stream_request_rate_limit_rps = config.get(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
             if stream_request_rate_limit_rps is not None:
                 v = float(stream_request_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
                 self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info("Successfully connected to Shoonya", {"redis_db": redis_db})
@@ -1144,7 +1169,7 @@ class Shoonya(BrokerBase):
 
     def update_symbology(self, **kwargs) -> pd.DataFrame:
         dt_today = get_tradingapi_now().strftime("%Y%m%d")
-        symbols_path = os.path.join(config.get(f"{self.broker.name}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
+        symbols_path = os.path.join(config.get(f"{self.account_key}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
         if not os.path.exists(symbols_path):
             codes = save_symbol_data(saveToFolder=False)
             codes = codes.dropna(subset=["long_symbol"])
@@ -1460,8 +1485,12 @@ class Shoonya(BrokerBase):
     )
     def modify_order(self, **kwargs) -> Order:
         """
-        mandatory_keys = ['broker_order_id', 'new_price', 'new_quantity']
-
+        Args:
+            **kwargs:
+                broker_order_id (str): Broker order ID to modify.
+                new_price (float): New limit price (0 for market).
+                new_quantity (int): New total quantity.
+                order (Order, optional): Order object to bootstrap Redis state if not cached.
         """
         mandatory_keys = ["broker_order_id", "new_price", "new_quantity"]
         missing_keys = [key for key in mandatory_keys if key not in kwargs]
@@ -1907,7 +1936,7 @@ class Shoonya(BrokerBase):
                     date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
 
                     # Get symbol codes path from config
-                    symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
+                    symbol_codes_path = config.get(f"{self.account_key}.SYMBOLCODES")
                     if not symbol_codes_path:
                         context = create_error_context(broker_name=self.broker.name)
                         raise ConfigurationError(

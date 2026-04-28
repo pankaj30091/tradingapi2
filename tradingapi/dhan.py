@@ -356,11 +356,12 @@ class Dhan(BrokerBase):
     """
 
     @log_execution_time
-    def __init__(self, **kwargs):
+    def __init__(self, account: Optional[str] = None, **kwargs):
         try:
             super().__init__(**kwargs)
             self.codes = pd.DataFrame()
             self.broker = Brokers.DHAN
+            self.account_key: str = account if account is not None else self.broker.name
             self.api: Optional[Any] = None
             self._stream_credentials: Dict[str, str] = {}
             self.subscribe_thread = None
@@ -428,12 +429,12 @@ class Dhan(BrokerBase):
             pd.DataFrame: Symbol codes dataframe
         """
         try:
-            trading_logger.log_info("Updating symbology", {"broker_name": self.broker.name})
+            trading_logger.log_info("Updating symbology", {"broker_name": self.account_key})
 
             dt_today = get_tradingapi_now().strftime("%Y%m%d")
-            symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
+            symbol_codes_path = config.get(f"{self.account_key}.SYMBOLCODES")
             if not symbol_codes_path:
-                raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.broker.name}")
+                raise ConfigurationError(f"SYMBOLCODES path not found in config for {self.account_key}")
 
             symbols_path = os.path.join(symbol_codes_path, f"{dt_today}_symbols.csv")
 
@@ -474,7 +475,7 @@ class Dhan(BrokerBase):
         except (ConfigurationError, DataError):
             raise
         except Exception as e:
-            context = create_error_context(broker_name=self.broker.name, error=str(e))
+            context = create_error_context(broker_name=self.account_key, error=str(e))
             raise DataError(f"Unexpected error updating symbology: {str(e)}", context)
 
     # ------------------------------------------------------------------
@@ -501,8 +502,11 @@ class Dhan(BrokerBase):
         try:
             trading_logger.log_info("Connecting to Dhan", {"redis_db": redis_db})
 
-            if config.get(self.broker.name) == {}:
-                raise BrokerConnectionError("Dhan configuration not found or empty")
+            account_section = config.get(self.account_key)
+            if not account_section:
+                raise BrokerConnectionError(
+                    f"Configuration section '{self.account_key}' not found or empty in config"
+                )
 
             # Load symbology first
             try:
@@ -511,9 +515,9 @@ class Dhan(BrokerBase):
                 trading_logger.log_warning("Failed to update symbology", {"error": str(e)})
 
             # Read credentials
-            client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+            client_id = config.get(f"{self.account_key}.CLIENT_ID")
             if not client_id:
-                raise AuthenticationError("DHAN.CLIENT_ID not configured")
+                raise AuthenticationError(f"{self.account_key}.CLIENT_ID not configured")
 
             access_token = self._load_access_token()
 
@@ -527,7 +531,7 @@ class Dhan(BrokerBase):
             # Redis
             self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
             self.redis_o.ping()
-            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            quote_rate_limit_redis_db = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_REDIS_DB")
             if quote_rate_limit_redis_db is not None:
                 self._quote_rate_limit_redis = redis.Redis(
                     db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
@@ -537,25 +541,25 @@ class Dhan(BrokerBase):
                 self._quote_rate_limit_redis = self.redis_o
 
             # Optional rate-limit overrides from config (values are requests/second)
-            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            quote_rate_limit_rps = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS")
             if quote_rate_limit_rps is not None:
                 quote_rate_limit_rps = float(quote_rate_limit_rps)
                 if quote_rate_limit_rps <= 0:
-                    raise ConfigurationError("DHAN.QUOTE_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS must be > 0")
                 self._quote_rate_limit_interval_secs = 1.0 / quote_rate_limit_rps
 
-            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            historical_rate_limit_rps = config.get(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS")
             if historical_rate_limit_rps is not None:
                 historical_rate_limit_rps = float(historical_rate_limit_rps)
                 if historical_rate_limit_rps <= 0:
-                    raise ConfigurationError("DHAN.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
                 self._historical_rate_limit_interval_secs = 1.0 / historical_rate_limit_rps
 
-            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            stream_request_rate_limit_rps = config.get(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
             if stream_request_rate_limit_rps is not None:
                 stream_request_rate_limit_rps = float(stream_request_rate_limit_rps)
                 if stream_request_rate_limit_rps <= 0:
-                    raise ConfigurationError("DHAN.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
                 self._stream_request_rate_limit_interval_secs = 1.0 / stream_request_rate_limit_rps
 
             self.starting_order_ids_int = set_starting_internal_ids_int(redis_db=self.redis_o)
@@ -566,7 +570,7 @@ class Dhan(BrokerBase):
         except (ValidationError, BrokerConnectionError, AuthenticationError):
             raise
         except Exception as e:
-            context = create_error_context(redis_db=redis_db, broker_name=self.broker.name, error=str(e))
+            context = create_error_context(redis_db=redis_db, broker_name=self.account_key, error=str(e))
             raise BrokerConnectionError(f"Unexpected error connecting to Dhan: {str(e)}", context)
 
     def _load_access_token(self) -> str:
@@ -578,7 +582,7 @@ class Dhan(BrokerBase):
         2. TOTP_TOKEN configured → do a fresh login and write to file
         3. ACCESS_TOKEN in config → use it as a last resort (no auto-refresh)
         """
-        token_path = config.get(f"{self.broker.name}.USERTOKEN")
+        token_path = config.get(f"{self.account_key}.USERTOKEN")
 
         # Check if today's token is already on disk
         if token_path and os.path.exists(token_path):
@@ -587,13 +591,13 @@ class Dhan(BrokerBase):
                 with open(token_path, "r") as f:
                     token = f.read().strip()
                 if token:
-                    trading_logger.log_info("Loaded today's token from file", {"broker": self.broker.name})
+                    trading_logger.log_info("Loaded today's token from file", {"broker": self.account_key})
                     return token
 
         # Try TOTP-based fresh login
-        totp_token = config.get(f"{self.broker.name}.TOTP_TOKEN")
-        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
-        pin = config.get(f"{self.broker.name}.PIN")
+        totp_token = config.get(f"{self.account_key}.TOTP_TOKEN")
+        client_id = config.get(f"{self.account_key}.CLIENT_ID")
+        pin = config.get(f"{self.account_key}.PIN")
 
         if totp_token and client_id and pin:
             token = self._fresh_login_totp(client_id, pin, totp_token, token_path)
@@ -601,16 +605,16 @@ class Dhan(BrokerBase):
                 return token
 
         # Last resort: static token in config
-        token = config.get(f"{self.broker.name}.ACCESS_TOKEN")
+        token = config.get(f"{self.account_key}.ACCESS_TOKEN")
         if token:
             trading_logger.log_warning(
                 "Using static ACCESS_TOKEN from config — will not auto-refresh",
-                {"broker": self.broker.name},
+                {"broker": self.account_key},
             )
             return token
 
         raise AuthenticationError(
-            "Could not obtain Dhan access token. Configure TOTP_TOKEN+PIN or ACCESS_TOKEN."
+            f"Could not obtain Dhan access token for {self.account_key}. Configure TOTP_TOKEN+PIN or ACCESS_TOKEN."
         )
     
     
@@ -634,7 +638,7 @@ class Dhan(BrokerBase):
             try:
                 trading_logger.log_info(
                     f"Dhan TOTP login attempt {attempt}/{max_attempts}",
-                    {"broker": self.broker.name},
+                    {"broker": self.account_key},
                 )
                 otp = pyotp.TOTP(totp_secret).now()
                 resp = requests.post(
@@ -666,12 +670,12 @@ class Dhan(BrokerBase):
 
             except Exception as e:
                 trading_logger.log_error(
-                    f"TOTP login attempt {attempt} error", e, {"broker": self.broker.name}
+                    f"TOTP login attempt {attempt} error", e, {"broker": self.account_key}
                 )
                 if attempt < max_attempts:
                     time.sleep(40)
 
-        trading_logger.log_warning("All TOTP login attempts failed", {"broker": self.broker.name})
+        trading_logger.log_warning("All TOTP login attempts failed", {"broker": self.account_key})
         return None
     
     @log_execution_time
@@ -1320,6 +1324,13 @@ class Dhan(BrokerBase):
         """
         Modify a live Dhan order (price + quantity).
 
+        Args:
+            **kwargs:
+                broker_order_id (str): Broker order ID to modify.
+                new_price (float): New limit price (0 for market).
+                new_quantity (int): New total quantity.
+                order (Order, optional): Order object to bootstrap Redis state if not cached.
+
         Dhan SDK: dhan.modify_order(order_id, order_type, leg_name, quantity,
                                      price, trigger_price, disclosed_quantity, validity)
         """
@@ -1328,6 +1339,7 @@ class Dhan(BrokerBase):
                 if key not in kwargs:
                     raise ValidationError(f"Missing mandatory key: {key}")
 
+            order = kwargs.get("order")
             broker_order_id = str(kwargs["broker_order_id"])
             new_price = float(kwargs["new_price"])
             new_quantity = int(float(str(kwargs["new_quantity"])))
@@ -1340,7 +1352,6 @@ class Dhan(BrokerBase):
             if order_data:
                 order = Order(**order_data)
             else:
-                order = kwargs.get("order")
                 if order is None:
                     raise OrderError(f"Order {broker_order_id} not found in Redis")
                 order.broker_order_id = broker_order_id

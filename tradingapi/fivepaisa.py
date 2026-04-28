@@ -235,11 +235,13 @@ class FivePaisa(BrokerBase):
     """
 
     @log_execution_time
-    def __init__(self, **kwargs):
+    def __init__(self, account: Optional[str] = None, **kwargs):
         """
         Initialize FivePaisa broker with enhanced error handling.
 
         Args:
+            account: Optional config section name (e.g. "FIVEPAISA_ACCOUNT2").
+                     Defaults to "FIVEPAISA". Use to connect multiple accounts.
             **kwargs: Configuration parameters for FivePaisa broker
 
         Raises:
@@ -250,6 +252,7 @@ class FivePaisa(BrokerBase):
             super().__init__(**kwargs)
             self.codes = pd.DataFrame()
             self.broker = Brokers.FIVEPAISA
+            self.account_key: str = account if account is not None else self.broker.name
             self.api = None
             self._api_proxy_url = None
             self.subscribe_thread = None
@@ -290,7 +293,7 @@ class FivePaisa(BrokerBase):
             if self.api is None or not hasattr(self.api, "session"):
                 return
             from .proxy_utils import get_proxies_for_broker
-            proxies = get_proxies_for_broker(self.broker.name)
+            proxies = get_proxies_for_broker(self.account_key)
             proxy_url = (proxies or {}).get("https") or (proxies or {}).get("http")
             if not proxy_url or (not force_refresh and proxy_url == self._api_proxy_url):
                 return
@@ -448,7 +451,7 @@ class FivePaisa(BrokerBase):
 
             try:
                 dt_today = get_tradingapi_now().strftime("%Y%m%d")
-                symbol_codes_path = config.get(f"{self.broker.name}.SYMBOLCODES")
+                symbol_codes_path = config.get(f"{self.account_key}.SYMBOLCODES")
 
                 if not symbol_codes_path:
                     context = create_error_context(
@@ -553,7 +556,7 @@ class FivePaisa(BrokerBase):
         previous_proxy_env = None
         try:
             from .proxy_utils import set_proxy_env_for_broker
-            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+            previous_proxy_env = set_proxy_env_for_broker(self.account_key)
         except Exception:
             pass
 
@@ -561,12 +564,12 @@ class FivePaisa(BrokerBase):
             """Extract credentials from config with validation."""
             try:
                 credentials = {
-                    "APP_SOURCE": config.get(f"{self.broker.name}.APP_SOURCE"),
-                    "APP_NAME": config.get(f"{self.broker.name}.APP_NAME"),
-                    "USER_ID": config.get(f"{self.broker.name}.USER_ID"),
-                    "PASSWORD": config.get(f"{self.broker.name}.PASSWORD"),
-                    "USER_KEY": config.get(f"{self.broker.name}.USER_KEY"),
-                    "ENCRYPTION_KEY": config.get(f"{self.broker.name}.ENCRYPTION_KEY"),
+                    "APP_SOURCE": config.get(f"{self.account_key}.APP_SOURCE"),
+                    "APP_NAME": config.get(f"{self.account_key}.APP_NAME"),
+                    "USER_ID": config.get(f"{self.account_key}.USER_ID"),
+                    "PASSWORD": config.get(f"{self.account_key}.PASSWORD"),
+                    "USER_KEY": config.get(f"{self.account_key}.USER_KEY"),
+                    "ENCRYPTION_KEY": config.get(f"{self.account_key}.ENCRYPTION_KEY"),
                 }
 
                 missing_keys = [key for key, value in credentials.items() if not value]
@@ -588,7 +591,7 @@ class FivePaisa(BrokerBase):
         def _restore_session_from_token(susertoken_path):
             """Attempt to restore session from existing token."""
             try:
-                client_id = config.get(f"{self.broker.name}.CLIENT_ID")
+                client_id = config.get(f"{self.account_key}.CLIENT_ID")
                 if not client_id:
                     trading_logger.log_warning(
                         "CLIENT_ID not configured for session restore", {"broker": self.broker.name}
@@ -633,13 +636,13 @@ class FivePaisa(BrokerBase):
                             f"Fresh login attempt {attempt}/{max_attempts}", {"broker": self.broker.name}
                         )
 
-                        totp_token = config.get(f"{self.broker.name}.TOTP_TOKEN")
+                        totp_token = config.get(f"{self.account_key}.TOTP_TOKEN")
                         if not totp_token:
                             raise AuthenticationError("TOTP_TOKEN not configured")
 
                         otp = pyotp.TOTP(totp_token).now()
-                        client_id = config.get(f"{self.broker.name}.CLIENT_ID")
-                        pin = config.get(f"{self.broker.name}.PIN")
+                        client_id = config.get(f"{self.account_key}.CLIENT_ID")
+                        pin = config.get(f"{self.account_key}.PIN")
 
                         if not client_id or not pin:
                             raise AuthenticationError("CLIENT_ID or PIN not configured")
@@ -694,7 +697,7 @@ class FivePaisa(BrokerBase):
 
         def get_connected():
             """Main connection logic with robust session management."""
-            susertoken_path = config.get(f"{self.broker.name}.USERTOKEN")
+            susertoken_path = config.get(f"{self.account_key}.USERTOKEN")
 
             if not susertoken_path:
                 context = create_error_context(broker_name=self.broker.name, config_keys=list(config.configs.keys()))
@@ -755,9 +758,9 @@ class FivePaisa(BrokerBase):
         try:
             trading_logger.log_info("Connecting to FivePaisa", {"redis_db": redis_db, "broker_name": self.broker.name})
 
-            if config.get(self.broker.name) == {}:
-                context = create_error_context(broker_name=self.broker.name, config_keys=list(config.configs.keys()))
-                raise BrokerConnectionError("Configuration file not found or empty", context)
+            if not config.get(self.account_key):
+                context = create_error_context(broker_name=self.account_key, config_keys=list(config.configs.keys()))
+                raise BrokerConnectionError(f"Configuration section '{self.account_key}' not found or empty in config", context)
 
             # Update symbology
             try:
@@ -792,7 +795,7 @@ class FivePaisa(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to set starting order IDs", {"error": str(e), "redis_db": redis_db})
 
-            quote_rate_limit_redis_db = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_REDIS_DB")
+            quote_rate_limit_redis_db = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_REDIS_DB")
             if quote_rate_limit_redis_db is not None:
                 self._quote_rate_limit_redis = redis.Redis(
                     db=int(quote_rate_limit_redis_db), encoding="utf-8", decode_responses=True
@@ -801,25 +804,25 @@ class FivePaisa(BrokerBase):
             else:
                 self._quote_rate_limit_redis = self.redis_o
 
-            quote_rate_limit_rps = config.get(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS")
+            quote_rate_limit_rps = config.get(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS")
             if quote_rate_limit_rps is not None:
                 v = float(quote_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.QUOTE_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.QUOTE_RATE_LIMIT_RPS must be > 0")
                 self._quote_rate_limit_interval_secs = 1.0 / v
 
-            historical_rate_limit_rps = config.get(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS")
+            historical_rate_limit_rps = config.get(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS")
             if historical_rate_limit_rps is not None:
                 v = float(historical_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.HISTORICAL_RATE_LIMIT_RPS must be > 0")
                 self._historical_rate_limit_interval_secs = 1.0 / v
 
-            stream_request_rate_limit_rps = config.get(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
+            stream_request_rate_limit_rps = config.get(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS")
             if stream_request_rate_limit_rps is not None:
                 v = float(stream_request_rate_limit_rps)
                 if v <= 0:
-                    raise ConfigurationError(f"{self.broker.name}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
+                    raise ConfigurationError(f"{self.account_key}.REQUEST_STREAMING_DATA_RATE_LIMIT_RPS must be > 0")
                 self._stream_request_rate_limit_interval_secs = 1.0 / v
 
             trading_logger.log_info("Successfully connected to FivePaisa", {"redis_db": redis_db})
@@ -1463,10 +1466,11 @@ class FivePaisa(BrokerBase):
         Modify an existing order with the FivePaisa broker with enhanced error handling.
 
         Args:
-            **kwargs: Order modification parameters including:
-                - broker_order_id: Broker order ID to modify
-                - new_price: New price for the order
-                - new_quantity: New quantity for the order
+            **kwargs:
+                broker_order_id (str): Broker order ID to modify.
+                new_price (float): New limit price (0 for market).
+                new_quantity (int): New total quantity.
+                order (Order, optional): Order object to bootstrap Redis state if not cached.
 
         Returns:
             Order: Updated order object
@@ -2741,7 +2745,7 @@ class FivePaisa(BrokerBase):
                         first_error = e
 
                     if first_error is not None or data is None:
-                        trading_logger.log_warning(
+                        trading_logger.log_info(
                             "Historical API failed/None; reconnecting and retrying once",
                             {
                                 "symbol": row_outer["long_symbol"],
@@ -2930,7 +2934,7 @@ class FivePaisa(BrokerBase):
         previous_proxy_env = None
         try:
             from .proxy_utils import set_proxy_env_for_broker
-            previous_proxy_env = set_proxy_env_for_broker(self.broker.name)
+            previous_proxy_env = set_proxy_env_for_broker(self.account_key)
         except Exception:
             pass
         self._configure_api_proxy_session()

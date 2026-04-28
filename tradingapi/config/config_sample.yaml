@@ -34,6 +34,10 @@ FIVEPAISA:
   SYMBOLCODES:
   USERTOKEN:
 
+# Additional FivePaisa accounts (optional). Pass as account= to FivePaisa().
+# FIVEPAISA_ACCOUNT2:
+#   ... (same keys as FIVEPAISA above)
+
 SHOONYA:
   EXCHANGES: [NSE, BSE, MCX]
   USE_PROXY: false
@@ -44,6 +48,10 @@ SHOONYA:
   TOKEN:
   SYMBOLCODES: "/home/psharma/onedrive/rfiles/data/static/shoonya_symbols"
   USERTOKEN:
+
+# Additional Shoonya accounts (optional). Pass as account= to Shoonya().
+# SHOONYA_ACCOUNT2:
+#   ... (same keys as SHOONYA above)
 
 ICICIDIRECT:
   EXCHANGES: [NSE, BSE, MCX]
@@ -76,6 +84,10 @@ ICICIDIRECT:
   SYMBOL_MASTER_URL: # Optional: symbol master zip url
   SYMBOLCODES:
 
+# Additional ICICIDirect accounts (optional). Pass as account= to IciciDirect().
+# ICICIDIRECT_ACCOUNT2:
+#   ... (same keys as ICICIDIRECT above)
+
 DHAN:
   EXCHANGES: [NSE, BSE]
   USE_PROXY: false
@@ -89,3 +101,19 @@ DHAN:
   QUOTE_RATE_LIMIT_RPS: 1 # Optional: quote API limit in requests/second
   HISTORICAL_RATE_LIMIT_RPS: 10 # Optional: historical API limit in requests/second
   REQUEST_STREAMING_DATA_RATE_LIMIT_RPS: 10 # Optional: streaming subscription request rate in requests/second
+
+# Additional DHAN accounts (optional). Name can be anything; pass as account= to Dhan().
+# Example: dh2 = Dhan(account="DHAN_ACCOUNT2"); dh2.connect(redis_db=5)
+DHAN_ACCOUNT2:
+  EXCHANGES: [NSE, BSE]
+  USE_PROXY: false
+  CLIENT_ID:
+  ACCESS_TOKEN:
+  TOTP_TOKEN:
+  PIN:
+  USERTOKEN:
+  SYMBOLCODES:
+  QUOTE_RATE_LIMIT_REDIS_DB: 5
+  QUOTE_RATE_LIMIT_RPS: 1
+  HISTORICAL_RATE_LIMIT_RPS: 10
+  REQUEST_STREAMING_DATA_RATE_LIMIT_RPS: 10
