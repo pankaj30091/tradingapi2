@@ -1,6 +1,5 @@
 import datetime as dt
 import json
-import logging
 import math
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
@@ -10,8 +9,6 @@ from .globals import get_tradingapi_now
 import pandas as pd
 import pytz
 import redis
-
-logger = logging.getLogger(__name__)
 
 from .exceptions import (
     TradingAPIError,
@@ -25,7 +22,11 @@ from .exceptions import (
 )
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from chameli.dateutils import parse_datetime
-# Removed trading_logger import to avoid circular import issues
+
+
+def _get_trading_logger():
+    from tradingapi import trading_logger
+    return trading_logger
 
 NEXT_DAY_TIMESTAMP = int((get_tradingapi_now() + dt.timedelta(days=1)).timestamp())
 
@@ -290,9 +291,9 @@ class Order:
         try:
             # Handle None values
             if value is None:
-                logger.warning(
+                _get_trading_logger().log_warning(
                     "Received None value, returning 0",
-                    extra={"value": value, "default": 0, "method": "_convert_to_int", "argument_name": argument_name},
+                    context={"value": value, "default": 0, "method": "_convert_to_int", "argument_name": argument_name},
                 )
                 return 0
 
@@ -309,9 +310,9 @@ class Order:
                 # Strip whitespace and handle empty strings
                 value = value.strip()
                 if not value:
-                    logger.warning(
+                    _get_trading_logger().log_warning(
                         "Empty string value, returning 0",
-                        extra={
+                        context={
                             "value": repr(value),
                             "default": 0,
                             "method": "_convert_to_int",
@@ -324,9 +325,9 @@ class Order:
                     # Try to convert string to float first, then to int
                     return int(float(value))
                 except ValueError:
-                    logger.warning(
+                    _get_trading_logger().log_warning(
                         "Failed to convert string to int",
-                        extra={
+                        context={
                             "value": repr(value),
                             "default": 0,
                             "method": "_convert_to_int",
@@ -341,9 +342,9 @@ class Order:
                     # Convert object to string and then to number
                     str_value = str(value).strip()
                     if not str_value:
-                        logger.warning(
+                        _get_trading_logger().log_warning(
                             "Object converted to empty string, returning 0",
-                            extra={
+                            context={
                                 "value": repr(value),
                                 "value_type": type(value).__name__,
                                 "default": 0,
@@ -355,9 +356,9 @@ class Order:
 
                     return int(float(str_value))
                 except (ValueError, TypeError):
-                    logger.warning(
+                    _get_trading_logger().log_warning(
                         "Failed to convert object to int",
-                        extra={
+                        context={
                             "value": repr(value),
                             "value_type": type(value).__name__,
                             "default": 0,
@@ -368,10 +369,10 @@ class Order:
                     return 0
 
         except Exception as e:
-            logger.error(
+            _get_trading_logger().log_error(
                 "Error converting value to int",
-                exc_info=True,
-                extra={
+                e,
+                context={
                     "value": repr(value),
                     "value_type": type(value).__name__,
                     "method": "_convert_to_int",
@@ -388,9 +389,9 @@ class Order:
         try:
             # Handle None values
             if value is None:
-                logger.warning(
+                _get_trading_logger().log_warning(
                     "Received None value, returning NaN",
-                    extra={
+                    context={
                         "value": value,
                         "default": float("nan"),
                         "method": "_convert_to_float",
@@ -408,9 +409,9 @@ class Order:
                 # Strip whitespace and handle empty strings
                 value = value.strip()
                 if not value:
-                    logger.warning(
+                    _get_trading_logger().log_warning(
                         "Empty string value, returning NaN",
-                        extra={
+                        context={
                             "value": repr(value),
                             "default": float("nan"),
                             "method": "_convert_to_float",
@@ -422,9 +423,9 @@ class Order:
                 try:
                     return float(value)
                 except ValueError:
-                    logger.warning(
+                    _get_trading_logger().log_warning(
                         "Failed to convert string to float",
-                        extra={
+                        context={
                             "value": repr(value),
                             "default": float("nan"),
                             "method": "_convert_to_float",
@@ -439,9 +440,9 @@ class Order:
                     # Convert object to string and then to number
                     str_value = str(value).strip()
                     if not str_value:
-                        logger.warning(
+                        _get_trading_logger().log_warning(
                             "Object converted to empty string, returning NaN",
-                            extra={
+                            context={
                                 "value": repr(value),
                                 "value_type": type(value).__name__,
                                 "default": float("nan"),
@@ -453,9 +454,9 @@ class Order:
 
                     return float(str_value)
                 except (ValueError, TypeError):
-                    logger.warning(
+                    _get_trading_logger().log_warning(
                         "Failed to convert object to float",
-                        extra={
+                        context={
                             "value": repr(value),
                             "value_type": type(value).__name__,
                             "default": float("nan"),
@@ -466,10 +467,10 @@ class Order:
                     return float("nan")
 
         except Exception as e:
-            logger.error(
+            _get_trading_logger().log_error(
                 "Error converting value to float",
-                exc_info=True,
-                extra={
+                e,
+                context={
                     "value": repr(value),
                     "value_type": type(value).__name__,
                     "method": "_convert_to_float",
@@ -492,10 +493,10 @@ class Order:
             else:
                 return False
         except Exception as e:
-            logger.error(
+            _get_trading_logger().log_error(
                 "Error converting value to bool",
-                exc_info=True,
-                extra={
+                e,
+                context={
                     "value": value,
                     "value_type": type(value).__name__,
                     "method": "_convert_to_bool",
@@ -720,9 +721,9 @@ class BrokerBase(ABC):
         try:
             self._validate_config(kwargs)
             self._initialize_broker(kwargs)
-            logger.info(
+            _get_trading_logger().log_info(
                 "Broker initialized successfully",
-                extra={"broker_type": self.__class__.__name__, "config_keys": list(kwargs.keys())},
+                context={"broker_type": self.__class__.__name__, "config_keys": list(kwargs.keys())},
             )
         except Exception as e:
             context = create_error_context(
@@ -736,9 +737,9 @@ class BrokerBase(ABC):
             raise ValidationError("Configuration must be a dictionary")
 
         # Add specific validation logic for each broker type
-        logger.debug(
+        _get_trading_logger().log_debug(
             "Validating broker configuration",
-            extra={"broker_type": self.__class__.__name__, "config_keys": list(config.keys())},
+            context={"broker_type": self.__class__.__name__, "config_keys": list(config.keys())},
         )
 
     def _initialize_broker(self, config: dict):
@@ -1078,9 +1079,9 @@ class BrokerBase(ABC):
         self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds: Optional[str] = None
     ) -> Optional[float]:
         """Default broker margin hook. Brokers can override if supported."""
-        logger.warning(
+        _get_trading_logger().log_warning(
             "get_margin_requirement not implemented for broker",
-            extra={
+            context={
                 "broker_type": self.__class__.__name__,
                 "combo_symbol": combo_symbol,
                 "order_size": order_size,

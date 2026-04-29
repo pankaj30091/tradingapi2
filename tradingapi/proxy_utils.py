@@ -5,14 +5,13 @@ When a broker has USE_PROXY=True in config and proxy settings (e.g. Webshare) ar
 configured, get_proxies_for_broker() returns a proxies dict for use with requests.
 Used in connect() and save_symbol_data() for each broker.
 """
-import logging
 import os
 import random
 from typing import Any, Dict, Optional
 
 import requests
 
-logger = logging.getLogger(__name__)
+from tradingapi import trading_logger
 
 _WEBSHARE_LIST_URL = "https://proxy.webshare.io/api/v2/proxy/list/"
 
@@ -39,17 +38,17 @@ def get_proxies_for_broker(broker_name: str) -> Optional[Dict[str, str]]:
 
     proxy_cfg = config.configs.get("proxy")
     if not isinstance(proxy_cfg, dict):
-        logger.debug("Proxy not used: no proxy section in config", extra={"broker": broker_name})
+        trading_logger.log_debug("Proxy not used: no proxy section in config", context={"broker": broker_name})
         return None
 
     source = (proxy_cfg.get("source") or "").strip().lower()
     if source != "webshare":
-        logger.debug("Proxy not used: only webshare source is supported", extra={"broker": broker_name})
+        trading_logger.log_debug("Proxy not used: only webshare source is supported", context={"broker": broker_name})
         return None
 
     api_key = proxy_cfg.get("api_key") or os.getenv("WEBSHARE_PROXY_API_KEY")
     if not api_key:
-        logger.warning("Proxy enabled but proxy.api_key not set", extra={"broker": broker_name})
+        trading_logger.log_warning("Proxy enabled but proxy.api_key not set", context={"broker": broker_name})
         return None
 
     mode = proxy_cfg.get("mode") or "direct"
@@ -66,16 +65,16 @@ def get_proxies_for_broker(broker_name: str) -> Optional[Dict[str, str]]:
             timeout=15,
         )
         if resp.status_code != 200:
-            logger.warning(
+            trading_logger.log_warning(
                 "Webshare proxy list failed",
-                extra={"broker": broker_name, "status_code": resp.status_code},
+                context={"broker": broker_name, "status_code": resp.status_code},
             )
             return None
         data = resp.json()
         results = data.get("results") or []
         valid_proxies = [p for p in results if p.get("valid")]
         if not valid_proxies:
-            logger.warning("No valid Webshare proxies in list", extra={"broker": broker_name})
+            trading_logger.log_warning("No valid Webshare proxies in list", context={"broker": broker_name})
             return None
         proxy = random.choice(valid_proxies)
         host = proxy.get("proxy_address", "")
@@ -88,9 +87,9 @@ def get_proxies_for_broker(broker_name: str) -> Optional[Dict[str, str]]:
             proxy_url = f"http://{host}:{port}"
         return {"http": proxy_url, "https": proxy_url}
     except Exception as e:
-        logger.warning(
+        trading_logger.log_warning(
             "Failed to fetch proxy for broker",
-            extra={"broker": broker_name, "error": str(e)},
+            context={"broker": broker_name, "error": str(e)},
         )
         return None
 

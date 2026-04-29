@@ -4,7 +4,6 @@ import concurrent.futures.thread
 import datetime as dt
 import io
 import json
-import logging
 import math
 import os
 import re
@@ -63,7 +62,6 @@ from . import trading_logger
 from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
 
-logger = logging.getLogger(__name__)
 config = get_config()
 
 
@@ -336,7 +334,7 @@ def save_symbol_data(saveToFolder: bool = False):
         return df
 
     except Exception as e:
-        logger.error(f"Error in save_symbol_data (Dhan): {e}", exc_info=True)
+        trading_logger.log_error("Error in save_symbol_data (Dhan)", e)
         raise
 
 

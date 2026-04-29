@@ -2,7 +2,6 @@ import datetime as dt
 import inspect
 import io
 import json
-import logging
 import math
 import os
 import re
@@ -66,7 +65,6 @@ from . import trading_logger
 from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
 
-logger = logging.getLogger(__name__)
 config = get_config()
 
 
@@ -179,9 +177,9 @@ def save_symbol_data(saveToFolder: bool = False):
                     expiry = dt.datetime.strptime(expiry_str, "%Y%b%d").strftime("%Y%m%d")
                     return f"{symbol_vec[0]}_FUT_{expiry}__".upper()
                 except (ValueError, TypeError):
-                    logger.debug(
+                    trading_logger.log_debug(
                         "Symbol row not parsed as FUT (expiry parse failed)",
-                        extra={"symbol_vec": symbol_vec, "expiry_str": expiry_str},
+                        context={"symbol_vec": symbol_vec, "expiry_str": expiry_str},
                     )
                     return None
             elif len(symbol_vec) == 6:
@@ -194,9 +192,9 @@ def save_symbol_data(saveToFolder: bool = False):
                     strike = ("%f" % float(symbol_vec[5])).rstrip("0").rstrip(".")
                     return f"{symbol_vec[0]}_OPT_{expiry}_{right}_{strike}".upper()
                 except (ValueError, TypeError):
-                    logger.debug(
+                    trading_logger.log_debug(
                         "Symbol row not parsed as OPT (expiry parse failed)",
-                        extra={"symbol_vec": symbol_vec, "expiry_str": expiry_str},
+                        context={"symbol_vec": symbol_vec, "expiry_str": expiry_str},
                     )
                     return None
             else:
@@ -224,8 +222,6 @@ def save_symbol_data(saveToFolder: bool = False):
         except Exception:
             pass  # If trading_logger fails, continue with standard logging
 
-        # Also log to standard logger as backup
-        logger.error(f"Error in save_symbol_data: {e}", exc_info=True)
         raise
 
 

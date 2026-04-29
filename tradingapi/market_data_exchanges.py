@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Union
 
 from .broker_base import Brokers
-
-logger = logging.getLogger(__name__)
+from tradingapi import trading_logger
 
 _BUILTIN_MARKET_DATA_EXCHANGES_BY_BROKER: dict[str, frozenset[str]] = {
     "DHAN": frozenset({"NSE", "BSE"}),
@@ -47,10 +45,9 @@ def get_market_data_exchanges_for_broker(broker: Union[Brokers, str]) -> frozens
             normalize_market_data_exchange(x) for x in raw if x is not None and str(x).strip()
         )
     if raw is not None:
-        logger.warning(
-            "Invalid exchanges config (expected list) for broker %s; using built-in defaults",
-            key,
-            extra={"broker": key, "exchanges_raw_type": type(raw).__name__},
+        trading_logger.log_warning(
+            f"Invalid exchanges config (expected list) for broker {key}; using built-in defaults",
+            context={"broker": key, "exchanges_raw_type": type(raw).__name__},
         )
     return _BUILTIN_MARKET_DATA_EXCHANGES_BY_BROKER.get(key, _DEFAULT_UNKNOWN_BROKER_EXCHANGES)
 

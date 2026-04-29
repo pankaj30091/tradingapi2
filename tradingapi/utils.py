@@ -2,7 +2,6 @@ import datetime as dt
 import fcntl
 import glob
 import json
-import logging
 import math
 import os
 import re
@@ -13,7 +12,7 @@ import time
 import traceback
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Dict, List, Optional, Tuple, Union, cast, Sequence
+from typing import Any, Dict, List, Optional, Tuple, Union, cast, Sequence
 
 import numpy as np
 import pandas as pd
@@ -45,7 +44,6 @@ from .error_handling import retry_on_error, safe_execute, log_execution_time, ha
 from . import trading_logger
 from .globals import get_tradingapi_now
 
-logger = logging.getLogger(__name__)
 r = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 
 
@@ -122,7 +120,7 @@ def hget_with_default(brok: BrokerBase, hash_name: str, key: str, default_value)
         return value
 
 
-def get_all_strategy_names(redis_db) -> set:
+def get_all_strategy_names(redis_db) -> set[str]:
     """
     Returns a set of strategies used within the database of the trading system.
     :return:
@@ -140,7 +138,7 @@ def get_all_strategy_names(redis_db) -> set:
     return out
 
 
-def set_starting_internal_ids_int(redis_db) -> dict:
+def set_starting_internal_ids_int(redis_db) -> dict[str, int]:
     """Sets the internal_ids for each strategy. New orders start from the values defined by this function"""
     out: dict[str, int] = {}
     strategies = get_all_strategy_names(redis_db)
@@ -155,7 +153,7 @@ def set_starting_internal_ids_int(redis_db) -> dict:
                 # non-conforming keys (e.g. symbol strings containing "_OPT_").
                 parts = key.split("_")
                 if len(parts) < 2 or not parts[1].isdigit():
-                    logger.debug(f"Skipping non-internal-id key while scanning strategy {s}: {key}")
+                    trading_logger.log_debug(f"Skipping non-internal-id key while scanning strategy {s}: {key}")
                     continue
 
                 key_id = int(parts[1])
@@ -163,7 +161,7 @@ def set_starting_internal_ids_int(redis_db) -> dict:
                     out[s] = key_id + 1
             if cursor == 0:
                 break
-    logger.debug(f"Starting internal ids : {out} ")
+    trading_logger.log_debug(f"Starting internal ids : {out} ")
     return out
 
 
@@ -172,7 +170,7 @@ def publish_trades_to_redis(
     strategy_name: str,
     publish: bool = True,
     channel: Optional[str] = None,
-    trades_out: Optional[list] = None,
+    trades_out: Optional[list[Any]] = None,
 ) -> int:
     """
     Publish relevant trades for a strategy to Redis so downstream consumers
@@ -277,7 +275,7 @@ def publish_trades_to_redis(
 
         try:
             pnl_json = relevant_trades.to_json(orient="split")
-            cast(None, broker.redis_o.publish(publish_channel, pnl_json))
+            broker.redis_o.publish(publish_channel, pnl_json)
             trading_logger.log_info(
                 f"Published {len(relevant_trades)} relevant trades for {strategy_name} to Redis",
                 {
@@ -573,7 +571,7 @@ def get_pnl_table(
         cursor = 0
         scan_count = 0
         while True:
-            cursor, keys = cast(tuple, broker.redis_o.scan(cursor, match=pattern, count=1000))
+            cursor, keys = cast(tuple[Any, Any], broker.redis_o.scan(cursor, match=pattern, count=1000))
             int_order_ids.extend(keys)
             scan_count += len(keys)
             if cursor == 0:
@@ -627,9 +625,11 @@ def get_pnl_table(
                     continue
 
                 # Process entry keys
+                entry_time: Union[dt.datetime, str, None] = None
+                side: str = ""
                 if len(entry_keys) > 0:
                     try:
-                        order_1 = Order(**cast(dict, broker.redis_o.hgetall(entry_keys[0])))
+                        order_1 = Order(**cast(dict[str, Any], broker.redis_o.hgetall(entry_keys[0])))
                         entry_order_type = order_1.order_type
                         side = order_1.order_type if "?" not in symbol else "BUY"
                         try:
@@ -654,7 +654,7 @@ def get_pnl_table(
                 # Process exit keys
                 if len(exit_keys) > 0:
                     try:
-                        order_1 = Order(**cast(dict, broker.redis_o.hgetall(exit_keys[-1])))
+                        order_1 = Order(**cast(dict[str, Any], broker.redis_o.hgetall(exit_keys[-1])))
                         try:
                             exit_time = parse_datetime(order_1.remote_order_id[:-2])
                         except (ValueError, TypeError):
@@ -689,7 +689,7 @@ def get_pnl_table(
                 if refresh_status:
                     try:
                         for entry_key in entry_keys:
-                            order = Order(**cast(dict, broker.redis_o.hgetall(entry_key)))
+                            order = Order(**cast(dict[str, Any], broker.redis_o.hgetall(entry_key)))
                             broker_order_id = order.broker_order_id
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:
@@ -742,7 +742,7 @@ def get_pnl_table(
                 if refresh_status:
                     try:
                         for exit_key in exit_keys:
-                            order = Order(**cast(dict, broker.redis_o.hgetall(exit_key)))
+                            order = Order(**cast(dict[str, Any], broker.redis_o.hgetall(exit_key)))
                             broker_order_id = order.broker_order_id
                             update_order_status(broker, int_order_id, broker_order_id, eod=eod)
                     except Exception as e:
@@ -1017,7 +1017,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
             pattern = strategy + "_" + "*"
             cursor = 0
             while True:
-                cursor, keys = cast(tuple, broker.redis_o.scan(cursor, match=pattern, count=1000))
+                cursor, keys = cast(tuple[Any, Any], broker.redis_o.scan(cursor, match=pattern, count=1000))
                 int_order_ids.extend(keys)
                 if cursor == 0:
                     break
@@ -1066,7 +1066,7 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
                 jsons = []
                 for entry_key in entry_keys:
                     if entry_key:
-                        jsons.append(cast(dict, broker.redis_o.hgetall(entry_key)))
+                        jsons.append(cast(dict[str, Any], broker.redis_o.hgetall(entry_key)))
                     else:
                         jsons.append({})
                 if combo:
@@ -1115,7 +1115,7 @@ def get_open_position_by_order(
     broker: BrokerBase,
     int_order_id: str,
     exclude_zero: bool = True,
-    side: List = ["entry", "exit"],
+    side: List[str] = ["entry", "exit"],
     market_close_time: str = "15:30:00",
 ) -> Dict[str, Position]:
     """Get open positions for a specific internal order ID.
@@ -1156,7 +1156,7 @@ def get_open_position_by_order(
                     continue
 
                 try:
-                    order_data = cast(dict, broker.redis_o.hgetall(key))
+                    order_data = cast(dict[str, Any], broker.redis_o.hgetall(key))
                     if not order_data:
                         trading_logger.log_warning(
                             "No order data found for key", {"key": key, "int_order_id": int_order_id}
@@ -1353,7 +1353,7 @@ def parse_combo_symbol(combo_symbol):
         raise SymbolError(f"Unexpected error parsing combo symbol: {str(e)}", context)
 
 
-def get_exit_candidates(broker: BrokerBase, strategy: str, long_symbol: str, side: str) -> list:
+def get_exit_candidates(broker: BrokerBase, strategy: str, long_symbol: str, side: str) -> list[str]:
     """Retreive exit candidates for a specified strategy, side and entry order type
 
     Args:
@@ -1382,7 +1382,7 @@ def get_exit_candidates(broker: BrokerBase, strategy: str, long_symbol: str, sid
         pass
     # order keys to support fifo, key with lower integer component should be first
     int_order_ids.sort(key=lambda pair: pair.split("_")[1])
-    logger.info("Exit Candidates -->" + ",".join(int_order_ids))
+    trading_logger.log_info("Exit Candidates -->" + ",".join(int_order_ids))
     return int_order_ids
 
 
@@ -1561,12 +1561,12 @@ def transmit_entry_order(
     # Enforce: combo orders (with ":") must have order_type "BUY"
     if ":" in order.long_symbol and order.order_type != "BUY":
         error_msg = f"Combo order {order.long_symbol} must have order_type 'BUY'. Got '{order.order_type}' instead."
-        logger.error(error_msg)
+        trading_logger.log_error(error_msg)
         raise OrderError(error_msg, {"symbol": order.long_symbol, "order_type": order.order_type})
 
     if order.price is None:
         error_msg = f"Order not placed. Price was set as None for symbol: {order.long_symbol}"
-        logger.error(error_msg)
+        trading_logger.log_error(error_msg)
         raise OrderError(error_msg, {"symbol": order.long_symbol})
     if price_broker is None:
         price_broker = [broker]
@@ -1649,7 +1649,7 @@ def transmit_exit_order(
         broker: BrokerBase,
         internal_order_id: str,
     ):
-        order_mapping = cast(dict, broker.redis_o.hgetall(internal_order_id))
+        order_mapping = cast(dict[str, Any], broker.redis_o.hgetall(internal_order_id))
         entry_keys = order_mapping.get("entry_keys")
         if entry_keys is not None:
             entry_keys_list = entry_keys.split(" ")
@@ -1661,7 +1661,7 @@ def transmit_exit_order(
             for ek in exit_keys_list:
                 broker.cancel_order(broker_order_id=ek)
 
-    logger.info(
+    trading_logger.log_info(
         f"Exit order. Symbol: {order.long_symbol}{chr(10)} Side: {order.order_type}. Quantity: {order.quantity}"
     )
     exit_candidates = (
@@ -1740,13 +1740,13 @@ def transmit_exit_order(
                         else:
                             quantities_remaining[calc_index] += order_new.quantity
     else:
-        logger.info(
+        trading_logger.log_info(
             f"No exit candidates found for symbol: {order.long_symbol} and order: {order.order_type} and strategy: "
             f"{strategy}"
         )
 
 
-def calculate_extra_combo_positions(order_position: Dict[str, Position], base_position: Dict[str, int]) -> dict:
+def calculate_extra_combo_positions(order_position: Dict[str, Position], base_position: Dict[str, int]) -> dict[str, Any]:
     """Calculates extra positions outside completed combos.
 
     Args:
@@ -1807,10 +1807,10 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
         str: internal order id
     """
     if order is None:
-        logger.error(f"Order Not placed as None was received. Mother symbol: {long_symbol}. Are you logged in??")
+        trading_logger.log_error(f"Order Not placed as None was received. Mother symbol: {long_symbol}. Are you logged in??")
         return ""
     if order.status in [OrderStatus.REJECTED, OrderStatus.UNDEFINED]:
-        logger.error(
+        trading_logger.log_error(
             f"Order not placed for {order.long_symbol}. Status was {order.status}. Message was {order.message}. Mother symbol was: {long_symbol}"
         )
         return ""
@@ -1873,33 +1873,33 @@ def delete_broker_order_id(
         broker_order_id (str): broker order id
     """
     if broker_order_id == "0":
-        logger.info(f"Deleting internal order id: {internal_order_id} and linked broker order ids")
-        order_mapping = cast(dict, broker.redis_o.hgetall(internal_order_id))
+        trading_logger.log_info(f"Deleting internal order id: {internal_order_id} and linked broker order ids")
+        order_mapping = cast(dict[str, Any], broker.redis_o.hgetall(internal_order_id))
         entry_keys = order_mapping.get("entry_keys")
         if entry_keys is not None:
             entry_keys_list = entry_keys.split(" ")
             for ek in entry_keys_list:
-                logger.info(f"Deleting order. Order {ek}")
+                trading_logger.log_info(f"Deleting order. Order {ek}")
                 broker.redis_o.delete(ek)
         exit_keys = order_mapping.get("exit_keys")
         if exit_keys is not None:
             exit_keys_list = exit_keys.split(" ")
             for ek in exit_keys_list:
-                logger.info(f"Deleting order. Order {ek}")
+                trading_logger.log_info(f"Deleting order. Order {ek}")
                 broker.redis_o.delete(ek)
-        logger.info(f"Deleting order. Order {internal_order_id}")
+        trading_logger.log_info(f"Deleting order. Order {internal_order_id}")
         broker.redis_o.delete(internal_order_id)
     else:
-        order_mapping = cast(dict, broker.redis_o.hgetall(internal_order_id))
+        order_mapping = cast(dict[str, Any], broker.redis_o.hgetall(internal_order_id))
         if len(order_mapping) == 0:
-            logger.info(f"Internal Order ID: {internal_order_id} not found")
+            trading_logger.log_info(f"Internal Order ID: {internal_order_id} not found")
             return
         # check if removal is from entry
         entry_keys = order_mapping.get("entry_keys")
         if entry_keys is not None and str(broker_order_id) in entry_keys:
             entry_keys = entry_keys.split()
             entry_keys.remove(str(broker_order_id))
-            logger.info(f"Deleting broker order id: {broker_order_id}")
+            trading_logger.log_info(f"Deleting broker order id: {broker_order_id}")
             exit_keys = hget_with_default(broker, internal_order_id, "exit_keys", "").split()
             if len(entry_keys) == 0 and len(exit_keys) > 0:
                 if exit_is_expiration(broker, internal_order_id):
@@ -1910,11 +1910,11 @@ def delete_broker_order_id(
                         pipe.delete(ek)
                     pipe.execute()
                     pipe.reset()
-                    logger.info(
+                    trading_logger.log_info(
                         f"Deleting order and internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
                     )
                 else:
-                    logger.error(f"Unexpected exit key found for order id {internal_order_id}")
+                    trading_logger.log_error(f"Unexpected exit key found for order id {internal_order_id}")
             else:
                 order_mapping["entry_keys"] = " ".join(entry_keys)
                 pipe = broker.redis_o.pipeline()
@@ -1924,11 +1924,12 @@ def delete_broker_order_id(
                 pipe.delete(broker_order_id)
                 pipe.execute()
                 pipe.reset()
-                logger.info(
+                trading_logger.log_info(
                     f"Deleting unfilled order and updating internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
                 )
         else:
             exit_keys = order_mapping.get("exit_keys")
+            exit_keys_list: list[str] = []
             if exit_keys is not None and str(broker_order_id) in exit_keys:
                 # check if removal is from exit
                 exit_keys_list = exit_keys.split()
@@ -1943,7 +1944,7 @@ def delete_broker_order_id(
             pipe.delete(broker_order_id)
             pipe.execute()
             pipe.reset()
-            logger.info(
+            trading_logger.log_info(
                 f"Deleting  order and updating internal_order_id. Order {broker_order_id}. Internal Order ID: {internal_order_id}"
             )
 
@@ -1982,7 +1983,7 @@ def update_order_status(
     for attr in required_attributes:
         if not hasattr(fills, attr) or getattr(fills, attr) in [None, "0"]:
             attr_value = getattr(fills, attr, "<missing>")
-            logger.error(
+            trading_logger.log_error(
                 f"Missing or invalid attribute {attr} in order information for broker_order_id: {broker_order_id}. "
                 f"value={attr_value!r}, value_type={type(attr_value).__name__}"
             )
@@ -2061,7 +2062,7 @@ def get_linked_options(
         except (ValueError, TypeError):
             parsed_expiry = None
             expiry_parsed = False
-        if expiry_parsed:
+        if expiry_parsed and parsed_expiry is not None:
             expiry_str = parsed_expiry.strftime("%Y%m%d")
             symbols = [s for s in symbols if s.startswith(f"{short_symbol}_OPT_{expiry_str}")]
         else:
@@ -2159,7 +2160,7 @@ def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str =
         list[str]: List of short symbol names.
     """
     if not file_path:
-        logger.error("File path is empty. Please provide a valid file path.")
+        trading_logger.log_error("File path is empty. Please provide a valid file path.")
         return []
 
     if os.path.isdir(file_path):
@@ -2170,18 +2171,18 @@ def get_unique_short_symbol_names(exchange: str, sec_type: str, file_path: str =
             first_file = files[0]
             symbols = pd.read_csv(os.path.join(file_path, first_file))
         else:
-            logger.error("No files found in the specified directory.")
+            trading_logger.log_error("No files found in the specified directory.")
             return []
     elif os.path.isfile(file_path):
         # Read CSV from the given file
         symbols = pd.read_csv(file_path)
     else:
-        logger.error("Invalid file path provided.")
+        trading_logger.log_error("Invalid file path provided.")
         return []
 
     # Ensure required columns exist
     if "Exch" not in symbols.columns or "long_symbol" not in symbols.columns:
-        logger.error("Missing required columns 'Exch' or 'long_symbol' in the symbols file.")
+        trading_logger.log_error("Missing required columns 'Exch' or 'long_symbol' in the symbols file.")
         return []
 
     # Filter and extract unique short names
@@ -2258,11 +2259,11 @@ def get_margin_zerodha(broker: BrokerBase, long_symbol: str, proxy: str = "", ex
             output = int(output)
         except Exception:
             output = 1000000
-        logger.info(f"margin for {long_symbol}:{output}")
+        trading_logger.log_info(f"margin for {long_symbol}:{output}")
         session.close()
         return output
     except Exception:
-        logger.exception("Error")
+        trading_logger.log_error("Error")
         return 1000000
 
 
@@ -2359,11 +2360,11 @@ def get_margin_samco(long_symbol: str, driver_path: str = "", proxy: Optional[st
             )
         except Exception:
             output = 100000000
-        logger.info(f"margin for {long_symbol}:{output}")
+        trading_logger.log_info(f"margin for {long_symbol}:{output}")
         if driver:
             driver.close()
     except Exception:
-        logger.exception("Error")
+        trading_logger.log_error("Error")
         if driver:
             driver.close()
         if proxy is not None:
@@ -2450,7 +2451,7 @@ def get_margin_5p(long_symbol, strike_price, type, expiry, driver_path: str = ""
             )
         except Exception:
             output = 100000000
-        logger.info(f"margin for {long_symbol}:{output}")
+        trading_logger.log_info(f"margin for {long_symbol}:{output}")
         if driver:
             driver.close()
     except Exception:
@@ -2509,14 +2510,14 @@ def get_free_proxy(driver_path: str = "") -> Optional[str]:
                     selected_proxy_index = i
                     break
         except Exception:
-            logger.exception("Error")
+            trading_logger.log_error("Error")
             continue
 
     if selected_proxy_index is None:
-        logger.warning("No working proxy found, returning default")
+        trading_logger.log_warning("No working proxy found, returning default")
         return None
 
-    logger.info(f"Proxy selected: {proxies[selected_proxy_index]}")
+    trading_logger.log_info(f"Proxy selected: {proxies[selected_proxy_index]}")
     return (
         proxies[selected_proxy_index].get("IP Address", "127.0.0.1")
         + ":"
@@ -2564,7 +2565,7 @@ def review_price_history(symbol: str, exchange: str = "NSE", count: int = 1):
     """Retrieve the last `count` prices for a symbol from Redis."""
     global mds_history
     price_history_key = f"price_history:{symbol}~{exchange}"
-    price_history = cast(list, mds_history.zrevrange(price_history_key, 0, 0))
+    price_history = cast(list[str], mds_history.zrevrange(price_history_key, 0, 0))
     return [json.loads(price) for price in price_history]
 
 
@@ -2614,12 +2615,12 @@ def _get_price_mds(brok: BrokerBase, symbol: str, exchange: str = "NSE", channel
             "channel": channel,
         }
         mds_history.publish("subscription_requests", json.dumps(request))
-        logger.info(
+        trading_logger.log_info(
             f"symbol:{symbol} MDS data stale, re-subscribing; returning last known price"
         )
         return Price.from_dict(history[0])
     # No MDS history yet — subscribe and fall back to REST only for the first call
-    logger.info(
+    trading_logger.log_info(
         f"symbol:{symbol} subscription received by {brok.broker.name}. exchange received in request:{exchange}, exchange sent in broker request:{mapped_exchange}"
     )
     out = get_price(brok, symbol, exchange=exchange)
@@ -2773,9 +2774,9 @@ try:
     from ohlcutils.data import load_symbol
     from ohlcutils.enums import Periodicity
 
-    _OHLCUTILS_AVAILABLE = True
+    _ohlcutils_available = True
 except ImportError:
-    _OHLCUTILS_AVAILABLE = False
+    _ohlcutils_available = False
     load_symbol = None  # type: ignore[assignment, misc]
     Periodicity = None  # type: ignore[assignment, misc]
 
@@ -2892,7 +2893,7 @@ def get_historical_close_at_time(
     if cached is not None:
         return cached
 
-    if _OHLCUTILS_AVAILABLE and load_symbol is not None and Periodicity is not None:
+    if _ohlcutils_available and load_symbol is not None and Periodicity is not None:
         try:
             date_str_fmt = date_str if "-" in date_str else f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
             df = load_symbol(
@@ -3008,7 +3009,7 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
     try:
         quote = get_price(brokers, long_symbol, exchange=exchange, mds=mds)
     except Exception as e:
-        logger.error(f"Error getting price for {long_symbol} on {exchange}: {e}")
+        trading_logger.log_error(f"Error getting price for {long_symbol} on {exchange}: {e}")
         return float("nan")
     mid = float("nan")
     if quote.bid > 0 and quote.ask > 0:
@@ -3087,21 +3088,20 @@ def get_option_underlying_price(
     if not fut_expiry:
         underlying = base + "_IND___" if is_index else base + "_STK___"
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
-        logger.debug(
-            "get_option_underlying_price: no fut_expiry underlying=%s price_f=%s",
-            underlying,
-            price_f,
+        trading_logger.log_debug(
+
+            f"get_option_underlying_price: no fut_expiry underlying={underlying} price_f={price_f}"
+
         )
     else:
         underlying = base + "_FUT_" + fut_expiry + "__"
         price_f = get_mid_price(brokers, underlying, exchange=exchange, mds=mds, last=last)
         if math.isnan(price_f):
             return None
-        logger.debug(
-            "get_option_underlying_price: fut_expiry=%s underlying=%s price_f (fut)=%s",
-            fut_expiry,
-            underlying,
-            price_f,
+        trading_logger.log_debug(
+
+            f"get_option_underlying_price: fut_expiry={fut_expiry} underlying={underlying} price_f (fut)={price_f}"
+
         )
     if math.isnan(price_f):
         return None
@@ -3124,12 +3124,10 @@ def get_option_underlying_price(
         if t_f is None or t_f == 0:
             return None
         price_f = price_u + (price_f - price_u) * t_o / t_f
-        logger.debug(
-            "get_option_underlying_price: index interpolated price_u=%s t_o=%s t_f=%s price_f=%s",
-            price_u,
-            t_o,
-            t_f,
-            price_f,
+        trading_logger.log_debug(
+
+            f"get_option_underlying_price: index interpolated price_u={price_u} t_o={t_o} t_f={t_f} price_f={price_f}"
+
         )
     return float(price_f)
 
@@ -3262,22 +3260,13 @@ def find_option_with_delta(
 
     # If we cannot determine a valid direction, return -1
     if math.isnan(delta_1) or math.isnan(delta_2):
-        logger.info(
-            "find_option_with_delta: no valid option strike found (direction inference failed). "
-            "price_f=%s target_delta=%s return_lower_delta=%s chain_len=%s strike_range=[%s, %s] "
-            "delta_1=%s delta_2=%s mid_strike=%s valid_delta_count=%s nan_delta_count=%s total_delta_checks=%s",
-            price_f,
-            target_delta,
-            return_lower_delta,
-            len(option_chain),
-            strike_lo,
-            strike_hi,
-            delta_1,
-            delta_2,
-            _strike(option_chain[mid]) if option_chain and mid < len(option_chain) else None,
-            valid_delta_count,
-            nan_delta_count,
-            total_delta_checks,
+        trading_logger.log_info(
+            f"find_option_with_delta: no valid option strike found (direction inference failed). "
+            f"price_f={price_f} target_delta={target_delta} return_lower_delta={return_lower_delta} "
+            f"chain_len={len(option_chain)} strike_range=[{strike_lo}, {strike_hi}] "
+            f"delta_1={delta_1} delta_2={delta_2} "
+            f"mid_strike={_strike(option_chain[mid]) if option_chain and mid < len(option_chain) else None} "
+            f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} total_delta_checks={total_delta_checks}"
         )
         return best_index
 
@@ -3342,16 +3331,10 @@ def find_option_with_delta(
                 right = mid - 1  # Search lower strikes for bigger deltas
 
     if best_index < 0:
-        logger.info(
-            "find_option_with_delta: no valid option strike found. "
-            "price_f=%s chain_len=%s strike_range=[%s, %s] valid_delta_count=%s nan_delta_count=%s total_delta_checks=%s",
-            price_f,
-            len(option_chain),
-            strike_lo,
-            strike_hi,
-            valid_delta_count,
-            nan_delta_count,
-            total_delta_checks,
+        trading_logger.log_warning(
+            f"find_option_with_delta: no valid option strike found. "
+            f"price_f={price_f} chain_len={len(option_chain)} strike_range=[{strike_lo}, {strike_hi}] "
+            f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} total_delta_checks={total_delta_checks}"
         )
     return best_index
 
@@ -3436,17 +3419,17 @@ def get_delta_strike(
         price_f = get_option_underlying_price(
             brokers, underlying_symbol, opt_expiry, fut_expiry, exchange=exchange, mds=mds, as_of=as_of
         )
-        logger.debug("get_delta_strike: price_f from get_option_underlying_price=%s", price_f)
+        trading_logger.log_debug(f"get_delta_strike: price_f from get_option_underlying_price={price_f}")
         if price_f is None:
-            logger.debug("get_delta_strike: no underlying price available from get_option_underlying_price")
+            trading_logger.log_debug("get_delta_strike: no underlying price available from get_option_underlying_price")
             return None
     elif as_of is not None:
         price_at = get_price_at_time(brokers[0], underlying_symbol, exchange, as_of=as_of, mds=mds, last=True)
         price_f = float(price_at) if price_at is not None else float("nan")
-        logger.debug("get_delta_strike: price_f from get_price_at_time(underlying)=%s", price_f)
+        trading_logger.log_debug(f"get_delta_strike: price_f from get_price_at_time(underlying)={price_f}")
     else:
         price_f = get_price(brokers, underlying_symbol, checks=["last"], exchange=exchange, mds=mds).last
-        logger.debug("get_delta_strike: price_f from get_price(underlying).last=%s", price_f)
+        trading_logger.log_debug(f"get_delta_strike: price_f from get_price(underlying).last={price_f}")
     option_chain = get_linked_options(brokers[0], underlying_symbol, opt_expiry, exchange)
     # option_chain = get_opt_chain(broker, underlying_symbol.split("_")[0], opt_expiry_yyyy_mm_dd)
     option_chain = [opt for opt in option_chain if f"_{option_type}_" in opt]
@@ -3457,10 +3440,10 @@ def get_delta_strike(
     if rounding is not None and rounding > 0:
         option_chain = [t for t in option_chain if abs(float(t.split("_")[4]) % rounding) < 1e-6]
     if len(option_chain) == 0:
-        logger.info(f"Option Chain not found for symbol: {underlying_symbol}")
+        trading_logger.log_info(f"Option Chain not found for symbol: {underlying_symbol}")
         return None
     if price_f is None or (isinstance(price_f, float) and math.isnan(price_f)):
-        logger.debug("get_delta_strike: invalid underlying price_f=%s", price_f)
+        trading_logger.log_debug(f"get_delta_strike: invalid underlying price_f={price_f}")
         return None
     index = find_option_with_delta(
         brokers,
@@ -3476,11 +3459,11 @@ def get_delta_strike(
     if index >= 0:
         return option_chain[index]
     else:
-        logger.debug("get_delta_strike: no option found (index=%s)", index)
+        trading_logger.log_debug(f"get_delta_strike: no option found (index={index})")
         return None
 
 
-def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds: Optional[str] = None) -> dict:
+def get_impact_cost(brokers: list[BrokerBase], symbol: str, exchange="NSE", mds: Optional[str] = None) -> dict[str, Any]:
     ticker = get_price(brokers, symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
     mid_price = (ticker.ask + ticker.bid) / 2
     if mid_price == 0 or math.isnan(mid_price):
@@ -3537,6 +3520,7 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
     sorted_pairs = sorted(zipped_pairs, reverse=True)
 
     # Unpack the sorted pairs into lists
+    sorted_triggers: tuple[Any, ...] | list[Any] | None = None
     if exchanges is not None:
         if not sorted_pairs:
             sorted_quantities = []
@@ -3630,12 +3614,12 @@ def place_combo_order(
     additional_infos: list[str] = [""],
     exchanges: list[str] = ["NSE"],
     price_broker: Optional[List[BrokerBase]] = None,
-    price_types: list = [],
+    price_types: list[str] = [],
     trigger_prices: Union[Sequence[float], float, None] = None,
     mds: Optional[str] = None,
     validate_db_position: bool = True,
     paper: bool = True,
-) -> dict:
+) -> dict[str, Any]:
     """Place a combo order with broker with enhanced error handling.
 
     Args:
@@ -3702,7 +3686,8 @@ def place_combo_order(
         )
     else:
         # trigger_prices is guaranteed to be a scalar (float/int) here, not a sequence
-        trigger_prices = [float(trigger_prices)] * len(symbols)  # type: ignore
+        assert isinstance(trigger_prices, (int, float))
+        trigger_prices = [float(trigger_prices)] * len(symbols)
 
     # Ensure all variables are lists for the zip operation
     assert isinstance(symbols, list)
@@ -3723,9 +3708,10 @@ def place_combo_order(
         additional_infos,
         trigger_prices,
     ) = _sort_list(symbols, quantities, price_types, additional_infos, exchanges, trigger_prices)
+    assert isinstance(trigger_prices, list)
     out = {}
     for symbol, exchange, quantity, price_type, additional_info, trigger_price in zip(
-        symbols, exchanges, quantities, price_types, additional_infos, trigger_prices  # type: ignore
+        symbols, exchanges, quantities, price_types, additional_infos, trigger_prices
     ):
         size = quantity
         if entry:
@@ -3750,7 +3736,7 @@ def place_combo_order(
         )
         if not math.isnan(temp_order.trigger_price):
             temp_order.is_stoploss_order = True
-        logger.info(f"{symbol} {exch} {size} {side}")
+        trading_logger.log_info(f"{symbol} {exch} {size} {side}")
         if entry:
             temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper, mds=mds)
             out[symbol] = temp
@@ -3789,7 +3775,7 @@ def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds: Optional[st
     pnl.reset_index(drop=True, inplace=True)
     for index, row in pnl.iterrows():
         if row["exit_quantity"] + row["entry_quantity"] != 0 and row["entry_price"] != 0:
-            logger.debug(f'Getting mtm for {row["symbol"]}')
+            trading_logger.log_debug(f'Getting mtm for {row["symbol"]}')
             exchange = "BSE" if "SENSEX" in row["symbol"] else "NSE"
             quote = get_price(
                 brokers,
@@ -3902,7 +3888,7 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
         """Fetch the price from Redis using the broker_order_id and ensure it matches the long_symbol."""
         if brok is None:
             return 0
-        order_data = cast(dict, brok.redis_o.hgetall(broker_order_id))
+        order_data = cast(dict[str, Any], brok.redis_o.hgetall(broker_order_id))
         if order_data.get("long_symbol") == long_symbol:
             return float(order_data.get("price", 0))
         return 0
@@ -4055,7 +4041,7 @@ def calc_pnl(trades: pd.DataFrame, brok: Optional[BrokerBase] = None):
     """
     broker_name = brok.broker.name if brok is not None else "UNDEFINED"
     if len(trades) == 0:
-        logger.info("No trades")
+        trading_logger.log_info("No trades")
         return trades
     trades = trades.copy()
     if broker_name is not None:
@@ -4122,7 +4108,7 @@ def register_strategy_capital(
             capital_dict = broker.get_available_capital()
             if not isinstance(capital_dict, dict):
                 # Fallback for old implementations that might still return float
-                logger.warning(f"get_available_capital returned non-dict type {type(capital_dict)}, converting to dict")
+                trading_logger.log_warning(f"get_available_capital returned non-dict type {type(capital_dict)}, converting to dict")
                 capital_dict = {
                     "cash": float(capital_dict) if isinstance(capital_dict, (int, float)) else 0.0,
                     "collateral": 0.0,
@@ -4132,13 +4118,13 @@ def register_strategy_capital(
             collateral = capital_dict.get("collateral", 0.0)
             capital_available = cash + collateral
         except Exception as e:
-            logger.warning(f"Failed to get available capital from broker {broker_name}: {e}")
+            trading_logger.log_warning(f"Failed to get available capital from broker {broker_name}: {e}")
             capital_dict = {"cash": 0.0, "collateral": 0.0}
             capital_available = 0.0
 
         # Connect to Redis DB 0
         redis_conn = redis.Redis(host=redis_host, db=0, port=redis_port, decode_responses=True)
-        logger.info(f"Connected to Redis at {redis_host}:{redis_port} DB 0 for capital registration")
+        trading_logger.log_info(f"Connected to Redis at {redis_host}:{redis_port} DB 0 for capital registration")
 
         # Define registration key
         if username:
@@ -4153,19 +4139,19 @@ def register_strategy_capital(
                 with redis_conn.pipeline() as pipe:
                     # Watch the key for changes
                     pipe.watch(registration_key)
-                    logger.info(f"Watching registration key: {registration_key}")
+                    trading_logger.log_info(f"Watching registration key: {registration_key}")
 
-                    # Get current data
-                    existing_data_str = pipe.get(registration_key)
-                    logger.info(
+                    # Get current data (read directly; pipe is in watch mode so reads are immediate)
+                    existing_data_str = redis_conn.get(registration_key)
+                    trading_logger.log_info(
                         f"Current registration data length: {len(existing_data_str) if existing_data_str else 0}"
                     )
 
                     if existing_data_str:
                         try:
-                            registration_data = json.loads(existing_data_str)  # type: ignore
+                            registration_data: dict[str, Any] = json.loads(existing_data_str)
                         except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse existing registration data for {date}, creating new")
+                            trading_logger.log_warning(f"Failed to parse existing registration data for {date}, creating new")
                             registration_data = {
                                 "date": date,
                                 "brokers": {},
@@ -4200,7 +4186,7 @@ def register_strategy_capital(
 
                     # Update last_updated timestamp
                     registration_data["last_updated"] = current_time
-                    logger.info(
+                    trading_logger.log_info(
                         f"Saving registration data with {len(registration_data.get('strategies', {}))} strategies and {len(registration_data.get('brokers', {}))} brokers"
                     )
 
@@ -4208,26 +4194,26 @@ def register_strategy_capital(
                     pipe.multi()
                     pipe.set(registration_key, json.dumps(registration_data))
                     result = pipe.execute()
-                    logger.info(f"Redis transaction executed for key {registration_key}, result: {result}")
+                    trading_logger.log_info(f"Redis transaction executed for key {registration_key}, result: {result}")
 
                 # Success - break out of retry loop
-                logger.info(f"Successfully updated capital registration for {strategy_name} with broker {broker_name}")
+                trading_logger.log_info(f"Successfully updated capital registration for {strategy_name} with broker {broker_name}")
                 break
 
             except redis.WatchError:
                 # Another client modified the key, retry
                 if attempt < max_retries - 1:
-                    logger.debug(
+                    trading_logger.log_debug(
                         f"Registration key {registration_key} modified by another client, retrying (attempt {attempt + 1}/{max_retries})"
                     )
                     continue
                 else:
-                    logger.error(
+                    trading_logger.log_error(
                         f"Failed to update registration data after {max_retries} attempts due to concurrent modifications"
                     )
                     return False
             except Exception as e:
-                logger.error(f"Unexpected error during registration update: {e}")
+                trading_logger.log_error(f"Unexpected error during registration update: {e}")
                 return False
 
         # Also register broker in strategy:broker_universe set
@@ -4245,12 +4231,12 @@ def register_strategy_capital(
             broker_universe_key = "strategy:broker_universe"
             broker_entry = f"{broker_name}:{redis_db}"
             redis_conn.sadd(broker_universe_key, broker_entry)
-            logger.debug(f"Added broker to strategy:broker_universe: {broker_entry}")
+            trading_logger.log_debug(f"Added broker to strategy:broker_universe: {broker_entry}")
         except Exception as e:
             # Non-critical error, log but don't fail the registration
-            logger.warning(f"Failed to register broker in strategy:broker_universe: {e}")
+            trading_logger.log_warning(f"Failed to register broker in strategy:broker_universe: {e}")
 
-        logger.info(
+        trading_logger.log_info(
             f"Registered strategy capital: {strategy_name} with broker {broker_name}, "
             f"allocated={capital_allocated}, broker_capital={capital_available}"
         )
@@ -4262,18 +4248,18 @@ def register_strategy_capital(
                 saved_json = json.loads(saved_data)
                 strategies = list(saved_json.get("strategies", {}).keys())
                 brokers = list(saved_json.get("brokers", {}).keys())
-                logger.info(
+                trading_logger.log_info(
                     f"Verification: Redis key {registration_key} contains strategies={strategies}, brokers={brokers}"
                 )
             else:
-                logger.error(
+                trading_logger.log_error(
                     f"Verification FAILED: Redis key {registration_key} is empty or missing after successful registration"
                 )
         except Exception as e:
-            logger.error(f"Verification FAILED: Could not read back Redis key {registration_key}: {e}")
+            trading_logger.log_error(f"Verification FAILED: Could not read back Redis key {registration_key}: {e}")
 
         return True
 
     except Exception as e:
-        logger.error(f"Failed to register strategy capital: {e}", exc_info=True)
+        trading_logger.log_error(f"Failed to register strategy capital: {e}", exc_info=True)
         return False
