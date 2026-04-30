@@ -29,6 +29,10 @@ def _validate_datetime_input(date_input):
         return True
     except (ValueError, TypeError):
         return False
+
+
+def _filter_epoch_historical_rows(rows: List["HistoricalData"]) -> List["HistoricalData"]:
+    return [row for row in rows if getattr(row, "date", None) != dt.datetime(1970, 1, 1)]
 from py5paisa import FivePaisaClient
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
@@ -2834,34 +2838,9 @@ class FivePaisa(BrokerBase):
                                     "data_shape": data.shape if data is not None else None,
                                 },
                             )
-                            historical_data_list.append(
-                                HistoricalData(
-                                    date=dt.datetime(1970, 1, 1),
-                                    open=float("nan"),
-                                    high=float("nan"),
-                                    low=float("nan"),
-                                    close=float("nan"),
-                                    volume=0,
-                                    intoi=0,
-                                    oi=0,
-                                )
-                            )
                     else:
                         trading_logger.log_debug("No data found for symbol", {"symbol": row_outer["long_symbol"]})
-                        historical_data_list.append(
-                            HistoricalData(
-                                date=dt.datetime(1970, 1, 1),
-                                open=float("nan"),
-                                high=float("nan"),
-                                low=float("nan"),
-                                close=float("nan"),
-                                volume=0,
-                                intoi=0,
-                                oi=0,
-                            )
-                        )
-
-                    out[row_outer["long_symbol"]] = historical_data_list
+                    out[row_outer["long_symbol"]] = _filter_epoch_historical_rows(historical_data_list)
 
                 except Exception as e:
                     trading_logger.log_error(

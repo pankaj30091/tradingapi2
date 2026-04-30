@@ -36,6 +36,10 @@ def _validate_datetime_input(date_input):
         return True
     except (ValueError, TypeError):
         return False
+
+
+def _filter_epoch_historical_rows(rows: List["HistoricalData"]) -> List["HistoricalData"]:
+    return [row for row in rows if getattr(row, "date", None) != dt.datetime(1970, 1, 1)]
 from NorenRestApiPy.NorenApi import NorenApi
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
@@ -2036,18 +2040,6 @@ class FlatTrade(BrokerBase):
                         historical_data_list.append(historical_data)
                 else:
                     trading_logger.log_debug("No data found for symbol", {"long_symbol": row_outer["long_symbol"]})
-                    historical_data_list.append(
-                        HistoricalData(
-                            date=dt.datetime(1970, 1, 1),
-                            open=float("nan"),
-                            high=float("nan"),
-                            low=float("nan"),
-                            close=float("nan"),
-                            volume=0,
-                            intoi=0,
-                            oi=0,
-                        )
-                    )
                 if periodicity == "1d" and date_end_dt.date() == get_tradingapi_now().date():
                     # make a call to permin data for start date and end date of today
                     if historical_data_list:
@@ -2113,7 +2105,7 @@ class FlatTrade(BrokerBase):
                                     oi=row["oi"],
                                 )
                                 historical_data_list.append(historical_data)
-                out[row_outer["long_symbol"]] = historical_data_list
+                out[row_outer["long_symbol"]] = _filter_epoch_historical_rows(historical_data_list)
 
             return out
         except Exception as e:

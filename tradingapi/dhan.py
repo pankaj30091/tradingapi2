@@ -84,6 +84,11 @@ def _historical_data_calendar_date(h: HistoricalData) -> Optional[dt.date]:
     return None
 
 
+def _filter_epoch_historical_rows(rows: List[HistoricalData]) -> List[HistoricalData]:
+    epoch_d = dt.date(1970, 1, 1)
+    return [row for row in rows if _historical_data_calendar_date(row) != epoch_d]
+
+
 def _validate_datetime_input(date_input):
     """Helper function to validate datetime input for decorators."""
     try:
@@ -1719,7 +1724,7 @@ class Dhan(BrokerBase):
                 if _is_nan(security_id):
                     exch_char, security_id, exchange_segment = self._resolve_symbol_lookup(long_symbol, exchange)
                 if security_id is None or exchange_segment is None:
-                    out[long_symbol] = [self._build_historical_placeholder()]
+                    out[long_symbol] = []
                     continue
                 security_id = int(security_id)
 
@@ -1756,7 +1761,7 @@ class Dhan(BrokerBase):
                     )
                 except Exception as e:
                     trading_logger.log_error("Dhan historical API error", e, {"symbol": long_symbol})
-                    out[long_symbol] = [self._build_historical_placeholder()]
+                    out[long_symbol] = []
                     continue
 
                 historical_data_list = []
@@ -1898,7 +1903,7 @@ class Dhan(BrokerBase):
                             ]
                             historical_data_list.append(today_bar)
 
-                out[long_symbol] = historical_data_list
+                out[long_symbol] = _filter_epoch_historical_rows(historical_data_list)
 
             return out
 

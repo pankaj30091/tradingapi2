@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple, Union, cast, Sequence
@@ -43,6 +44,7 @@ from .exceptions import (
 from .error_handling import retry_on_error, safe_execute, log_execution_time, handle_broker_errors, validate_inputs
 from . import trading_logger
 from .globals import get_tradingapi_now
+from .market_data_exchanges import broker_supports_market_data_exchange
 
 r = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 
@@ -78,6 +80,8 @@ sys.excepthook = my_handler
 config = get_config()
 mds_history = redis.Redis(db=1, encoding="utf-8", decode_responses=True)
 pubsub = mds_history.pubsub()
+hds_redis = redis.Redis(db=3, encoding="utf-8", decode_responses=True)
+_hds_rr_state = [0]  # round-robin counter for broker selection in get_historical_data
 
 empty_trades = pd.DataFrame(
     {
@@ -3853,6 +3857,164 @@ def historical_to_dataframes(historical_data: Dict[str, List[HistoricalData]]) -
             print(f"Error processing data for symbol {symbol}: {e}")
 
     return dataframes
+
+
+def _hds_json_default(obj):
+    if isinstance(obj, (dt.datetime, dt.date)) or hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not serializable")
+
+
+def _deserialize_historical(data_dict: dict) -> Dict[str, List[HistoricalData]]:
+    result: Dict[str, List[HistoricalData]] = {}
+    for symbol, bars in data_dict.items():
+        hd_list = []
+        for bar in bars:
+            date_val = bar.get("date")
+            if date_val:
+                parsed = pd.Timestamp(date_val)
+                if parsed.tzinfo is None:
+                    parsed = parsed.tz_localize("Asia/Kolkata")
+                else:
+                    parsed = parsed.tz_convert("Asia/Kolkata")
+            else:
+                parsed = pd.Timestamp("1970-01-01", tz="Asia/Kolkata")
+            hd_list.append(HistoricalData(
+                date=parsed,
+                open=float(bar.get("open", float("nan"))),
+                high=float(bar.get("high", float("nan"))),
+                low=float(bar.get("low", float("nan"))),
+                close=float(bar.get("close", float("nan"))),
+                volume=int(bar.get("volume", 0)),
+                intoi=int(bar.get("intoi", 0)),
+                oi=int(bar.get("oi", 0)),
+            ))
+        result[symbol] = hd_list
+    return result
+
+
+def get_historical_data(
+    brokers: Union[List[BrokerBase], BrokerBase],
+    symbol: str,
+    date_start: Union[str, "dt.datetime", "dt.date"],
+    date_end: Union[str, "dt.datetime", "dt.date"],
+    exchange: str = "NSE",
+    periodicity: str = "1m",
+    refresh_mapping: bool = False,
+    hds: Optional[str] = None,
+    redis_host: str = "localhost",
+    redis_port: int = 6379,
+    redis_db: int = 3,
+    timeout: int = 120,
+    max_attempts: int = 2,
+    bypass_cache: str = "",
+) -> Dict[str, List[HistoricalData]]:
+    """Fetch historical OHLCV data broker-agnostically.
+
+    When hds is provided the request is routed through a running
+    historical_data_server process via Redis pub/sub.  Without hds the
+    call is made directly to one of the supplied brokers with round-robin
+    load distribution and per-broker retry.
+
+    bypass_cache controls HDS Redis cache behaviour (ignored when hds is None):
+      ""      — normal cache read+write (default)
+      "read"  — skip cache read, fetch from broker, write result to cache
+      "write" — use cached data if available, do not write result to cache
+      "both"  — skip cache read and write entirely
+    """
+    if isinstance(brokers, BrokerBase):
+        brokers = [brokers]
+
+    # ------------------------------------------------------------------ #
+    # Direct broker path (no HDS)
+    # ------------------------------------------------------------------ #
+    if not hds:
+        exchange_upper = str(exchange).strip().upper()
+        candidates = [
+            b for b in brokers
+            if b.is_connected() and broker_supports_market_data_exchange(b.broker, exchange_upper)
+        ]
+        if not candidates:
+            raise MarketDataError(
+                f"No connected broker supports exchange {exchange} for get_historical_data",
+                {"symbol": symbol, "exchange": exchange},
+            )
+        n = len(candidates)
+        start = _hds_rr_state[0] % n
+        _hds_rr_state[0] += 1
+        ordered = candidates[start:] + candidates[:start]
+        last_exc: Optional[Exception] = None
+        for broker in ordered[:max_attempts]:
+            try:
+                result = broker.get_historical(
+                    symbol,
+                    date_start,
+                    date_end,
+                    exchange=exchange,
+                    periodicity=periodicity,
+                    refresh_mapping=refresh_mapping,
+                )
+                if result and any(len(v) > 0 for v in result.values()):
+                    return result
+                trading_logger.log_info(
+                    f"get_historical_data: empty result from {broker.broker.name}, trying next broker",
+                    {"symbol": symbol, "exchange": exchange, "periodicity": periodicity},
+                )
+            except Exception as e:
+                last_exc = e
+                trading_logger.log_info(
+                    f"get_historical_data: {broker.broker.name} raised {type(e).__name__}, trying next broker",
+                    {"symbol": symbol, "exchange": exchange, "error": str(e)},
+                )
+        raise MarketDataError(
+            f"get_historical_data: all {min(max_attempts, n)} broker attempts failed for {symbol}~{exchange}",
+            {"symbol": symbol, "exchange": exchange, "periodicity": periodicity, "last_error": str(last_exc)},
+        )
+
+    # ------------------------------------------------------------------ #
+    # HDS path — route through Redis pub/sub
+    # ------------------------------------------------------------------ #
+    request_id = str(uuid.uuid4())
+    response_channel = f"hds_response:{request_id}"
+    r_hds = redis.Redis(host=redis_host, port=redis_port, db=redis_db, encoding="utf-8", decode_responses=True)
+    ps = r_hds.pubsub()
+    ps.subscribe(response_channel)
+    request = {
+        "symbol": symbol,
+        "exchange": exchange,
+        "periodicity": periodicity,
+        "date_start": date_start if isinstance(date_start, str) else (
+            date_start.isoformat() if hasattr(date_start, "isoformat") else str(date_start)
+        ),
+        "date_end": date_end if isinstance(date_end, str) else (
+            date_end.isoformat() if hasattr(date_end, "isoformat") else str(date_end)
+        ),
+        "refresh_mapping": refresh_mapping,
+        "bypass_cache": bypass_cache,
+        "max_attempts": max_attempts,
+        "response_channel": response_channel,
+    }
+    r_hds.publish("historical_data_requests", json.dumps(request))
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            msg = ps.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if msg and msg["type"] == "message":
+                response = json.loads(msg["data"])
+                if response.get("status") == "error":
+                    raise MarketDataError(
+                        f"HDS error for {symbol}~{exchange}: {response.get('error', 'unknown')}",
+                        {"symbol": symbol, "exchange": exchange, "periodicity": periodicity},
+                    )
+                return _deserialize_historical(response.get("data", {}))
+    finally:
+        ps.unsubscribe(response_channel)
+        ps.close()
+        r_hds.close()
+    raise MarketDataError(
+        f"HDS timeout ({timeout}s) waiting for {symbol}~{exchange} {periodicity}",
+        {"symbol": symbol, "exchange": exchange, "periodicity": periodicity},
+    )
 
 
 def _get_active_commission_config(entry_date: str, config) -> str:

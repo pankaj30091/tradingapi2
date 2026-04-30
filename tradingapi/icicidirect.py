@@ -432,6 +432,11 @@ def _parse_api_date_to_kolkata(
     return dt_val.tz_localize(ICICIDIRECT_TIMEZONE)
 
 
+def _filter_epoch_historical_rows(rows: List[HistoricalData]) -> List[HistoricalData]:
+    epoch_d = dt.date(1970, 1, 1)
+    return [row for row in rows if pd.to_datetime(row.date).date() != epoch_d]
+
+
 def my_handler(typ, value, trace):
     """
     Unhandled exception hook for this module, consistent with other brokers.
@@ -2095,7 +2100,7 @@ class IciciDirect(BrokerBase):
                     )
 
             out.sort(key=lambda x: x.date)
-            return {symbol: out}
+            return {symbol: _filter_epoch_historical_rows(out)}
         except (ValidationError, SymbolError, MarketDataError):
             raise
         except Exception as e:
