@@ -76,10 +76,10 @@ def broker_capital(broker) -> float:
 def current_utilisation(broker, strategy_name: str) -> float:
     """Sum of margin currently consumed by open positions of this strategy.
 
-    Uses the broker's margin_available field from get_positions() if available,
-    otherwise falls back to querying get_pnl_table and reading stored margin from Redis.
+    Calls broker.get_margin_requirement() for each open position (net=False).
+    Exchange is read from Redis per position; defaults to NSE if missing.
     """
-    from tradingapi.utils import get_pnl_table
+    from tradingapi.utils import get_pnl_table, hget_with_default
 
     try:
         pnl = get_pnl_table(broker, strategy_name, refresh_status=True)
@@ -89,23 +89,30 @@ def current_utilisation(broker, strategy_name: str) -> float:
     if pnl.empty:
         return 0.0
 
-    # Open positions: entry_quantity + exit_quantity != 0, or no exit_time yet
     open_mask = (pnl["entry_quantity"].fillna(0) + pnl["exit_quantity"].fillna(0)) != 0
     exit_empty = pnl["exit_time"].fillna("").astype(str).str.strip().isin(["", "0", "NaT"])
     open_pnl = pnl.loc[open_mask | exit_empty]
 
-    if "margin" in open_pnl.columns:
-        total = open_pnl["margin"].fillna(0).astype(float).sum()
-        if total > 0:
-            return float(total)
-
-    # Fallback: read margin stored in Redis at entry time (keyed as <int_order_id>:margin)
     total = 0.0
-    for int_order_id in open_pnl.get("int_order_id", []):
+    for _, row in open_pnl.iterrows():
+        combo_symbol = str(row.get("symbol", "")).strip()
+        if not combo_symbol:
+            continue
+        net_qty = float(row.get("entry_quantity", 0) or 0) + float(row.get("exit_quantity", 0) or 0)
+        if net_qty == 0:
+            continue
+        # Signed: positive = long, negative = short.
+        # parse_combo_symbol handles both simple and combo symbols uniformly.
+        order_size = int(net_qty)
+
+        entry_keys_str = str(row.get("entry_keys", "")).strip()
+        first_key = entry_keys_str.split()[0] if entry_keys_str else ""
+        exchange = hget_with_default(broker, first_key, "exchange", "NSE") if first_key else "NSE"
+
         try:
-            val = broker.redis_o.hget(str(int_order_id), "margin")
-            if val:
-                total += float(val)
+            margin = broker.get_margin_requirement(combo_symbol, order_size, exchange)
+            if margin is not None:
+                total += float(margin)
         except Exception:
             pass
     return total
