@@ -778,7 +778,7 @@ class Dhan(BrokerBase):
         combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         order_size=lambda x: isinstance(x, (int, float)) and int(x) != 0,
     )
-    def get_margin_requirement(self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds=None) -> float:
+    def get_margin_requirement(self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds=None, net: bool = False) -> float:
         """Return basket margin required for a single-leg or multi-leg combo."""
         try:
             if self.api is None:
@@ -826,8 +826,8 @@ class Dhan(BrokerBase):
 
             payload = {
                 "dhanClientId": self.api.client_id,
-                "includePosition": False,
-                "includeOrder": False,
+                "includePosition": net,
+                "includeOrder": net,
                 "includeOrders": False,
                 "scripList": scripts,
                 "scripts": scripts,

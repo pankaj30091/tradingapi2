@@ -39,6 +39,7 @@ from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, 
 from .config import get_config
 from .utils import (
     delete_broker_order_id,
+    get_price,
     json_serializer_default,
     parse_combo_symbol,
     set_starting_internal_ids_int,
@@ -47,6 +48,7 @@ from .utils import (
 from .exceptions import (
     ConfigurationError,
     DataError,
+    MarginError,
     RedisError,
     SymbolError,
     TradingAPIError,
@@ -839,6 +841,130 @@ class FivePaisa(BrokerBase):
                 restore_proxy_env(previous_proxy_env)
             except Exception:
                 pass
+
+    @log_execution_time
+    @validate_inputs(
+        combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        order_size=lambda x: isinstance(x, (int, float)) and int(x) != 0,
+    )
+    def get_margin_requirement(self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds=None, net: bool = False) -> float:
+        """Return margin requirement via py5paisa multi_order_Margin API."""
+        try:
+            if self.api is None:
+                raise BrokerConnectionError("FivePaisa API not connected")
+
+            exch_key = str(exchange or "").upper()[0]
+            if exch_key not in self.exchange_mappings:
+                raise MarginError(f"Exchange {exchange!r} not loaded in symbol map")
+
+            symbol_map = self.exchange_mappings[exch_key]["symbol_map"]
+            exchange_map = self.exchange_mappings[exch_key]["exchange_map"]
+            exchangetype_map = self.exchange_mappings[exch_key]["exchangetype_map"]
+
+            order_requests = []
+            for long_symbol, leg_ratio in parse_combo_symbol(combo_symbol).items():
+                net_qty = int(order_size) * int(leg_ratio)
+                if net_qty == 0:
+                    continue
+
+                scrip_code = symbol_map.get(long_symbol)
+                if scrip_code is None:
+                    raise MarginError(f"ScripCode not found for {long_symbol!r}")
+
+                exch = exchange_map.get(long_symbol, "N")
+                exch_type = exchangetype_map.get(long_symbol, "D")
+                order_type = "BUY" if net_qty > 0 else "SELL"
+
+                quote = get_price(self, long_symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
+                price_candidates = [quote.last, quote.ask, quote.bid, quote.prior_close]
+                price = next((float(v) for v in price_candidates if not pd.isna(v) and float(v) > 0), 0.0)
+
+                order_requests.append({
+                    "Exch": exch,
+                    "ExchType": exch_type,
+                    "ScripCode": int(scrip_code),
+                    "Price": price,
+                    "Qty": abs(net_qty),
+                    "OrderType": order_type,
+                    "IsIntraday": False,
+                })
+
+            if not order_requests:
+                raise MarginError(f"No valid legs resolved from combo_symbol={combo_symbol!r}")
+
+            result = self.api.multi_order_Margin(
+                CoverPositions="Y" if net else "N",
+                OrderRequests=order_requests,
+            )
+
+            if result is None:
+                raise MarginError("multi_order_Margin returned None")
+
+            # Response is typically {"body": {"TotalMargin": ...}} or {"TotalMargin": ...}
+            body = result.get("body", result)
+            total = body.get("TotalMarginRequired")
+            if total is None:
+                raise MarginError(f"Unexpected multi_order_Margin response: {result}")
+            if float(total) < 0:
+                raise MarginError(f"multi_order_Margin returned {total} (market may be closed or scrip invalid)")
+
+            return float(total)
+
+        except (ValidationError, MarginError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                combo_symbol=combo_symbol,
+                order_size=order_size,
+                exchange=exchange,
+                error=str(e),
+            )
+            raise MarginError(f"Failed to calculate FivePaisa margin requirement: {str(e)}", context)
+
+    @log_execution_time
+    @validate_inputs(
+        combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        order_size=lambda x: isinstance(x, (int, float)) and int(x) != 0,
+    )
+    def get_margin_requirement_new(self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds=None) -> float:
+        """Return local NSE SPAN margin for a single-leg or multi-leg combo."""
+        try:
+            if str(exchange or "").upper() not in ("NSE", "N"):
+                raise MarginError(f"FivePaisa SPAN margin currently supports NSE only, got exchange={exchange}")
+
+            from .span import SpanEngine
+
+            span_cache_dir = os.path.join(config.get("datapath", os.getcwd()), "span_cache")
+            engine = SpanEngine(
+                download_dir=span_cache_dir,
+                lot_size_lookup=lambda symbol: self.get_min_lot_size(symbol, exchange=exchange),
+            )
+
+            for long_symbol, leg_ratio in parse_combo_symbol(combo_symbol).items():
+                net_qty = int(order_size) * int(leg_ratio)
+                if net_qty == 0:
+                    continue
+
+                quote = self.get_quote(long_symbol, exchange=exchange)
+                price_candidates = [quote.last, quote.ask, quote.bid, quote.prior_close]
+                price = next((float(v) for v in price_candidates if not pd.isna(v) and float(v) > 0), None)
+                if price is None:
+                    raise MarginError(f"No usable market price found for {long_symbol}")
+
+                engine.add_position(long_symbol, net_qty, price)
+
+            return float(engine.calculate_margin()["total_margin"])
+
+        except (ValidationError, MarginError):
+            raise
+        except Exception as e:
+            context = create_error_context(
+                combo_symbol=combo_symbol,
+                order_size=order_size,
+                exchange=exchange,
+                error=str(e),
+            )
+            raise MarginError(f"Failed to calculate FivePaisa margin requirement: {str(e)}", context)
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)

@@ -1214,7 +1214,20 @@ def get_open_position_by_order(
             entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()  # type: ignore  # type: ignore
             entry_key = entry_keys[0]
             exchange = hget_with_default(broker, entry_key, "exchange", "NSE")  # type: ignore
-            exit_price = broker.get_quote(symbol, exchange).last  # type: ignore
+            quote = broker.get_quote(symbol, exchange)  # type: ignore
+            exit_price = quote.last if quote is not None else 0.0
+            # Guard against non-finite quote values when creating synthetic
+            # expiry squareoff orders; Redis should not store "nan"/"inf" prices.
+            try:
+                exit_price = float(exit_price)
+            except (TypeError, ValueError):
+                exit_price = 0.0
+            if not math.isfinite(exit_price):
+                exit_price = 0.0
+            # Some brokers publish 0.05 as the terminal OTM expiry tick.
+            # Normalize this artifact to 0.0 for expiry paper exits.
+            if isinstance(exit_price, (int, float)) and math.isclose(float(exit_price), 0.05, rel_tol=0.0, abs_tol=1e-9):
+                exit_price = 0.0
             exit_quantity = abs(size)
             sq_off_order = Order(
                 order_type="SELL" if size > 0 else "COVER",
@@ -4049,17 +4062,49 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
     def get_redis_price(broker_order_id: str, long_symbol: str, brok: Optional[BrokerBase] = None):
         """Fetch the price from Redis using the broker_order_id and ensure it matches the long_symbol."""
         if brok is None:
-            return 0
+            return np.nan
         order_data = cast(dict[str, Any], brok.redis_o.hgetall(broker_order_id))
         if order_data.get("long_symbol") == long_symbol:
             return float(order_data.get("price", 0))
-        return 0
+        return np.nan
+
+    def is_expiry_paper_exit(broker_order_id: str, long_symbol: str, brok: Optional[BrokerBase] = None) -> bool:
+        """Return True when the exit order is an expiry paper square-off."""
+        if brok is None:
+            return False
+        order_data = cast(dict[str, Any], brok.redis_o.hgetall(broker_order_id))
+        if order_data.get("long_symbol") != long_symbol:
+            return False
+        exchange = str(order_data.get("exchange", "") or "").upper()
+        message = str(order_data.get("message", "") or "").upper()
+        return exchange == "SQUAREOFF" or "EXPIRATION PAPER ORDER" in message
+
+    def get_exchange_for_order(broker_order_id: str, long_symbol: str, brok: Optional[BrokerBase]) -> str:
+        """Return the exchange for this order key, defaulting to NSE."""
+        if brok is None:
+            return "NSE"
+        order_data = cast(dict[str, Any], brok.redis_o.hgetall(broker_order_id))
+        if order_data.get("long_symbol") != long_symbol:
+            return "NSE"
+        raw = str(order_data.get("exchange", "") or "NSE").strip().upper()
+        if not raw:
+            return "NSE"
+        if raw == "N":
+            return "NSE"
+        if raw == "B":
+            return "BSE"
+        return raw or "NSE"
 
     broker_name = brok.broker.name if brok is not None else "UNDEFINED"
 
     if "commission" not in dataframe.columns:
         dataframe["commission"] = 0.0
+    else:
+        dataframe["commission"] = pd.to_numeric(dataframe["commission"], errors="coerce").fillna(0.0).astype(float)
+    dataframe["entry_commission"] = 0.0
+    dataframe["exit_commission"] = 0.0
 
+    dataframe = dataframe.reset_index(drop=True)
     for index, row in dataframe.iterrows():
         symbol_str = str(row["symbol"])
         symbol_parts = symbol_str.split("_", 2)
@@ -4077,6 +4122,8 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
         exit_keys_str = str(row.get("exit_keys", ""))
         exit_keys = exit_keys_str.split(" ") if exit_keys_str else []
         total_commission = 0
+        total_entry_commission = 0.0
+        total_exit_commission = 0.0
         if len(legs) > 1 and brok is None:
             raise ValueError("brok needs to be specfied for combo trades")
         for leg in legs:
@@ -4098,17 +4145,26 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
             # Find the correct entry and exit keys for this leg
             entry_price = None
             exit_price = None
+            entry_exchange = "NSE"
+            exit_exchange = "NSE"
+            matched_entry_key: Optional[str] = None
+            matched_exit_key: Optional[str] = None
 
+            # First finite Redis price per leg (negative allowed); reject nan/inf.
             for entry_key in entry_keys:
                 price = get_redis_price(entry_key, leg_symbol, brok)
-                if price > 0:
+                if math.isfinite(price):
                     entry_price = price
+                    entry_exchange = get_exchange_for_order(entry_key, leg_symbol, brok)
+                    matched_entry_key = entry_key
                     break
 
             for exit_key in exit_keys:
                 price = get_redis_price(exit_key, leg_symbol, brok)
-                if price > 0:
+                if math.isfinite(price):
                     exit_price = price
+                    exit_exchange = get_exchange_for_order(exit_key, leg_symbol, brok)
+                    matched_exit_key = exit_key
                     break
 
             # Fallback to row's entry_price and exitPrice if not found in Redis
@@ -4117,21 +4173,21 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
             exit_price = exit_price if exit_price is not None else row["exit_price"] if len(legs) == 1 else 0
 
             # Fetch commission rates for the entry trade
-            flat_rate = config.get_commission_by_date(entry_date, f"{broker_name}.{symbol_type}.{trade_side}.flat", 0)
+            flat_rate = config.get_commission_by_date(entry_date, f"{broker_name}.{entry_exchange}.{symbol_type}.{trade_side}.flat", 0)
             per_commission = config.get_commission_by_date(
-                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.commission", 0
+                entry_date, f"{broker_name}.{entry_exchange}.{symbol_type}.{trade_side}.percentage.commission", 0
             )
             per_stt = config.get_commission_by_date(
-                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.stt", 0
+                entry_date, f"{broker_name}.{entry_exchange}.{symbol_type}.{trade_side}.percentage.stt", 0
             )
             per_exchange = config.get_commission_by_date(
-                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.exchange", 0
+                entry_date, f"{broker_name}.{entry_exchange}.{symbol_type}.{trade_side}.percentage.exchange", 0
             )
             per_sebi = config.get_commission_by_date(
-                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.sebi", 0
+                entry_date, f"{broker_name}.{entry_exchange}.{symbol_type}.{trade_side}.percentage.sebi", 0
             )
             per_stampduty = config.get_commission_by_date(
-                entry_date, f"{broker_name}.{symbol_type}.{trade_side}.percentage.stampduty", 0
+                entry_date, f"{broker_name}.{entry_exchange}.{symbol_type}.{trade_side}.percentage.stampduty", 0
             )
 
             # Calculate the total commission for the entry trade
@@ -4146,22 +4202,30 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
             )
 
             # Fetch commission rates for the exit trade
-            flat_rate = config.get_commission_by_date(exit_date, f"{broker_name}.{symbol_type}.{exit_side}.flat", 0)
+            flat_rate = config.get_commission_by_date(exit_date, f"{broker_name}.{exit_exchange}.{symbol_type}.{exit_side}.flat", 0)
             per_commission = config.get_commission_by_date(
-                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.commission", 0
+                exit_date, f"{broker_name}.{exit_exchange}.{symbol_type}.{exit_side}.percentage.commission", 0
             )
             per_stt = config.get_commission_by_date(
-                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.stt", 0
+                exit_date, f"{broker_name}.{exit_exchange}.{symbol_type}.{exit_side}.percentage.stt", 0
             )
             per_exchange = config.get_commission_by_date(
-                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.exchange", 0
+                exit_date, f"{broker_name}.{exit_exchange}.{symbol_type}.{exit_side}.percentage.exchange", 0
             )
             per_sebi = config.get_commission_by_date(
-                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.sebi", 0
+                exit_date, f"{broker_name}.{exit_exchange}.{symbol_type}.{exit_side}.percentage.sebi", 0
             )
             per_stampduty = config.get_commission_by_date(
-                exit_date, f"{broker_name}.{symbol_type}.{exit_side}.percentage.stampduty", 0
+                exit_date, f"{broker_name}.{exit_exchange}.{symbol_type}.{exit_side}.percentage.stampduty", 0
             )
+
+            # For expiry paper exits, waive only brokerage.
+            # Keep statutory levies (STT/exchange/SEBI/stamp duty) unchanged.
+            for exit_key in exit_keys:
+                if is_expiry_paper_exit(exit_key, leg_symbol, brok):
+                    flat_rate = 0
+                    per_commission = 0
+                    break
 
             # Calculate the total commission for the exit trade
             exit_trade_value = abs(row["exit_quantity"] * abs(leg_size) * exit_price)
@@ -4174,11 +4238,22 @@ def _update_commissions(dataframe: pd.DataFrame, brok: Optional[BrokerBase] = No
                 + (per_stampduty / 100 * exit_trade_value)
             )
 
+            # Write commission back to the matched Redis keys
+            if brok is not None:
+                if matched_entry_key is not None:
+                    brok.redis_o.hset(matched_entry_key, "commission", round(entry_commission, 2))
+                if matched_exit_key is not None:
+                    brok.redis_o.hset(matched_exit_key, "commission", round(exit_commission, 2))
+
             # Sum up the commission for this leg
             total_commission += entry_commission + exit_commission
+            total_entry_commission += entry_commission
+            total_exit_commission += exit_commission
 
         # Update the dataframe with the total commission for the combo symbol
-        dataframe.at[index, "commission"] = round(float(total_commission), 0)
+        dataframe.at[index, "commission"] = round(float(total_commission), 2)
+        dataframe.at[index, "entry_commission"] = round(total_entry_commission, 2)
+        dataframe.at[index, "exit_commission"] = round(total_exit_commission, 2)
 
     return dataframe
 

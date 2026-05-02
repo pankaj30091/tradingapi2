@@ -1076,7 +1076,7 @@ class BrokerBase(ABC):
         pass
 
     def get_margin_requirement(
-        self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds: Optional[str] = None
+        self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds: Optional[str] = None, net: bool = False
     ) -> Optional[float]:
         """Default broker margin hook. Brokers can override if supported."""
         _get_trading_logger().log_warning(
