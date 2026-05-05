@@ -28,7 +28,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from .broker_base import BrokerBase, HistoricalData, Order, OrderInfo, OrderStatus, Position, Price
-from .config import get_config
+from .config import get_config, get_fno_freeze_limit
 from .exceptions import (
     SymbolError,
     TradingAPIError,
@@ -3615,6 +3615,45 @@ def _sort_list(symbols, quantities, price_types, additional_info, exchanges=None
             )
 
 
+def _is_fno_symbol(symbol: str) -> bool:
+    first_leg = str(symbol or "").split(":")[0].split("?")[0].strip()
+    return "_OPT_" in first_leg or "_FUT_" in first_leg
+
+
+def _compute_slices(total: int, max_per_order: Optional[int]) -> List[int]:
+    total = int(total)
+    if total <= 0:
+        return []
+    if not max_per_order or int(max_per_order) <= 0 or total <= int(max_per_order):
+        return [total]
+    n = int(max_per_order)
+    return [n] * (total // n) + ([total % n] if total % n else [])
+
+
+def _get_freeze_limit_lots(broker: BrokerBase, combo_symbol: str) -> Optional[int]:
+    """Return max combo-units per order for the FNO underlying in combo_symbol.
+
+    Config values are in total contracts (= lots × lot_size).  The returned
+    value is in combo-units so that: combo_units × max_leg_size ≤ limit_contracts.
+    Returns None for non-FNO symbols or when no limit is configured.
+    """
+    first_leg = str(combo_symbol or "").split(":")[0].split("?")[0].strip()
+    if "_OPT_" not in first_leg and "_FUT_" not in first_leg:
+        return None
+    underlying = first_leg.split("_")[0]
+    broker_name = getattr(getattr(broker, "broker", None), "name", "") or ""
+    limit_contracts = get_fno_freeze_limit(broker_name, underlying)
+    if not limit_contracts:
+        return None
+    legs = parse_combo_symbol(combo_symbol)
+    if not legs:
+        return None
+    max_leg_size = max(abs(int(q)) for q in legs.values())
+    if max_leg_size <= 0:
+        return None
+    return max(1, int(limit_contracts) // max_leg_size)
+
+
 @log_execution_time
 @validate_inputs(
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
@@ -3636,6 +3675,7 @@ def place_combo_order(
     mds: Optional[str] = None,
     validate_db_position: bool = True,
     paper: bool = True,
+    freeze_limit_lots: Optional[int] = None,
 ) -> dict[str, Any]:
     """Place a combo order with broker with enhanced error handling.
 
@@ -3726,46 +3766,104 @@ def place_combo_order(
         trigger_prices,
     ) = _sort_list(symbols, quantities, price_types, additional_infos, exchanges, trigger_prices)
     assert isinstance(trigger_prices, list)
+
+    # Auto-detect freeze limit from config if not explicitly provided.
+    # FNO symbols without a configured limit are refused — placing an oversized
+    # FNO order without a freeze limit is unsafe.
+    if freeze_limit_lots is None and symbols:
+        first_sym = symbols[0]
+        if _is_fno_symbol(first_sym):
+            freeze_limit_lots = _get_freeze_limit_lots(execution_broker, first_sym)
+            if freeze_limit_lots is None:
+                first_leg = first_sym.split(":")[0].split("?")[0].strip()
+                underlying = first_leg.split("_")[0]
+                broker_name = getattr(getattr(execution_broker, "broker", None), "name", "") or ""
+                trading_logger.log_error(
+                    f"freeze_limit not configured for FNO "
+                    f"underlying={underlying} broker={broker_name}; "
+                    f"order skipped symbol={first_sym}"
+                )
+                return {}
+
     out = {}
     for symbol, exchange, quantity, price_type, additional_info, trigger_price in zip(
         symbols, exchanges, quantities, price_types, additional_infos, trigger_prices
     ):
-        size = quantity
         if entry:
-            side = "BUY" if size > 0 else "SHORT"
+            side = "BUY" if quantity > 0 else "SHORT"
         else:
-            side = "COVER" if size > 0 else "SELL"
-        size = abs(size)
+            side = "COVER" if quantity > 0 else "SELL"
+
+        slices = _compute_slices(abs(int(quantity)), freeze_limit_lots)
+        if len(slices) > 1:
+            trading_logger.log_info(
+                f"freeze slicing symbol={symbol} total_qty={abs(int(quantity))} "
+                f"max_per_order={freeze_limit_lots} slices={slices} entry={entry}"
+            )
+
+        # Pre-allocate one internal_order_id shared across all slices (entry only).
+        # transmit_entry_order honours a pre-set order.internal_order_id, so all
+        # slices' broker_order_ids accumulate under the same entry_keys in Redis.
+        symbol_shared_id: Optional[str] = None
+        if entry and len(slices) > 1:
+            next_id = execution_broker.starting_order_ids_int.get(strategy, 1)
+            execution_broker.starting_order_ids_int[strategy] = next_id + 1
+            symbol_shared_id = f"{strategy}_{next_id}"
+
         exch = exchange
         exch_type = execution_broker.exchange_mappings[exch]["exchangetype_map"].get(symbol.split("?")[0])
-        temp_order = Order(
-            order_type=side,
-            quantity=size,
-            exchange=exch,
-            exchange_segment=exch_type,
-            is_intraday=False,
-            price=float("nan"),
-            ahplaced="N",
-            long_symbol=symbol,
-            price_type=price_type,
-            additional_info=additional_info,
-            trigger_price=trigger_price,
-        )
-        if not math.isnan(temp_order.trigger_price):
-            temp_order.is_stoploss_order = True
-        trading_logger.log_info(f"{symbol} {exch} {size} {side}")
-        if entry:
-            temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper, mds=mds)
-            out[symbol] = temp
-        else:
-            transmit_exit_order(
-                execution_broker,
-                strategy,
-                temp_order,
-                validate_db_position,
-                paper=paper,
-                mds=mds,
+
+        for idx, slice_qty in enumerate(slices, start=1):
+            slice_additional_info = additional_info
+            if len(slices) > 1:
+                slice_meta = json.dumps(
+                    {
+                        "freeze_limited_order_size": freeze_limit_lots,
+                        "requested_quantity": abs(int(quantity)),
+                        "slice_count": len(slices),
+                        "slice_index": idx,
+                        "slice_quantity": slice_qty,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                try:
+                    slice_additional_info = _merge_additional_info(additional_info, slice_meta)
+                except Exception:
+                    slice_additional_info = additional_info
+
+            temp_order = Order(
+                order_type=side,
+                quantity=int(slice_qty),
+                exchange=exch,
+                exchange_segment=exch_type,
+                is_intraday=False,
+                price=float("nan"),
+                ahplaced="N",
+                long_symbol=symbol,
+                price_type=price_type,
+                additional_info=slice_additional_info,
+                trigger_price=trigger_price,
             )
+            if symbol_shared_id:
+                temp_order.internal_order_id = symbol_shared_id
+            if not math.isnan(temp_order.trigger_price):
+                temp_order.is_stoploss_order = True
+            trading_logger.log_info(f"{symbol} {exch} {slice_qty} {side} slice={idx}/{len(slices)}")
+            if entry:
+                temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper, mds=mds)
+                out[symbol] = temp
+            else:
+                transmit_exit_order(
+                    execution_broker,
+                    strategy,
+                    temp_order,
+                    validate_db_position,
+                    paper=paper,
+                    mds=mds,
+                )
+            if idx < len(slices):
+                time.sleep(5)
     return out
 
 

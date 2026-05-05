@@ -40,7 +40,7 @@ def _validate_datetime_input(date_input):
 
 def _filter_epoch_historical_rows(rows: List["HistoricalData"]) -> List["HistoricalData"]:
     return [row for row in rows if getattr(row, "date", None) != dt.datetime(1970, 1, 1)]
-from NorenRestApiPy.NorenApi import NorenApi
+from NorenRestApiPy.NorenApi import NorenApi, position as FlatTradePosition
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
 from .config import get_config
@@ -52,6 +52,7 @@ from .error_handling import validate_inputs, log_execution_time, retry_on_error
 from .exceptions import (
     ConfigurationError,
     DataError,
+    MarginError,
     RedisError,
     SymbolError,
     TradingAPIError,
@@ -1013,6 +1014,86 @@ class FlatTrade(BrokerBase):
         except Exception as e:
             trading_logger.log_error("Error getting available capital", e, {"broker": self.broker.name})
             raise MarketDataError(f"Failed to get available capital: {str(e)}")
+
+    def get_margin_requirement(self, combo_symbol: str, order_size: int, exchange: str = "NSE", mds=None, net: bool = False) -> float:
+        """Return margin requirement via FlatTrade ``span_calculator`` (Noren API)."""
+        if self.api is None:
+            raise BrokerConnectionError("FlatTrade API not connected")
+
+        exch_key = str(exchange or "").upper()[0]
+        if exch_key not in self.exchange_mappings:
+            raise MarginError(f"Exchange {exchange!r} not loaded in symbol map")
+
+        exchange_map = self.exchange_mappings[exch_key]["exchange_map"]
+
+        # Build set of index base symbols from _IND___ entries across all exchanges
+        index_bases: set[str] = set()
+        for mapping in self.exchange_mappings.values():
+            for sym in mapping["symbol_map"]:
+                if sym.endswith("_IND___"):
+                    index_bases.add(sym.split("_")[0])
+
+        positions = []
+        for long_symbol, leg_ratio in parse_combo_symbol(combo_symbol).items():
+            net_qty = int(order_size) * int(leg_ratio)
+            if net_qty == 0:
+                continue
+
+            parts = long_symbol.split("_")
+            if len(parts) < 5:
+                raise MarginError(f"Cannot parse long_symbol {long_symbol!r} for span_calculator")
+
+            base, inst_type, expiry_str = parts[0], parts[1], parts[2]
+            opt_side, strike = parts[3], parts[4]
+
+            try:
+                dt.datetime.strptime(expiry_str, "%Y%m%d")
+                exd_int = int(expiry_str)
+            except ValueError:
+                raise MarginError(f"Cannot parse expiry date in {long_symbol!r}")
+
+            is_index = base in index_bases
+            if inst_type == "FUT":
+                instname = "FUTIDX" if is_index else "FUTSTK"
+                optt = "XX"
+                strprc_val = -1.0
+            elif inst_type == "OPT":
+                instname = "OPTIDX" if is_index else "OPTSTK"
+                optt = "PE" if opt_side == "PUT" else "CE"
+                strprc_val = float(strike)
+            else:
+                raise MarginError(f"Unknown instrument type {inst_type!r} in {long_symbol!r}")
+
+            exch = exchange_map.get(long_symbol)
+            if exch is None:
+                raise MarginError(f"Exchange not found for {long_symbol!r}")
+
+            pos = FlatTradePosition()
+            pos.prd = "M"
+            pos.exch = exch
+            pos.instname = instname
+            pos.symname = base
+            pos.exd = exd_int
+            pos.optt = optt
+            pos.strprc = strprc_val
+            pos.buyqty = abs(net_qty) if net_qty > 0 else 0
+            pos.sellqty = abs(net_qty) if net_qty < 0 else 0
+            pos.netqty = net_qty
+            positions.append(pos)
+
+        if not positions:
+            raise MarginError(f"No valid legs resolved from combo_symbol={combo_symbol!r}")
+
+        actid = config.get(f"{self.account_key}.USER") or ""
+        result = self.api.span_calculator(actid, positions)
+
+        if result is None or result.get("stat") != "Ok":
+            raise MarginError(f"span_calculator failed: {result}")
+
+        span = float(result.get("span", 0) or 0)
+        expo = float(result.get("expo", 0) or 0)
+        return span + expo
+
 
     @log_execution_time
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)

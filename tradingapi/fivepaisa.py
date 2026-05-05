@@ -35,6 +35,60 @@ def _filter_epoch_historical_rows(rows: List["HistoricalData"]) -> List["Histori
     return [row for row in rows if getattr(row, "date", None) != dt.datetime(1970, 1, 1)]
 from py5paisa import FivePaisaClient
 
+
+def _patch_py5paisa_for_mom(api) -> None:
+    """Fix three upstream py5paisa bugs that break multi_order_Margin:
+
+      1. session is httpx.Client with 5s default timeout. Bump to 10s as a
+         safety margin (normal MOM responses are sub-second).
+      2. self.payload = GENERIC_PAYLOAD is a reference assignment, so each
+         call accumulates stale body keys across calls; the polluted body
+         makes the 5paisa server hang past 5s. Reset to a fresh deep copy
+         before each MOM call.
+      3. order_request() does log_response(res["body"]["Message"]) for the
+         MOM branch, but the MOM response has no "Message" key — the KeyError
+         is raised at the subscript (not inside log_response), is swallowed
+         by the bare except, and the function silently returns None. Inject
+         an empty "Message" into the response by wrapping session.post for
+         the duration of the MOM call so the subscript succeeds and
+         res["body"] is returned normally.
+    """
+    if getattr(api, "_tradingapi_patched", False):
+        return
+
+    import copy
+    from py5paisa.const import GENERIC_PAYLOAD
+
+    try:
+        api.session.timeout = 10
+    except Exception:
+        pass
+
+    original_mom = api.multi_order_Margin
+    original_post = api.session.post
+
+    def post_with_message_key(*args, **kwargs):
+        response = original_post(*args, **kwargs)
+        try:
+            data = response.json()
+            if isinstance(data, dict) and isinstance(data.get("body"), dict):
+                data["body"].setdefault("Message", "")
+                response.json = lambda: data  # type: ignore[method-assign]
+        except Exception:
+            pass
+        return response
+
+    def fixed_multi_order_Margin(**order):
+        api.payload = copy.deepcopy(GENERIC_PAYLOAD)
+        api.session.post = post_with_message_key  # type: ignore[method-assign]
+        try:
+            return original_mom(**order)
+        finally:
+            api.session.post = original_post  # type: ignore[method-assign]
+
+    api.multi_order_Margin = fixed_multi_order_Margin
+    api._tradingapi_patched = True
+
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
 from .config import get_config
 from .utils import (
@@ -873,7 +927,7 @@ class FivePaisa(BrokerBase):
 
                 exch = exchange_map.get(long_symbol, "N")
                 exch_type = exchangetype_map.get(long_symbol, "D")
-                order_type = "BUY" if net_qty > 0 else "SELL"
+                order_type = "B" if net_qty > 0 else "S"
 
                 quote = get_price(self, long_symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
                 price_candidates = [quote.last, quote.ask, quote.bid, quote.prior_close]
@@ -883,30 +937,29 @@ class FivePaisa(BrokerBase):
                     "Exch": exch,
                     "ExchType": exch_type,
                     "ScripCode": int(scrip_code),
+                    "ScripData": "",
+                    "PlaceModifyCancel": "P",
+                    "OrderType": order_type,
                     "Price": price,
                     "Qty": abs(net_qty),
-                    "OrderType": order_type,
                     "IsIntraday": False,
                 })
 
             if not order_requests:
                 raise MarginError(f"No valid legs resolved from combo_symbol={combo_symbol!r}")
 
-            result = self.api.multi_order_Margin(
+            _patch_py5paisa_for_mom(self.api)
+            body = self.api.multi_order_Margin(
                 CoverPositions="Y" if net else "N",
-                OrderRequests=order_requests,
+                Orders=order_requests,
             )
-
-            if result is None:
+            if body is None:
                 raise MarginError("multi_order_Margin returned None")
-
-            # Response is typically {"body": {"TotalMargin": ...}} or {"TotalMargin": ...}
-            body = result.get("body", result)
             total = body.get("TotalMarginRequired")
             if total is None:
-                raise MarginError(f"Unexpected multi_order_Margin response: {result}")
+                raise MarginError(f"Unexpected MultiOrderMargin response: {body}")
             if float(total) < 0:
-                raise MarginError(f"multi_order_Margin returned {total} (market may be closed or scrip invalid)")
+                raise MarginError(f"MultiOrderMargin returned {total} (market may be closed or scrip invalid)")
 
             return float(total)
 

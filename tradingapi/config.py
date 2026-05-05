@@ -541,6 +541,22 @@ def get_config() -> Config:
     return cast(Config, _config_instance)
 
 
+def get_fno_freeze_limit(broker_name: str, underlying: str) -> Optional[int]:
+    """Return max contracts per FNO order for (broker, underlying).
+
+    Values in tradingapi.yaml are total contracts (= lots × lot_size).
+    Returns None if no limit is configured for the broker/underlying.
+    """
+    try:
+        cfg = get_config()
+        freeze_cfg = cfg.get("freeze_limits") or {}
+        broker_map = (freeze_cfg.get("brokers") or {}).get(str(broker_name).strip().upper(), {})
+        val = broker_map.get(str(underlying).strip().upper())
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+
 # Example usage with enhanced error handling
 if __name__ == "__main__":
     try:
