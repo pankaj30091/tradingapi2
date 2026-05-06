@@ -28,7 +28,7 @@ packages = ["tradingapi"]
 
 [project]
 name = "tradingapi"
-version = "0.3.0"
+version = "0.3.1"
 description = "Trade integration with brokers"
 readme = "README.md"
 license = "MIT"
