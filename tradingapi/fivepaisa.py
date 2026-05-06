@@ -45,13 +45,11 @@ def _patch_py5paisa_for_mom(api) -> None:
          call accumulates stale body keys across calls; the polluted body
          makes the 5paisa server hang past 5s. Reset to a fresh deep copy
          before each MOM call.
-      3. order_request() does log_response(res["body"]["Message"]) for the
-         MOM branch, but the MOM response has no "Message" key — the KeyError
-         is raised at the subscript (not inside log_response), is swallowed
-         by the bare except, and the function silently returns None. Inject
-         an empty "Message" into the response by wrapping session.post for
-         the duration of the MOM call so the subscript succeeds and
-         res["body"] is returned normally.
+      3. order_request() does res["body"]["Message"] for MOM, but the MOM
+         response has no "Message" key — KeyError is raised at the subscript,
+         swallowed by the bare except, and the function silently returns None.
+         Replace order_request for the MOM case to extract res["body"] directly
+         without touching "Message".
     """
     if getattr(api, "_tradingapi_patched", False):
         return
@@ -64,28 +62,35 @@ def _patch_py5paisa_for_mom(api) -> None:
     except Exception:
         pass
 
-    original_mom = api.multi_order_Margin
-    original_post = api.session.post
+    original_order_request = api.order_request
 
-    def post_with_message_key(*args, **kwargs):
-        response = original_post(*args, **kwargs)
+    def safe_order_request(req_type):
+        if req_type != "MOM":
+            return original_order_request(req_type)
         try:
-            data = response.json()
-            if isinstance(data, dict) and isinstance(data.get("body"), dict):
-                data["body"].setdefault("Message", "")
-                response.json = lambda: data  # type: ignore[method-assign]
-        except Exception:
-            pass
-        return response
+            api.payload["body"]["ClientCode"] = api.client_code
+            api.payload["head"]["key"] = api.USER_KEY
+            from py5paisa.const import HEADERS
+            token = api.access_token or api.Jwt_token
+            headers = dict(HEADERS)
+            headers["Authorization"] = f"Bearer {token}"
+            headers["5Paisa-API-Uid"] = api.APIUID
+            res = api.session.post(api.MULTIORDERMARGIN_ROUTE, json=api.payload, headers=headers).json()
+            api.payload = copy.deepcopy(GENERIC_PAYLOAD)
+            return res.get("body")
+        except Exception as e:
+            from . import trading_logger
+            trading_logger.log_warning("py5paisa MOM request failed", {"error": repr(e)})
+            api.payload = copy.deepcopy(GENERIC_PAYLOAD)
+            return None
 
     def fixed_multi_order_Margin(**order):
         api.payload = copy.deepcopy(GENERIC_PAYLOAD)
-        api.session.post = post_with_message_key  # type: ignore[method-assign]
-        try:
-            return original_mom(**order)
-        finally:
-            api.session.post = original_post  # type: ignore[method-assign]
+        for k, v in order.items():
+            api.payload["body"][k] = v
+        return safe_order_request("MOM")
 
+    api.order_request = safe_order_request
     api.multi_order_Margin = fixed_multi_order_Margin
     api._tradingapi_patched = True
 

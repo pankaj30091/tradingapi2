@@ -37,6 +37,7 @@ examples/
 tradingapi.egg-info/
 # Package-local pytest tree ignored; root tests/ holds the live broker harness
 tradingapi/tests/
+tests/test_find_option_with_delta.py
 
 # environment
 setup.cfg

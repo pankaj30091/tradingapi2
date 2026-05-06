@@ -402,6 +402,10 @@ class Dhan(BrokerBase):
             self._global_market_data_rate_limit_lock_key = "dhan:market_data:lock"
             self._historical_audit_redis = None
             self._historical_audit_redis_db = 1
+            self._audit_enabled_cache: bool = False
+            self._audit_enabled_cache_ts: float = 0.0
+            self._audit_pid: str = str(os.getpid())
+            self._audit_proc_name: str = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else ""
             atexit.register(self._mark_process_shutting_down)
 
             trading_logger.log_info(
@@ -979,53 +983,51 @@ class Dhan(BrokerBase):
             parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999000)
         return parsed.isoformat(timespec="milliseconds")
 
-    def _log_historical_request_audit(
-        self,
-        symbol: Optional[str],
-        security_id: int,
-        interval: str,
-        from_date: str,
-        to_date: str,
-    ) -> None:
+    def _audit_dhan_call(self, call_type: str, fields: dict) -> None:
+        """Unified Redis stream audit for all Dhan API call types and errors.
+
+        call_type: "historical" | "quote" | "stream" | "error" | "stream_disconnect"
+        Toggle live (no restart): redis-cli -n 1 SET audit:dhan:enabled 1|0
+        """
+        now = time.monotonic()
+        if now - self._audit_enabled_cache_ts < 5.0:
+            if not self._audit_enabled_cache:
+                return
+        else:
+            try:
+                val = self._get_historical_audit_redis().get("audit:dhan:enabled")
+                self._audit_enabled_cache = val in (b"1", "1")
+            except Exception:
+                self._audit_enabled_cache = False
+            self._audit_enabled_cache_ts = now
+            if not self._audit_enabled_cache:
+                return
         try:
             audit_redis = self._get_historical_audit_redis()
             tz_ist = pytz.timezone("Asia/Kolkata")
             now_ist = dt.datetime.now(tz_ist)
             day_key = now_ist.strftime("%Y%m%d")
-            ts_ist = now_ist.isoformat(timespec="milliseconds")
-            symbol_str = str(symbol or "")
-
-            total_key = f"audit:dhan:historical:req:count:day:{day_key}"
-            per_symbol_key = f"audit:dhan:historical:req:count:symbol:{day_key}"
-            stream_key = f"audit:dhan:historical:req:v1:{day_key}"
-            ttl_seconds = 60 * 60 * 24 * 45
-
-            from_dt_ist = self._format_ist_datetime_string(from_date, is_end=False)
-            to_dt_ist = self._format_ist_datetime_string(to_date, is_end=True)
-
+            ttl = 60 * 60 * 24 * 45
+            stream_key = f"audit:dhan:{call_type}:req:v1:{day_key}"
+            combined_key = f"audit:dhan:all:req:v1:{day_key}"
+            count_key = f"audit:dhan:{call_type}:req:count:day:{day_key}"
+            entry = {
+                "ts_ist": now_ist.isoformat(timespec="milliseconds"),
+                "call_type": call_type,
+                "pid": self._audit_pid,
+                "proc": self._audit_proc_name,
+                **{k: str(v) for k, v in fields.items()},
+            }
             pipe = audit_redis.pipeline()
-            pipe.incr(total_key)
-            if symbol_str:
-                pipe.hincrby(per_symbol_key, symbol_str, 1)
-            pipe.xadd(
-                stream_key,
-                {
-                    "ts_ist": ts_ist,
-                    "symbol": symbol_str,
-                    "security_id": str(security_id),
-                    "interval": str(interval),
-                    "from_date": from_dt_ist,
-                    "to_date": to_dt_ist,
-                },
-                maxlen=500000,
-                approximate=True,
-            )
-            pipe.expire(total_key, ttl_seconds)
-            pipe.expire(per_symbol_key, ttl_seconds)
-            pipe.expire(stream_key, ttl_seconds)
+            pipe.incr(count_key)
+            pipe.xadd(stream_key, entry, maxlen=500000, approximate=True)
+            pipe.xadd(combined_key, entry, maxlen=1000000, approximate=True)
+            pipe.expire(count_key, ttl)
+            pipe.expire(stream_key, ttl)
+            pipe.expire(combined_key, ttl)
             pipe.execute()
         except Exception as e:
-            trading_logger.log_warning("Failed to audit Dhan historical request", {"error": str(e), "symbol": symbol})
+            trading_logger.log_warning(f"Failed to audit Dhan {call_type} call", {"error": str(e)})
 
     def _fetch_dhan_historical(
         self,
@@ -1060,13 +1062,13 @@ class Dhan(BrokerBase):
             url = self.api.base_url + "/charts/intraday"
 
         self._wait_for_historical_rate_limit()
-        self._log_historical_request_audit(
-            symbol=symbol,
-            security_id=security_id,
-            interval=periodicity,
-            from_date=from_date,
-            to_date=to_date,
-        )
+        self._audit_dhan_call("historical", {
+            "symbol": symbol or "",
+            "security_id": security_id,
+            "interval": periodicity,
+            "from_date": from_date,
+            "to_date": to_date,
+        })
         response = self.api.session.post(url, headers=self.api.header, timeout=self.api.timeout, data=json.dumps(payload))
         return self.api._parse_response(response)
 
@@ -1809,14 +1811,22 @@ class Dhan(BrokerBase):
                             continue
                     historical_data_list.sort(key=lambda x: x.date)
                 else:
+                    _hist_err = _extract_dhan_error_details(data)
                     trading_logger.log_error(
                         "No data from Dhan historical API",
                         None,
                         {
                             "symbol": long_symbol,
-                            **_extract_dhan_error_details(data),
+                            **_hist_err,
                         },
                     )
+                    self._audit_dhan_call("error", {
+                        "call_type": "historical",
+                        "symbol": long_symbol,
+                        "security_id": security_id,
+                        "exchange_segment": exchange_segment,
+                        **_hist_err,
+                    })
 
                 if periodicity in {"1d", "d"} and date_end_dt.date() == get_tradingapi_now().date():
                     # Refresh today's daily bar from 1m data (up-to-date partial OHLC), matching Shoonya-style behavior.
@@ -1949,6 +1959,11 @@ class Dhan(BrokerBase):
                 raise BrokerConnectionError("Dhan API not initialized")
 
             self._wait_for_quote_rate_limit()
+            self._audit_dhan_call("quote", {
+                "symbol": long_symbol,
+                "security_id": security_id,
+                "exchange_segment": exchange_segment,
+            })
             out = self.api.quote_data(securities={exchange_segment: [int(security_id)]})
             if out and out.get("status") == "success":
                 response_data = out.get("data", {}) or {}
@@ -1971,9 +1986,17 @@ class Dhan(BrokerBase):
                     market_feed.ask_volume = int(sell_qty[0].get("quantity", 0) or 0)
                 return market_feed
 
+            _quote_err = _extract_dhan_error_details(out)
+            self._audit_dhan_call("error", {
+                "call_type": "quote",
+                "symbol": long_symbol,
+                "security_id": security_id,
+                "exchange_segment": exchange_segment,
+                **_quote_err,
+            })
             trading_logger.log_warning(
                 "Dhan quote_data unavailable",
-                {"long_symbol": long_symbol, **_extract_dhan_error_details(out)},
+                {"long_symbol": long_symbol, **_quote_err},
             )
 
             return market_feed
@@ -2438,6 +2461,18 @@ class Dhan(BrokerBase):
                                 # Call synchronously; avoids RuntimeError from asyncio.to_thread()
                                 # when concurrent.futures thread pool is torn down by another component.
                                 self._wait_for_stream_request_rate_limit()
+                                self._audit_dhan_call("stream", {
+                                    "request_code": message.get("RequestCode", ""),
+                                    "instrument_count": len(message.get("InstrumentList", [])),
+                                    "operation": "subscribe",
+                                    "symbols": ",".join(
+                                        stream_symbol_map.get(
+                                            (_DHAN_FEED_SEGMENT_MAP.get(instr.get("ExchangeSegment", ""), ("", -1))[1], int(instr.get("SecurityId", -1))),
+                                            (instr.get("SecurityId", ""), ""),
+                                        )[0]
+                                        for instr in message.get("InstrumentList", [])
+                                    ),
+                                })
                                 await ws.send(json.dumps(message))
                             while self._streaming:
                                 raw = await ws.recv()
@@ -2462,6 +2497,10 @@ class Dhan(BrokerBase):
                         trading_logger.log_info("Dhan streaming thread closed cleanly")
                     else:
                         trading_logger.log_error("Dhan streaming thread error", e, {})
+                        self._audit_dhan_call("stream_disconnect", {
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                        })
                 finally:
                     try:
                         if loop is not None and not loop.is_closed():
@@ -2500,6 +2539,18 @@ class Dhan(BrokerBase):
                 async def _send_incremental_messages():
                     for message in delta_messages:
                         self._wait_for_stream_request_rate_limit()
+                        self._audit_dhan_call("stream", {
+                            "request_code": message.get("RequestCode", ""),
+                            "instrument_count": len(message.get("InstrumentList", [])),
+                            "operation": "subscribe_delta",
+                            "symbols": ",".join(
+                                stream_symbol_map.get(
+                                    (_DHAN_FEED_SEGMENT_MAP.get(instr.get("ExchangeSegment", ""), ("", -1))[1], int(instr.get("SecurityId", -1))),
+                                    (instr.get("SecurityId", ""), ""),
+                                )[0]
+                                for instr in message.get("InstrumentList", [])
+                            ),
+                        })
                         await ws.send(json.dumps(message))
 
                 future = asyncio.run_coroutine_threadsafe(_send_incremental_messages(), loop)

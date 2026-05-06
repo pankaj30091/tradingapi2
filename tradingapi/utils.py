@@ -3242,116 +3242,132 @@ def find_option_with_delta(
     chain_strikes = [_strike(s) for s in option_chain] if option_chain else []
     strike_lo = min(chain_strikes) if chain_strikes else float("nan")
     strike_hi = max(chain_strikes) if chain_strikes else float("nan")
+    n = len(option_chain)
     total_delta_checks = 0
     valid_delta_count = 0
     nan_delta_count = 0
-    # Determine if delta is increasing or decreasing
-    mid = (left + right) // 2
-    delta_1, delta_2 = float("nan"), float("nan")
+    nan_delta_strikes = []  # track strikes where delta could not be calculated
+    # Cache so seeding sweep + binary search + linear fallback never recompute the same strike.
+    delta_cache: dict[int, float] = {}
 
-    # Find the first valid left-side delta
-    i = mid
-    while i >= left and math.isnan(delta_1):
-        total_delta_checks += 1
-        delta_1 = calculate_delta(
-            brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
+    def _delta_at(idx: int) -> float:
+        nonlocal total_delta_checks, valid_delta_count, nan_delta_count
+        if idx in delta_cache:
+            return delta_cache[idx]
+        d = calculate_delta(
+            brokers, option_chain[idx], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
         )
-        if math.isnan(delta_1):
+        total_delta_checks += 1
+        if d is None or math.isnan(d):
+            d = float("nan")
             nan_delta_count += 1
+            nan_delta_strikes.append(_strike(option_chain[idx]))
         else:
             valid_delta_count += 1
-        i -= 1
+        delta_cache[idx] = d
+        return d
 
-    # Find the first valid right-side delta
-    i = mid + 1
-    while i <= right and math.isnan(delta_2):
-        total_delta_checks += 1
-        delta_2 = calculate_delta(
-            brokers, option_chain[i], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
-        )
-        if math.isnan(delta_2):
-            nan_delta_count += 1
+    def _consider(idx: int, abs_delta: float) -> None:
+        nonlocal best_index, best_delta
+        if return_lower_delta:
+            if abs_delta <= target_delta and abs_delta > best_delta:
+                best_delta = abs_delta
+                best_index = idx
         else:
-            valid_delta_count += 1
-        i += 1
+            if abs_delta >= target_delta and abs_delta < best_delta:
+                best_delta = abs_delta
+                best_index = idx
 
-    # If we cannot determine a valid direction, return -1
-    if math.isnan(delta_1) or math.isnan(delta_2):
-        trading_logger.log_info(
-            f"find_option_with_delta: no valid option strike found (direction inference failed). "
-            f"price_f={price_f} target_delta={target_delta} return_lower_delta={return_lower_delta} "
-            f"chain_len={len(option_chain)} strike_range=[{strike_lo}, {strike_hi}] "
-            f"delta_1={delta_1} delta_2={delta_2} "
-            f"mid_strike={_strike(option_chain[mid]) if option_chain and mid < len(option_chain) else None} "
-            f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} total_delta_checks={total_delta_checks}"
+    if n == 0:
+        trading_logger.log_warning(
+            f"find_option_with_delta: empty option_chain. price_f={price_f} target_delta={target_delta}"
         )
+        return -1
+
+    # --- Change 1: robust direction seeding via spread-out probes ---
+    seed_fractions = [0.1, 0.25, 0.5, 0.75, 0.9]
+    seed_indices = sorted({min(n - 1, max(0, int(round(f * (n - 1))))) for f in seed_fractions})
+    seed_samples: list[tuple[int, float]] = []  # (idx, |delta|)
+    for idx in seed_indices:
+        d = _delta_at(idx)
+        if not math.isnan(d):
+            ad = abs(d)
+            seed_samples.append((idx, ad))
+            _consider(idx, ad)
+
+    if len(seed_samples) < 2:
+        # Too few seeds; fall through to linear scan over the whole chain.
+        for idx in range(n):
+            d = _delta_at(idx)
+            if math.isnan(d):
+                continue
+            _consider(idx, abs(d))
+        if best_index < 0:
+            trading_logger.log_warning(
+                f"find_option_with_delta: no valid option strike found (linear fallback after seed failure). "
+                f"price_f={price_f} target_delta={target_delta} return_lower_delta={return_lower_delta} "
+                f"chain_len={n} strike_range=[{strike_lo}, {strike_hi}] "
+                f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} "
+                f"total_delta_checks={total_delta_checks} nan_delta_strikes={sorted(set(nan_delta_strikes))}"
+            )
         return best_index
 
-    increasing = abs(delta_2) > abs(delta_1)  # True if deltas increase with strike price
-    # if delta is nan, we need to decide if the search range is to the left or right of the present strike
-    # and use delta_2's position vis_a-vis target_delta to determine the direction of move to identity next best delta.
-    move_right_on_nan_delta = True
-    if abs(delta_2) > target_delta and increasing:
-        move_right_on_nan_delta = False
-    elif abs(delta_2) > target_delta and not increasing:
-        move_right_on_nan_delta = True
-    elif abs(delta_2) < target_delta and increasing:
-        move_right_on_nan_delta = True
-    elif abs(delta_2) < target_delta and not increasing:
-        move_right_on_nan_delta = False
+    # Determine monotonicity from lowest- vs. highest-strike valid seeds.
+    increasing = seed_samples[-1][1] > seed_samples[0][1]
+
+    # --- Change 2: NaN at mid -> scan to nearest valid neighbor instead of shrinking range ---
+    NAN_SCAN_CAP = 5
+
+    def _nearest_valid(mid: int, lo: int, hi: int) -> int:
+        # Returns idx of nearest valid delta within [lo, hi], or -1 if none within cap.
+        for step in range(1, NAN_SCAN_CAP + 1):
+            for cand in (mid - step, mid + step):
+                if lo <= cand <= hi and not math.isnan(_delta_at(cand)):
+                    return cand
+        return -1
 
     while left <= right:
         mid = (left + right) // 2
-        delta = calculate_delta(
-            brokers, option_chain[mid], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
-        )
-        total_delta_checks += 1
-        delta = abs(delta)  # always select an option using the absolute value of delta.
+        d = _delta_at(mid)
+        eff_idx = mid
+        if math.isnan(d):
+            alt = _nearest_valid(mid, left, right)
+            if alt < 0:
+                # Wide NaN band — bail to linear fallback below.
+                break
+            eff_idx = alt
+            d = delta_cache[alt]
+        ad = abs(d)
+        _consider(eff_idx, ad)
 
-        if math.isnan(delta):
-            nan_delta_count += 1
-            # Don't exclude the range containing current best (where target delta likely is).
-            # Otherwise e.g. NaN at mid=59 leads to right=58 and we exclude [59,119], losing index 110.
-            if best_index >= 0:
-                if mid < best_index:
-                    left = mid + 1  # Keep [mid+1, right] so we don't drop best_index
-                else:
-                    right = mid - 1  # Keep [left, mid-1]
-            else:
-                if move_right_on_nan_delta:
-                    left = mid + 1
-                else:
-                    right = mid - 1
-            continue
-        valid_delta_count += 1
-
-        # Update best index if this delta is a better fit
-        if return_lower_delta:
-            if delta <= target_delta and delta > best_delta:
-                best_delta = delta
-                best_index = mid
-        else:
-            if delta >= target_delta and delta < best_delta:
-                best_delta = delta
-                best_index = mid
-
-        # Adjust binary search range based on delta trend
         if increasing:
-            if delta > target_delta:
-                right = mid - 1  # Search lower strikes for smaller deltas
+            if ad > target_delta:
+                right = eff_idx - 1
             else:
-                left = mid + 1  # Search higher strikes for bigger deltas
+                left = eff_idx + 1
         else:
-            if delta > target_delta:
-                left = mid + 1  # Search higher strikes for smaller deltas
+            if ad > target_delta:
+                left = eff_idx + 1
             else:
-                right = mid - 1  # Search lower strikes for bigger deltas
+                right = eff_idx - 1
+
+    # --- Change 3: linear-scan fallback if binary search failed to land a best ---
+    if best_index < 0:
+        for idx in range(n):
+            if idx in delta_cache:
+                d = delta_cache[idx]
+            else:
+                d = _delta_at(idx)
+            if math.isnan(d):
+                continue
+            _consider(idx, abs(d))
 
     if best_index < 0:
         trading_logger.log_warning(
             f"find_option_with_delta: no valid option strike found. "
-            f"price_f={price_f} chain_len={len(option_chain)} strike_range=[{strike_lo}, {strike_hi}] "
-            f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} total_delta_checks={total_delta_checks}"
+            f"price_f={price_f} chain_len={n} strike_range=[{strike_lo}, {strike_hi}] "
+            f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} total_delta_checks={total_delta_checks} "
+            f"nan_delta_strikes={sorted(set(nan_delta_strikes))}"
         )
     return best_index
 
