@@ -52,12 +52,14 @@ def _patch_py5paisa_for_mom(api) -> None:
         return
 
     import copy
+    import httpx
     from py5paisa.const import GENERIC_PAYLOAD, HEADERS
 
+    # Dedicated session for MOM — never shares the pool with api.session,
+    # which other py5paisa calls (balance, order status, etc.) use concurrently.
+    mom_session = httpx.Client(verify=False, timeout=10)
+
     def fixed_multi_order_Margin(**order):
-        # Build payload locally — never touch api.payload, which other py5paisa
-        # methods (order status, balance, etc.) mutate concurrently and would
-        # otherwise overwrite the MOM body between assembly and POST.
         payload = copy.deepcopy(GENERIC_PAYLOAD)
         payload["body"]["ClientCode"] = api.client_code
         payload["head"]["key"] = api.USER_KEY
@@ -69,11 +71,10 @@ def _patch_py5paisa_for_mom(api) -> None:
         headers["Authorization"] = f"Bearer {token}"
         headers["5Paisa-API-Uid"] = api.APIUID
         try:
-            res = api.session.post(
+            res = mom_session.post(
                 api.MULTIORDERMARGIN_ROUTE,
                 json=payload,
                 headers=headers,
-                timeout=10,
             ).json()
             return res.get("body")
         except Exception as e:
