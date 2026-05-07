@@ -37,60 +37,50 @@ from py5paisa import FivePaisaClient
 
 
 def _patch_py5paisa_for_mom(api) -> None:
-    """Fix three upstream py5paisa bugs that break multi_order_Margin:
+    """Replace api.multi_order_Margin to bypass three upstream py5paisa bugs:
 
-      1. session is httpx.Client with 5s default timeout. Bump to 10s as a
-         safety margin (normal MOM responses are sub-second).
-      2. self.payload = GENERIC_PAYLOAD is a reference assignment, so each
-         call accumulates stale body keys across calls; the polluted body
-         makes the 5paisa server hang past 5s. Reset to a fresh deep copy
-         before each MOM call.
-      3. order_request() does res["body"]["Message"] for MOM, but the MOM
-         response has no "Message" key — KeyError is raised at the subscript,
-         swallowed by the bare except, and the function silently returns None.
-         Replace order_request for the MOM case to extract res["body"] directly
-         without touching "Message".
+      1. self.payload = GENERIC_PAYLOAD is a reference assignment shared across
+         every py5paisa method, so concurrent calls (status, balance, place_order)
+         clobber the MOM body between build and POST. Build payload locally.
+      2. order_request() does res["body"]["Message"] for MOM, but MOM responses
+         have no "Message" key — KeyError is swallowed by a bare except and the
+         function silently returns None. POST directly and read body.
+      3. Default 5s read timeout is too tight for SENSEX MOM under load.
+         Use a per-call 10s timeout (does not affect other API calls).
     """
     if getattr(api, "_tradingapi_patched", False):
         return
 
     import copy
-    from py5paisa.const import GENERIC_PAYLOAD
+    from py5paisa.const import GENERIC_PAYLOAD, HEADERS
 
-    try:
-        api.session.timeout = 10
-    except Exception:
-        pass
+    def fixed_multi_order_Margin(**order):
+        # Build payload locally — never touch api.payload, which other py5paisa
+        # methods (order status, balance, etc.) mutate concurrently and would
+        # otherwise overwrite the MOM body between assembly and POST.
+        payload = copy.deepcopy(GENERIC_PAYLOAD)
+        payload["body"]["ClientCode"] = api.client_code
+        payload["head"]["key"] = api.USER_KEY
+        for k, v in order.items():
+            payload["body"][k] = v
 
-    original_order_request = api.order_request
-
-    def safe_order_request(req_type):
-        if req_type != "MOM":
-            return original_order_request(req_type)
+        token = api.access_token or api.Jwt_token
+        headers = dict(HEADERS)
+        headers["Authorization"] = f"Bearer {token}"
+        headers["5Paisa-API-Uid"] = api.APIUID
         try:
-            api.payload["body"]["ClientCode"] = api.client_code
-            api.payload["head"]["key"] = api.USER_KEY
-            from py5paisa.const import HEADERS
-            token = api.access_token or api.Jwt_token
-            headers = dict(HEADERS)
-            headers["Authorization"] = f"Bearer {token}"
-            headers["5Paisa-API-Uid"] = api.APIUID
-            res = api.session.post(api.MULTIORDERMARGIN_ROUTE, json=api.payload, headers=headers).json()
-            api.payload = copy.deepcopy(GENERIC_PAYLOAD)
+            res = api.session.post(
+                api.MULTIORDERMARGIN_ROUTE,
+                json=payload,
+                headers=headers,
+                timeout=10,
+            ).json()
             return res.get("body")
         except Exception as e:
             from . import trading_logger
             trading_logger.log_warning("py5paisa MOM request failed", {"error": repr(e)})
-            api.payload = copy.deepcopy(GENERIC_PAYLOAD)
             return None
 
-    def fixed_multi_order_Margin(**order):
-        api.payload = copy.deepcopy(GENERIC_PAYLOAD)
-        for k, v in order.items():
-            api.payload["body"][k] = v
-        return safe_order_request("MOM")
-
-    api.order_request = safe_order_request
     api.multi_order_Margin = fixed_multi_order_Margin
     api._tradingapi_patched = True
 
