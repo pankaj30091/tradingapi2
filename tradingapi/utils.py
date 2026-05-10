@@ -3247,7 +3247,7 @@ def find_option_with_delta(
     valid_delta_count = 0
     nan_delta_count = 0
     nan_delta_strikes = []  # track strikes where delta could not be calculated
-    # Cache so seeding sweep + binary search + linear fallback never recompute the same strike.
+    # Cache so seeding sweep + binary search never recompute the same strike.
     delta_cache: dict[int, float] = {}
 
     def _delta_at(idx: int) -> float:
@@ -3296,15 +3296,9 @@ def find_option_with_delta(
             _consider(idx, ad)
 
     if len(seed_samples) < 2:
-        # Too few seeds; fall through to linear scan over the whole chain.
-        for idx in range(n):
-            d = _delta_at(idx)
-            if math.isnan(d):
-                continue
-            _consider(idx, abs(d))
         if best_index < 0:
             trading_logger.log_warning(
-                f"find_option_with_delta: no valid option strike found (linear fallback after seed failure). "
+                f"find_option_with_delta: no valid option strike found (seed failure). "
                 f"price_f={price_f} target_delta={target_delta} return_lower_delta={return_lower_delta} "
                 f"chain_len={n} strike_range=[{strike_lo}, {strike_hi}] "
                 f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} "
@@ -3333,7 +3327,7 @@ def find_option_with_delta(
         if math.isnan(d):
             alt = _nearest_valid(mid, left, right)
             if alt < 0:
-                # Wide NaN band — bail to linear fallback below.
+                # Wide NaN band: stop here instead of expanding into a full-chain scan.
                 break
             eff_idx = alt
             d = delta_cache[alt]
@@ -3350,17 +3344,6 @@ def find_option_with_delta(
                 left = eff_idx + 1
             else:
                 right = eff_idx - 1
-
-    # --- Change 3: linear-scan fallback if binary search failed to land a best ---
-    if best_index < 0:
-        for idx in range(n):
-            if idx in delta_cache:
-                d = delta_cache[idx]
-            else:
-                d = _delta_at(idx)
-            if math.isnan(d):
-                continue
-            _consider(idx, abs(d))
 
     if best_index < 0:
         trading_logger.log_warning(
