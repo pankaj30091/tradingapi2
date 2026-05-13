@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 from uuid import uuid4
 
 import numpy as np
@@ -332,6 +332,10 @@ class FivePaisa(BrokerBase):
             self._last_market_data_api_call_ts = 0.0
             self._global_market_data_rate_limit_key = "fivepaisa:market_data:last_call_ts"
             self._global_market_data_rate_limit_lock_key = "fivepaisa:market_data:lock"
+            # Populated in connect() for start_quotes_streaming.reconnect_stream (out of connect() locals).
+            self._fp_susertoken_path: Optional[str] = None
+            self._fp_restore_session_from_token: Optional[Callable[[str], bool]] = None
+            self._fp_fresh_login: Optional[Callable[[str], None]] = None
 
             trading_logger.log_info(
                 "FivePaisa broker initialized", {"broker_type": "FivePaisa", "config_keys": list(kwargs.keys())}
@@ -747,6 +751,9 @@ class FivePaisa(BrokerBase):
                 context = create_error_context(susertoken_path=susertoken_path, error=str(e))
                 raise AuthenticationError(f"Error in _fresh_login: {str(e)}", context)
 
+        self._fp_restore_session_from_token = _restore_session_from_token
+        self._fp_fresh_login = _fresh_login
+
         def get_connected():
             """Main connection logic with robust session management."""
             susertoken_path = config.get(f"{self.account_key}.USERTOKEN")
@@ -754,6 +761,8 @@ class FivePaisa(BrokerBase):
             if not susertoken_path:
                 context = create_error_context(broker_name=self.broker.name, config_keys=list(config.configs.keys()))
                 raise BrokerConnectionError("USERTOKEN path not configured", context)
+
+            self._fp_susertoken_path = susertoken_path
 
             # Check if we can use existing token
             if os.path.exists(susertoken_path):
@@ -3663,23 +3672,27 @@ class FivePaisa(BrokerBase):
                 except Exception as e:
                     trading_logger.log_error("Error handling WebSocket error", e, {"original_error": str(err)})
 
+            _ws_reconnect_state: Dict[str, int] = {"failures": 0}
+            _ws_reconnect_max = 10
+
             def reconnect():
-                """Reconnect to WebSocket (used by error_data callback)."""
-                trading_logger.log_info("Attempting to reconnect...")
-                time.sleep(5)  # Wait for a few seconds before reconnecting
+                """Reconnect after WebSocket errors — same path as send_stream_request on closed socket."""
+                trading_logger.log_info("Attempting to reconnect after WebSocket error...")
+                time.sleep(5)  # Wait before reconnecting to avoid hammering the broker
                 try:
-                    req_list = expand_symbols_to_request(self.subscribed_symbols)
-                    if not req_list:
-                        trading_logger.log_warning(
-                            "No symbols to reconnect", {"subscribed_symbols": self.subscribed_symbols}
-                        )
-                        return
-                    if self.api is None:
-                        raise BrokerConnectionError("API client not initialized")
-                    req_data = self.api.Request_Feed("mf", "s", req_list)
-                    connect_and_receive(req_data)
+                    reconnect_stream()
+                    _ws_reconnect_state["failures"] = 0
                 except Exception as e:
+                    _ws_reconnect_state["failures"] += 1
                     trading_logger.log_error("Reconnection failed", e, {"subscribed_symbols": self.subscribed_symbols})
+                    if _ws_reconnect_state["failures"] >= _ws_reconnect_max:
+                        trading_logger.log_error(
+                            "WebSocket reconnect giving up after repeated failures",
+                            None,
+                            {"failures": _ws_reconnect_state["failures"], "subscribed_symbols": self.subscribed_symbols},
+                        )
+                        _ws_reconnect_state["failures"] = 0
+                        return
                     reconnect()
 
             def connect_and_receive(req_data):
@@ -3711,6 +3724,26 @@ class FivePaisa(BrokerBase):
                 except Exception:
                     pass
                 self.subscribe_thread = None
+                # Re-authenticate at broker level before reconnecting the websocket.
+                # fivepaisa's server requires a fresh session after a connection drop;
+                # reusing the old api object without re-auth results in a silent connection
+                # that accepts subscriptions but never streams data.
+                trading_logger.log_info("Re-authenticating before stream reconnect", {"broker": self.broker.name})
+                token_path = self._fp_susertoken_path or config.get(f"{self.account_key}.USERTOKEN")
+                if not token_path:
+                    raise BrokerConnectionError("USERTOKEN path not configured")
+                restore_fn = self._fp_restore_session_from_token
+                fresh_fn = self._fp_fresh_login
+                if restore_fn is None or fresh_fn is None:
+                    raise BrokerConnectionError(
+                        "FivePaisa stream session helpers not initialized; connect() must succeed before streaming"
+                    )
+                if not restore_fn(token_path):
+                    trading_logger.log_warning(
+                        "Token restore failed during reconnect, attempting fresh login",
+                        {"broker": self.broker.name},
+                    )
+                    fresh_fn(token_path)
                 req_list_full = expand_symbols_to_request(self.subscribed_symbols)
                 if not req_list_full:
                     context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
