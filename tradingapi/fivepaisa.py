@@ -3860,12 +3860,9 @@ class FivePaisa(BrokerBase):
 
                     # Start the connection and receiving data in a separate thread
                     if not has_live_stream():
-                        self.subscribe_thread = threading.Thread(
-                            target=connect_and_receive, args=(req_data,), name="MarketDataStreamer"
-                        )
-                        self.subscribe_thread.start()
-                        time.sleep(2)
-                        trading_logger.log_info("Streaming thread started", {"thread_name": "MarketDataStreamer"})
+                        # WS is dead — full reconnect restoring all subscribed_symbols (already updated above).
+                        # Connecting with just the current op's req_data would lose all prior subscriptions.
+                        reconnect_stream()
                     else:
                         trading_logger.log_info(
                             "Requesting streaming for existing connection", {"req_data": json.dumps(req_data)}

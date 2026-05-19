@@ -21,13 +21,15 @@ _ALLOCATIONS_DIR = Path(os.path.expanduser("~/onedrive/.tradingapi/allocations")
 _TODAY_SYMLINK = _ALLOCATIONS_DIR / "master_allocation_today.yaml"
 
 
-def load_today_allocation(broker_name: str, strategy_name: str) -> float:
-    """Return the pct (0.0–1.0) allocated to strategy_name on broker_name today.
+def load_today_allocation_entry(broker_name: str, strategy_name: str) -> dict:
+    """Return the full allocation entry dict for strategy_name on broker_name today.
+
+    Example return value: {'pct': 0.275, 'redis_db': 8}
+    SCALPING strategies include a 'redis_db' key; others have only 'pct'.
 
     Reads master_allocation_today.yaml (a symlink to today's dated file).
     Raises FileNotFoundError if the symlink/file is missing.
     Raises ValueError if the date in the file does not match today.
-    Returns 0.0 if the strategy is listed with pct == 0 (inactive today).
     Raises KeyError if the broker/strategy is not found in the file at all.
     """
     if not _TODAY_SYMLINK.exists():
@@ -63,7 +65,19 @@ def load_today_allocation(broker_name: str, strategy_name: str) -> float:
             f"Available strategies: {list(strategies.keys())}"
         )
 
-    entry = strategies[strategy_key]
+    return dict(strategies[strategy_key])
+
+
+def load_today_allocation(broker_name: str, strategy_name: str) -> float:
+    """Return the pct (0.0–1.0) allocated to strategy_name on broker_name today.
+
+    Reads master_allocation_today.yaml (a symlink to today's dated file).
+    Raises FileNotFoundError if the symlink/file is missing.
+    Raises ValueError if the date in the file does not match today.
+    Returns 0.0 if the strategy is listed with pct == 0 (inactive today).
+    Raises KeyError if the broker/strategy is not found in the file at all.
+    """
+    entry = load_today_allocation_entry(broker_name, strategy_name)
     return float(entry.get("pct", 0.0))
 
 
