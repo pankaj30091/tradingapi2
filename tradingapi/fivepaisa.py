@@ -3738,12 +3738,11 @@ class FivePaisa(BrokerBase):
                     raise BrokerConnectionError(
                         "FivePaisa stream session helpers not initialized; connect() must succeed before streaming"
                     )
-                if not restore_fn(token_path):
-                    trading_logger.log_warning(
-                        "Token restore failed during reconnect, attempting fresh login",
-                        {"broker": self.broker.name},
-                    )
-                    fresh_fn(token_path)
+                # Always do a full TOTP re-login for stream reconnects.
+                # restore_fn succeeds (REST verifies OK) but FivePaisa's WS server silently
+                # rejects streaming on a token-restored session — subscriptions are accepted
+                # but no ticks are ever delivered. fresh_fn gets a genuine new session.
+                fresh_fn(token_path)
                 req_list_full = expand_symbols_to_request(self.subscribed_symbols)
                 if not req_list_full:
                     context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
