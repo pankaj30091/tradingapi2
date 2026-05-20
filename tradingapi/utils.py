@@ -4597,3 +4597,68 @@ def register_strategy_capital(
     except Exception as e:
         trading_logger.log_error(f"Failed to register strategy capital: {e}", exc_info=True)
         return False
+
+
+def close_all_positions(
+    broker: BrokerBase,
+    strategy: str,
+    exchange: str,
+    paper: bool,
+    refresh_status: bool = True,
+    price_types: list[str] = ["LMT"],
+    exclude_today_expiry: bool = False,
+    publish: bool = True,
+    additional_infos: list[str] | None = None,
+) -> list[str]:
+    """Close all open positions for a strategy by placing exit orders.
+
+    Reads open positions from get_pnl_table (authoritative Redis state, not in-memory cache),
+    places one exit order per open position, then publishes updated trades to Redis.
+
+    Args:
+        broker: Broker instance used for order placement and Redis access.
+        strategy: Strategy name.
+        exchange: Exchange string (e.g. "NSE", "BSE") passed to place_combo_order.
+        paper: Paper trading flag passed through to place_combo_order.
+        price_types: Order price type(s), e.g. ["LMT"], ["MKT"], ["BID+0.05"].
+        exclude_today_expiry: If True, skip symbols whose expiry date is today or earlier.
+        publish: Whether to publish trades to Redis after placing orders.
+        additional_infos: Per-order metadata list passed to place_combo_order (e.g. [json.dumps({"message": "..."})]).
+
+    Returns:
+        List of symbols for which exit orders were successfully placed.
+    """
+    closed_symbols: list[str] = []
+    pnl = get_pnl_table(broker, strategy, refresh_status=refresh_status)
+    if pnl.empty:
+        return closed_symbols
+    open_rows = pnl[(pnl["entry_quantity"].fillna(0) + pnl["exit_quantity"].fillna(0)) != 0]
+    for _, row in open_rows.iterrows():
+        symbol = str(row["symbol"])
+        if exclude_today_expiry:
+            parts = symbol.split("_")
+            if len(parts) > 2 and parts[2] <= dt.datetime.today().strftime("%Y%m%d"):
+                trading_logger.log_info(f"close_all_positions: skipping today-expiry symbol {symbol}")
+                continue
+        qty = int(float(row["entry_quantity"]) + float(row["exit_quantity"]))
+        if qty == 0:
+            continue
+        try:
+            place_combo_order(
+                execution_broker=broker,
+                strategy=strategy,
+                symbols=[symbol],
+                quantities=[-qty],
+                entry=False,
+                exchanges=[exchange],
+                price_types=price_types,
+                paper=paper,
+                additional_infos=additional_infos if additional_infos is not None else [""],
+            )
+            trading_logger.log_info(f"close_all_positions: exit placed {symbol} qty={qty}")
+            closed_symbols.append(symbol)
+        except Exception as e:
+            trading_logger.log_error(f"close_all_positions: failed to place exit for {symbol} qty={qty}: {e}")
+    if publish:
+        publish_trades_to_redis(broker, strategy, publish=not paper)
+    return closed_symbols
