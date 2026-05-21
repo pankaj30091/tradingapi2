@@ -3382,6 +3382,7 @@ def get_delta_strike(
     exchange="NSE",
     mds: Optional[str] = None,
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
+    max_moneyness: float = 0.10,
 ) -> Union[str, None]:
     """Get option strike price for a given delta with enhanced error handling.
 
@@ -3403,6 +3404,10 @@ def get_delta_strike(
         as_of: Optional. When omitted (default), behavior matches pre-change realtime paths.
             When set, underlying and option marks use historical OHLC at that time; T for IV/delta
             uses ``as_of`` instead of now.
+        max_moneyness: Maximum allowed deviation of the found strike from the underlying price,
+            as a fraction (e.g. 0.10 = 10%). Applies symmetrically to ITM and OTM strikes.
+            Rejects results where stale market data produced a plausible-looking but wrong delta.
+            Defaults to 0.10.
 
     Returns:
         Union[str, None]: Option symbol or None if not found
@@ -3473,7 +3478,17 @@ def get_delta_strike(
         as_of=as_of,
     )
     if index >= 0:
-        return option_chain[index]
+        sym = option_chain[index]
+        strike = float(sym.split("_")[4])
+        deviation = abs(strike / price_f - 1.0)
+        if deviation > max_moneyness:
+            trading_logger.log_warning(
+                f"get_delta_strike: moneyness sanity check failed. "
+                f"strike={strike} price_f={price_f} deviation={deviation:.1%} max_moneyness={max_moneyness:.1%} "
+                f"delta={delta} option_type={option_type} symbol={sym}"
+            )
+            return None
+        return sym
     else:
         trading_logger.log_debug(f"get_delta_strike: no option found (index={index})")
         return None
