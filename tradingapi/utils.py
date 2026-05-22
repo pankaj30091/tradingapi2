@@ -3284,30 +3284,14 @@ def find_option_with_delta(
         )
         return -1
 
-    # --- Change 1: robust direction seeding via spread-out probes ---
-    seed_fractions = [0.1, 0.25, 0.5, 0.75, 0.9]
-    seed_indices = sorted({min(n - 1, max(0, int(round(f * (n - 1))))) for f in seed_fractions})
-    seed_samples: list[tuple[int, float]] = []  # (idx, |delta|)
-    for idx in seed_indices:
-        d = _delta_at(idx)
-        if not math.isnan(d):
-            ad = abs(d)
-            seed_samples.append((idx, ad))
-            _consider(idx, ad)
+    # Monotonicity is deterministic from option type: calls lose delta as strike rises, puts gain it.
+    increasing = "_PUT_" in option_chain[0]
 
-    if len(seed_samples) < 2:
-        if best_index < 0:
-            trading_logger.log_warning(
-                f"find_option_with_delta: no valid option strike found (seed failure). "
-                f"price_f={price_f} target_delta={target_delta} return_lower_delta={return_lower_delta} "
-                f"chain_len={n} strike_range=[{strike_lo}, {strike_hi}] "
-                f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} "
-                f"total_delta_checks={total_delta_checks} nan_delta_strikes={sorted(set(nan_delta_strikes))}"
-            )
-        return best_index
-
-    # Determine monotonicity from lowest- vs. highest-strike valid seeds.
-    increasing = seed_samples[-1][1] > seed_samples[0][1]
+    # Seed at midpoint (near ATM) — most liquid, least likely to have stale data.
+    mid_seed = n // 2
+    d = _delta_at(mid_seed)
+    if not math.isnan(d):
+        _consider(mid_seed, abs(d))
 
     # --- Change 2: NaN at mid -> scan to nearest valid neighbor instead of shrinking range ---
     NAN_SCAN_CAP = 5
