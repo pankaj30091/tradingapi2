@@ -3382,7 +3382,7 @@ def get_delta_strike(
     exchange="NSE",
     mds: Optional[str] = None,
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
-    max_moneyness: float = 0.10,
+    max_moneyness: float = 0.07,
 ) -> Union[str, None]:
     """Get option strike price for a given delta with enhanced error handling.
 
@@ -3405,9 +3405,9 @@ def get_delta_strike(
             When set, underlying and option marks use historical OHLC at that time; T for IV/delta
             uses ``as_of`` instead of now.
         max_moneyness: Maximum allowed deviation of the found strike from the underlying price,
-            as a fraction (e.g. 0.10 = 10%). Applies symmetrically to ITM and OTM strikes.
+            as a fraction (e.g. 0.07 = 7%). Applies symmetrically to ITM and OTM strikes.
             Rejects results where stale market data produced a plausible-looking but wrong delta.
-            Defaults to 0.10.
+            Defaults to 0.07.
 
     Returns:
         Union[str, None]: Option symbol or None if not found
