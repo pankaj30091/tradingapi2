@@ -2000,10 +2000,14 @@ def update_order_status(
     for attr in required_attributes:
         if not hasattr(fills, attr) or getattr(fills, attr) in [None, "0"]:
             attr_value = getattr(fills, attr, "<missing>")
-            trading_logger.log_error(
+            msg = (
                 f"Missing or invalid attribute {attr} in order information for broker_order_id: {broker_order_id}. "
                 f"value={attr_value!r}, value_type={type(attr_value).__name__}"
             )
+            if attr == "exchange_order_id":
+                trading_logger.log_info(msg)
+            else:
+                trading_logger.log_error(msg)
             return fills
 
     if broker.broker != fills.broker:
