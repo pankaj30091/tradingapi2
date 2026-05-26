@@ -3179,8 +3179,10 @@ def calculate_delta(
 ):
     delta = float("nan")
     if as_of is None:
-        ticker = get_price(brokers, long_symbol, checks=["bid", "ask", "prior_close"], exchange=exchange, mds=mds)
-        price = (ticker.bid + ticker.ask) / 2 if ticker.bid > 0 and ticker.ask > 0 else ticker.prior_close
+        ticker = get_price(brokers, long_symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
+        if not (ticker.bid > 0 and ticker.ask > 0):
+            return float("nan")
+        price = (ticker.bid + ticker.ask) / 2
         t = (
             calc_fractional_business_days(
                 get_tradingapi_now(),

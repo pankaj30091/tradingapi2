@@ -24,7 +24,7 @@ _TODAY_SYMLINK = _ALLOCATIONS_DIR / "master_allocation_today.yaml"
 def load_today_allocation_entry(broker_name: str, strategy_name: str) -> dict:
     """Return the full allocation entry dict for strategy_name on broker_name today.
 
-    Example return value: {'pct': 0.275, 'redis_db': 8}
+    Example return value: {'pct': 0.225, 'redis_db': 8}
     SCALPING strategies include a 'redis_db' key; others have only 'pct'.
 
     Reads master_allocation_today.yaml (a symlink to today's dated file).
