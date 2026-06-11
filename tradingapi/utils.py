@@ -3168,6 +3168,65 @@ def _asof_to_ref_time_naive(as_of: Union[dt.datetime, dt.date, str, pd.Timestamp
     return ref
 
 
+def _option_mark_price(
+    brokers: list[BrokerBase],
+    long_symbol: str,
+    exchange="NSE",
+    mds: Optional[str] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
+) -> float:
+    """Mark price for an option: live bid/ask mid, or historical last when as_of is set.
+
+    Returns NaN unless there is a usable two-sided quote (live path) or a positive
+    historical price (as_of path). Never falls back to prior_close: stale marks
+    are the root cause of bad delta-strike picks.
+    """
+    if as_of is None:
+        ticker = get_price(brokers, long_symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
+        if not (ticker.bid > 0 and ticker.ask > 0) or ticker.ask < ticker.bid:
+            return float("nan")
+        return (ticker.bid + ticker.ask) / 2
+    br: List[BrokerBase] = [brokers] if isinstance(brokers, BrokerBase) else brokers
+    if not br:
+        return float("nan")
+    price_at = get_price_at_time(br[0], long_symbol, exchange, as_of=as_of, mds=mds, last=True)
+    if price_at is None or (isinstance(price_at, float) and (math.isnan(price_at) or price_at <= 0)):
+        return float("nan")
+    return float(price_at)
+
+
+def _years_to_expiry(
+    long_symbol: str,
+    market_close_time="15:30:00",
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
+) -> float:
+    ref_time = get_tradingapi_now() if as_of is None else _asof_to_ref_time_naive(as_of)
+    expiry = dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S")
+    return calc_fractional_business_days(ref_time, expiry) / 252
+
+
+def _implied_vol_for_option(
+    brokers: list[BrokerBase],
+    long_symbol: str,
+    price_f: float,
+    years_to_expiry: float,
+    exchange="NSE",
+    mds: Optional[str] = None,
+    as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
+) -> float:
+    price = _option_mark_price(brokers, long_symbol, exchange=exchange, mds=mds, as_of=as_of)
+    if math.isnan(price):
+        return float("nan")
+    return BlackScholesIV(
+        S=price_f,
+        X=float(long_symbol.split("_")[4]),
+        r=0,
+        T=years_to_expiry,
+        OptionType=long_symbol.split("_")[3],
+        OptionPrice=price,
+    )
+
+
 def calculate_delta(
     brokers: list[BrokerBase],
     long_symbol,
@@ -3177,43 +3236,11 @@ def calculate_delta(
     mds: Optional[str] = None,
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ):
-    delta = float("nan")
-    if as_of is None:
-        ticker = get_price(brokers, long_symbol, checks=["bid", "ask"], exchange=exchange, mds=mds)
-        if not (ticker.bid > 0 and ticker.ask > 0):
-            return float("nan")
-        price = (ticker.bid + ticker.ask) / 2
-        t = (
-            calc_fractional_business_days(
-                get_tradingapi_now(),
-                dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
-            )
-            / 252
-        )  # convert days number of years
-    else:
-        br: List[BrokerBase] = [brokers] if isinstance(brokers, BrokerBase) else brokers
-        broker = br[0]
-        price_at = get_price_at_time(broker, long_symbol, exchange, as_of=as_of, mds=mds, last=True)
-        if price_at is None or (isinstance(price_at, float) and (math.isnan(price_at) or price_at <= 0)):
-            return float("nan")
-        price = float(price_at)
-        ref_time = _asof_to_ref_time_naive(as_of)
-        t = (
-            calc_fractional_business_days(
-                ref_time,
-                dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S"),
-            )
-            / 252
-        )
-    vol = BlackScholesIV(
-        S=price_f,
-        X=float(long_symbol.split("_")[4]),
-        r=0,
-        T=t,
-        OptionType=long_symbol.split("_")[3],
-        OptionPrice=price,
-    )
-    delta = BlackScholesDelta(
+    t = _years_to_expiry(long_symbol, market_close_time, as_of=as_of)
+    vol = _implied_vol_for_option(brokers, long_symbol, price_f, t, exchange=exchange, mds=mds, as_of=as_of)
+    if math.isnan(vol):
+        return float("nan")
+    return BlackScholesDelta(
         S=price_f,
         X=float(long_symbol.split("_")[4]),
         r=0,
@@ -3221,7 +3248,15 @@ def calculate_delta(
         T=t,
         OptionType=long_symbol.split("_")[3],
     )
-    return delta
+
+
+# find_option_with_delta tuning. Anchor IV is taken from the strike nearest the
+# underlying (most liquid, freshest data); a stale quote elsewhere in the chain
+# can no longer steer the result on its own.
+_ANCHOR_IV_SCAN_STRIKES = 5  # how far from ATM to look for a usable anchor quote
+_ANCHOR_IV_BOUNDS = (0.01, 3.0)  # sane annualized IV range for the anchor
+_REFINE_WINDOW = 2  # strikes around the model pick refined with market quotes
+_REFINE_IV_BAND = (0.5, 2.0)  # market IV / anchor IV ratio accepted during refinement
 
 
 def find_option_with_delta(
@@ -3235,113 +3270,122 @@ def find_option_with_delta(
     mds: Optional[str] = "mds",
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ):
-    # Determine the correct option exchange
+    """Find the chain index whose |delta| best matches target_delta.
+
+    Approach: anchor a single implied vol at the strike nearest the underlying,
+    compute model deltas for the whole chain from that one vol, pick the best
+    strike, then refine locally with market quotes whose implied vol is
+    consistent with the anchor.
+
+    Rationale: the previous binary search trusted each strike's market quote
+    independently; one stale quote produced a plausible delta and a grossly
+    wrong strike (e.g. ATM reported 1350 points away from spot). Model deltas
+    from a single near-ATM vol cannot be corrupted by stale wings, and the
+    refinement step recovers smile accuracy only from quotes that pass an
+    IV-consistency guard.
+    """
     opt_exchange = "NFO" if exchange == "NSE" else "BFO" if exchange == "BSE" else exchange
-
-    left, right = 0, len(option_chain) - 1
-    best_index = -1  # Default to -1 if no valid option is found
-    best_delta = float("-inf") if return_lower_delta else float("inf")  # Best delta found so far
-
-    def _strike(sym: str) -> float:
-        return float(sym.split("_")[4]) if "_" in sym and len(sym.split("_")) > 4 else float("nan")
-
-    chain_strikes = [_strike(s) for s in option_chain] if option_chain else []
-    strike_lo = min(chain_strikes) if chain_strikes else float("nan")
-    strike_hi = max(chain_strikes) if chain_strikes else float("nan")
     n = len(option_chain)
-    total_delta_checks = 0
-    valid_delta_count = 0
-    nan_delta_count = 0
-    nan_delta_strikes = []  # track strikes where delta could not be calculated
-    # Cache so seeding sweep + binary search never recompute the same strike.
-    delta_cache: dict[int, float] = {}
-
-    def _delta_at(idx: int) -> float:
-        nonlocal total_delta_checks, valid_delta_count, nan_delta_count
-        if idx in delta_cache:
-            return delta_cache[idx]
-        d = calculate_delta(
-            brokers, option_chain[idx], price_f, market_close_time, exchange=opt_exchange, mds=mds, as_of=as_of
-        )
-        total_delta_checks += 1
-        if d is None or math.isnan(d):
-            d = float("nan")
-            nan_delta_count += 1
-            nan_delta_strikes.append(_strike(option_chain[idx]))
-        else:
-            valid_delta_count += 1
-        delta_cache[idx] = d
-        return d
-
-    def _consider(idx: int, abs_delta: float) -> None:
-        nonlocal best_index, best_delta
-        if return_lower_delta:
-            if abs_delta <= target_delta and abs_delta > best_delta:
-                best_delta = abs_delta
-                best_index = idx
-        else:
-            if abs_delta >= target_delta and abs_delta < best_delta:
-                best_delta = abs_delta
-                best_index = idx
-
     if n == 0:
         trading_logger.log_warning(
             f"find_option_with_delta: empty option_chain. price_f={price_f} target_delta={target_delta}"
         )
         return -1
-
-    # Monotonicity is deterministic from option type: calls lose delta as strike rises, puts gain it.
-    increasing = "_PUT_" in option_chain[0]
-
-    # Seed at midpoint (near ATM) — most liquid, least likely to have stale data.
-    mid_seed = n // 2
-    d = _delta_at(mid_seed)
-    if not math.isnan(d):
-        _consider(mid_seed, abs(d))
-
-    # --- Change 2: NaN at mid -> scan to nearest valid neighbor instead of shrinking range ---
-    NAN_SCAN_CAP = 5
-
-    def _nearest_valid(mid: int, lo: int, hi: int) -> int:
-        # Returns idx of nearest valid delta within [lo, hi], or -1 if none within cap.
-        for step in range(1, NAN_SCAN_CAP + 1):
-            for cand in (mid - step, mid + step):
-                if lo <= cand <= hi and not math.isnan(_delta_at(cand)):
-                    return cand
+    if price_f is None or (isinstance(price_f, float) and math.isnan(price_f)) or price_f <= 0:
+        trading_logger.log_warning(
+            f"find_option_with_delta: invalid underlying price_f={price_f} target_delta={target_delta}"
+        )
         return -1
 
-    while left <= right:
-        mid = (left + right) // 2
-        d = _delta_at(mid)
-        eff_idx = mid
-        if math.isnan(d):
-            alt = _nearest_valid(mid, left, right)
-            if alt < 0:
-                # Wide NaN band: stop here instead of expanding into a full-chain scan.
-                break
-            eff_idx = alt
-            d = delta_cache[alt]
-        ad = abs(d)
-        _consider(eff_idx, ad)
-
-        if increasing:
-            if ad > target_delta:
-                right = eff_idx - 1
-            else:
-                left = eff_idx + 1
-        else:
-            if ad > target_delta:
-                left = eff_idx + 1
-            else:
-                right = eff_idx - 1
-
-    if best_index < 0:
+    strikes = [float(sym.split("_")[4]) for sym in option_chain]
+    option_type = option_chain[0].split("_")[3]
+    years = _years_to_expiry(option_chain[0], market_close_time, as_of=as_of)
+    if years <= 0:
         trading_logger.log_warning(
-            f"find_option_with_delta: no valid option strike found. "
-            f"price_f={price_f} chain_len={n} strike_range=[{strike_lo}, {strike_hi}] "
-            f"valid_delta_count={valid_delta_count} nan_delta_count={nan_delta_count} total_delta_checks={total_delta_checks} "
-            f"nan_delta_strikes={sorted(set(nan_delta_strikes))}"
+            f"find_option_with_delta: option expired or T<=0. symbol={option_chain[0]} years={years}"
         )
+        return -1
+
+    def _iv_at(idx: int) -> float:
+        return _implied_vol_for_option(
+            brokers, option_chain[idx], price_f, years, exchange=opt_exchange, mds=mds, as_of=as_of
+        )
+
+    # 1. Anchor IV at (or near) the ATM strike.
+    atm_idx = min(range(n), key=lambda i: abs(strikes[i] - price_f))
+    lo_iv, hi_iv = _ANCHOR_IV_BOUNDS
+    anchor_iv, anchor_idx = float("nan"), -1
+    scan = sorted(
+        range(max(0, atm_idx - _ANCHOR_IV_SCAN_STRIKES), min(n, atm_idx + _ANCHOR_IV_SCAN_STRIKES + 1)),
+        key=lambda i: abs(i - atm_idx),
+    )
+    for i in scan:
+        iv = _iv_at(i)
+        if not math.isnan(iv) and lo_iv <= iv <= hi_iv:
+            anchor_iv, anchor_idx = iv, i
+            break
+    if math.isnan(anchor_iv):
+        trading_logger.log_warning(
+            f"find_option_with_delta: no usable anchor IV near ATM. price_f={price_f} "
+            f"atm_strike={strikes[atm_idx]} scanned_strikes={[strikes[i] for i in scan]} target_delta={target_delta}"
+        )
+        return -1
+
+    # 2. Model deltas for the whole chain from the single anchor IV (pure math, no quotes).
+    abs_deltas = [
+        abs(BlackScholesDelta(S=price_f, X=k, r=0, sigma=anchor_iv, T=years, OptionType=option_type))
+        for k in strikes
+    ]
+
+    def _pick_best(deltas: list) -> int:
+        best_idx, best_d = -1, float("-inf") if return_lower_delta else float("inf")
+        for i, ad in enumerate(deltas):
+            if math.isnan(ad):
+                continue
+            if return_lower_delta:
+                if ad <= target_delta and ad > best_d:
+                    best_idx, best_d = i, ad
+            else:
+                if ad >= target_delta and ad < best_d:
+                    best_idx, best_d = i, ad
+        return best_idx
+
+    model_idx = _pick_best(abs_deltas)
+    if model_idx < 0:
+        trading_logger.log_warning(
+            f"find_option_with_delta: no strike satisfies target under model deltas. "
+            f"price_f={price_f} target_delta={target_delta} anchor_iv={anchor_iv:.4f} "
+            f"strike_range=[{strikes[0]}, {strikes[-1]}] return_lower_delta={return_lower_delta}"
+        )
+        return -1
+
+    # 3. Local refinement: overwrite model deltas with market deltas for strikes
+    # around the model pick, but only where the market IV is consistent with the
+    # anchor (stale-quote guard).
+    refined = list(abs_deltas)
+    for i in range(max(0, model_idx - _REFINE_WINDOW), min(n, model_idx + _REFINE_WINDOW + 1)):
+        iv = anchor_iv if i == anchor_idx else _iv_at(i)
+        if math.isnan(iv) or iv <= 0:
+            continue
+        ratio = iv / anchor_iv
+        if not (_REFINE_IV_BAND[0] <= ratio <= _REFINE_IV_BAND[1]):
+            trading_logger.log_debug(
+                f"find_option_with_delta: refinement rejected strike={strikes[i]} "
+                f"iv={iv:.4f} anchor_iv={anchor_iv:.4f} ratio={ratio:.2f}"
+            )
+            continue
+        refined[i] = abs(
+            BlackScholesDelta(S=price_f, X=strikes[i], r=0, sigma=iv, T=years, OptionType=option_type)
+        )
+    best_index = _pick_best(refined)
+    if best_index < 0:
+        best_index = model_idx
+
+    trading_logger.log_debug(
+        f"find_option_with_delta: price_f={price_f} target_delta={target_delta} "
+        f"anchor_strike={strikes[anchor_idx]} anchor_iv={anchor_iv:.4f} "
+        f"model_strike={strikes[model_idx]} final_strike={strikes[best_index]}"
+    )
     return best_index
 
 
