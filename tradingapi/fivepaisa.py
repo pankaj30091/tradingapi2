@@ -336,6 +336,11 @@ class FivePaisa(BrokerBase):
             self._fp_susertoken_path: Optional[str] = None
             self._fp_restore_session_from_token: Optional[Callable[[str], bool]] = None
             self._fp_fresh_login: Optional[Callable[[str], None]] = None
+            self._stream_reconnect_lock = threading.Lock()
+            self._stream_reconnect_serial_lock = threading.Lock()
+            self._stream_reconnect_active = False
+            self._suppress_stream_reconnect = False
+            self._last_stream_tick_ts = 0.0
 
             trading_logger.log_info(
                 "FivePaisa broker initialized", {"broker_type": "FivePaisa", "config_keys": list(kwargs.keys())}
@@ -3640,8 +3645,10 @@ class FivePaisa(BrokerBase):
                             "Skipping price data with unmapped token",
                             {
                                 "token": json_data.get("Token"),
+                                "scrip_code": json_data.get("ScripCode"),
                                 "exchange": json_data.get("Exch"),
                                 "exchange_type": json_data.get("ExchType"),
+                                "json_data": json_data,
                             },
                         )
                         return None
@@ -3657,43 +3664,126 @@ class FivePaisa(BrokerBase):
                 try:
                     data_str = message.replace(r"\/", "/")
                     json_data = json.loads(data_str)
-                    if len(json_data) == 1:
-                        price = map_to_price(json_data[0])
+                    if isinstance(json_data, list):
+                        for tick_data in json_data:
+                            price = map_to_price(tick_data)
+                            if price is not None:
+                                self._last_stream_tick_ts = time.time()
+                            if price is not None and ext_callback:
+                                ext_callback(price)
+                    elif isinstance(json_data, dict):
+                        price = map_to_price(json_data)
+                        if price is not None:
+                            self._last_stream_tick_ts = time.time()
                         if price is not None and ext_callback:
                             ext_callback(price)
                 except Exception as e:
                     trading_logger.log_error("Error processing WebSocket message", e, {"ws_message": message})
 
+            def schedule_reconnect(reason: str, **details):
+                if self._suppress_stream_reconnect:
+                    trading_logger.log_info(
+                        "Skipping WebSocket reconnect during planned close",
+                        {"reason": reason, **details},
+                    )
+                    return
+                with self._stream_reconnect_lock:
+                    if self._stream_reconnect_active:
+                        trading_logger.log_info(
+                            "WebSocket reconnect already in progress",
+                            {"reason": reason, **details},
+                        )
+                        return
+                    self._stream_reconnect_active = True
+                reconnect_thread = threading.Thread(
+                    target=reconnect,
+                    args=(reason, details),
+                    name="FivePaisaReconnect",
+                    daemon=True,
+                )
+                reconnect_thread.start()
+
             def error_data(ws, err):
                 """Handle WebSocket errors."""
                 try:
+                    if ws is not getattr(self.api, "ws", None):
+                        trading_logger.log_info("Ignoring WebSocket error from stale socket", {"error": str(err)})
+                        return
                     trading_logger.log_error("WebSocket error", None, {"error": str(err)})
-                    reconnect()
+                    schedule_reconnect("error", error=str(err))
                 except Exception as e:
                     trading_logger.log_error("Error handling WebSocket error", e, {"original_error": str(err)})
 
+            def close_data(ws, close_status_code, close_msg):
+                """Handle WebSocket closures that do not surface through on_error."""
+                try:
+                    if ws is not getattr(self.api, "ws", None):
+                        trading_logger.log_info(
+                            "Ignoring WebSocket close from stale socket",
+                            {"close_status_code": close_status_code, "close_msg": close_msg},
+                        )
+                        return
+                    trading_logger.log_warning(
+                        "WebSocket closed",
+                        {"close_status_code": close_status_code, "close_msg": close_msg},
+                    )
+                    schedule_reconnect(
+                        "close",
+                        close_status_code=close_status_code,
+                        close_msg=str(close_msg) if close_msg is not None else None,
+                    )
+                except Exception as e:
+                    trading_logger.log_error(
+                        "Error handling WebSocket close",
+                        e,
+                        {"close_status_code": close_status_code, "close_msg": close_msg},
+                    )
+
             _ws_reconnect_state: Dict[str, int] = {"failures": 0}
             _ws_reconnect_max = 10
+            _stream_reconnect_verify_timeout_secs = 8.0
 
-            def reconnect():
+            def reconnect(reason: str, details: Dict[str, Any]):
                 """Reconnect after WebSocket errors — same path as send_stream_request on closed socket."""
-                trading_logger.log_info("Attempting to reconnect after WebSocket error...")
-                time.sleep(5)  # Wait before reconnecting to avoid hammering the broker
                 try:
-                    reconnect_stream()
-                    _ws_reconnect_state["failures"] = 0
-                except Exception as e:
-                    _ws_reconnect_state["failures"] += 1
-                    trading_logger.log_error("Reconnection failed", e, {"subscribed_symbols": self.subscribed_symbols})
-                    if _ws_reconnect_state["failures"] >= _ws_reconnect_max:
-                        trading_logger.log_error(
-                            "WebSocket reconnect giving up after repeated failures",
-                            None,
-                            {"failures": _ws_reconnect_state["failures"], "subscribed_symbols": self.subscribed_symbols},
+                    while True:
+                        trading_logger.log_info(
+                            "Attempting to reconnect after WebSocket event",
+                            {
+                                "reason": reason,
+                                **details,
+                                "attempt": _ws_reconnect_state["failures"] + 1,
+                                "max_attempts": _ws_reconnect_max,
+                            },
                         )
-                        _ws_reconnect_state["failures"] = 0
-                        return
-                    reconnect()
+                        time.sleep(5)
+                        try:
+                            reconnect_stream()
+                            _ws_reconnect_state["failures"] = 0
+                            return
+                        except Exception as e:
+                            _ws_reconnect_state["failures"] += 1
+                            trading_logger.log_error(
+                                "Reconnection failed",
+                                e,
+                                {"subscribed_symbols": self.subscribed_symbols, "reason": reason, **details},
+                            )
+                            if _ws_reconnect_state["failures"] >= _ws_reconnect_max:
+                                trading_logger.log_error(
+                                    "WebSocket reconnect giving up after repeated failures",
+                                    None,
+                                    {
+                                        "failures": _ws_reconnect_state["failures"],
+                                        "subscribed_symbols": self.subscribed_symbols,
+                                        "reason": reason,
+                                        **details,
+                                    },
+                                )
+                                _ws_reconnect_state["failures"] = 0
+                                return
+                finally:
+                    with self._stream_reconnect_lock:
+                        self._stream_reconnect_active = False
 
             def connect_and_receive(req_data):
                 """Connect and receive data."""
@@ -3701,8 +3791,11 @@ class FivePaisa(BrokerBase):
                     if self.api is None:
                         raise BrokerConnectionError("API client not initialized")
                     self.api.connect(req_data)
-                    self.api.receive_data(on_message)
                     self.api.error_data(error_data)
+                    ws = getattr(self.api, "ws", None)
+                    if ws is not None:
+                        ws.on_close = close_data
+                    self.api.receive_data(on_message)
                 except Exception as e:
                     trading_logger.log_error("Error in connect_and_receive", e, {"req_data": req_data})
                     raise
@@ -3719,48 +3812,68 @@ class FivePaisa(BrokerBase):
 
             def reconnect_stream():
                 """Start a fresh websocket and restore all subscriptions."""
-                try:
-                    self._safe_close_streaming_ws()
-                except Exception:
-                    pass
-                self.subscribe_thread = None
-                # Re-authenticate at broker level before reconnecting the websocket.
-                # fivepaisa's server requires a fresh session after a connection drop;
-                # reusing the old api object without re-auth results in a silent connection
-                # that accepts subscriptions but never streams data.
-                trading_logger.log_info("Re-authenticating before stream reconnect", {"broker": self.broker.name})
-                token_path = self._fp_susertoken_path or config.get(f"{self.account_key}.USERTOKEN")
-                if not token_path:
-                    raise BrokerConnectionError("USERTOKEN path not configured")
-                restore_fn = self._fp_restore_session_from_token
-                fresh_fn = self._fp_fresh_login
-                if restore_fn is None or fresh_fn is None:
-                    raise BrokerConnectionError(
-                        "FivePaisa stream session helpers not initialized; connect() must succeed before streaming"
+                with self._stream_reconnect_serial_lock:
+                    previous_tick_ts = self._last_stream_tick_ts
+                    try:
+                        self._suppress_stream_reconnect = True
+                        self._safe_close_streaming_ws()
+                    except Exception:
+                        pass
+                    finally:
+                        self._suppress_stream_reconnect = False
+                    self.subscribe_thread = None
+                    # Re-authenticate at broker level before reconnecting the websocket.
+                    # fivepaisa's server requires a fresh session after a connection drop;
+                    # reusing the old api object without re-auth results in a silent connection
+                    # that accepts subscriptions but never streams data.
+                    trading_logger.log_info("Re-authenticating before stream reconnect", {"broker": self.broker.name})
+                    token_path = self._fp_susertoken_path or config.get(f"{self.account_key}.USERTOKEN")
+                    if not token_path:
+                        raise BrokerConnectionError("USERTOKEN path not configured")
+                    restore_fn = self._fp_restore_session_from_token
+                    fresh_fn = self._fp_fresh_login
+                    if restore_fn is None or fresh_fn is None:
+                        raise BrokerConnectionError(
+                            "FivePaisa stream session helpers not initialized; connect() must succeed before streaming"
+                        )
+                    # Always do a full TOTP re-login for stream reconnects.
+                    # restore_fn succeeds (REST verifies OK) but FivePaisa's WS server silently
+                    # rejects streaming on a token-restored session — subscriptions are accepted
+                    # but no ticks are ever delivered. fresh_fn gets a genuine new session.
+                    fresh_fn(token_path)
+                    req_list_full = expand_symbols_to_request(self.subscribed_symbols)
+                    if not req_list_full:
+                        context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
+                        raise MarketDataError("No symbols to reconnect after socket closure", context)
+                    if self.api is None:
+                        raise BrokerConnectionError("API client not initialized")
+                    req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
+                    reconnect_started_ts = time.time()
+                    self.subscribe_thread = threading.Thread(
+                        target=connect_and_receive,
+                        args=(req_data_full,),
+                        name="MarketDataStreamer",
                     )
-                # Always do a full TOTP re-login for stream reconnects.
-                # restore_fn succeeds (REST verifies OK) but FivePaisa's WS server silently
-                # rejects streaming on a token-restored session — subscriptions are accepted
-                # but no ticks are ever delivered. fresh_fn gets a genuine new session.
-                fresh_fn(token_path)
-                req_list_full = expand_symbols_to_request(self.subscribed_symbols)
-                if not req_list_full:
-                    context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
-                    raise MarketDataError("No symbols to reconnect after socket closure", context)
-                if self.api is None:
-                    raise BrokerConnectionError("API client not initialized")
-                req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
-                self.subscribe_thread = threading.Thread(
-                    target=connect_and_receive,
-                    args=(req_data_full,),
-                    name="MarketDataStreamer",
-                )
-                self.subscribe_thread.start()
-                time.sleep(2)
-                trading_logger.log_info(
-                    "Reconnected after socket closure",
-                    {"subscribed_count": len(self.subscribed_symbols)},
-                )
+                    self.subscribe_thread.start()
+                    should_verify_ticks = previous_tick_ts > 0 and bool(self.subscribed_symbols)
+                    if should_verify_ticks:
+                        deadline = time.time() + _stream_reconnect_verify_timeout_secs
+                        while time.time() < deadline:
+                            if self._last_stream_tick_ts >= reconnect_started_ts:
+                                break
+                            if not has_live_stream():
+                                raise BrokerConnectionError("WebSocket thread died during reconnect verification")
+                            time.sleep(0.5)
+                        else:
+                            raise BrokerConnectionError(
+                                "WebSocket reconnected but remained silent after reconnect verification"
+                            )
+                    else:
+                        time.sleep(2)
+                    trading_logger.log_info(
+                        "Reconnected after socket closure",
+                        {"subscribed_count": len(self.subscribed_symbols), "verified_ticks": should_verify_ticks},
+                    )
 
             def send_stream_request(req_data):
                 """Send an incremental subscribe/unsubscribe over an existing websocket."""
@@ -3903,12 +4016,15 @@ class FivePaisa(BrokerBase):
             trading_logger.log_info("Stopping quotes streaming")
 
             try:
+                self._suppress_stream_reconnect = True
                 self._safe_close_streaming_ws()
                 self.subscribe_thread = None
                 trading_logger.log_info("Streaming stopped successfully")
             except Exception as e:
                 context = create_error_context(error=str(e))
                 raise BrokerConnectionError(f"Failed to stop streaming: {str(e)}", context)
+            finally:
+                self._suppress_stream_reconnect = False
 
         except BrokerConnectionError:
             raise
