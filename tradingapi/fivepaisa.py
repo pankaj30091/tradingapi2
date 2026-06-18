@@ -3625,6 +3625,14 @@ class FivePaisa(BrokerBase):
 
                 return None, tick_exchange
 
+            def is_market_feed_payload(data):
+                """True for MarketFeedV3 tick objects; false for trade/order pushes (ReqType) and subscribe acks."""
+                if not isinstance(data, dict):
+                    return False
+                if data.get("ReqType"):
+                    return False
+                return any(k in data for k in ("Token", "LastRate", "BidRate", "TickDt"))
+
             def map_to_price(json_data):
                 """Map JSON data to Price object."""
                 try:
@@ -3666,12 +3674,16 @@ class FivePaisa(BrokerBase):
                     json_data = json.loads(data_str)
                     if isinstance(json_data, list):
                         for tick_data in json_data:
+                            if not is_market_feed_payload(tick_data):
+                                continue
                             price = map_to_price(tick_data)
                             if price is not None:
                                 self._last_stream_tick_ts = time.time()
                             if price is not None and ext_callback:
                                 ext_callback(price)
                     elif isinstance(json_data, dict):
+                        if not is_market_feed_payload(json_data):
+                            return
                         price = map_to_price(json_data)
                         if price is not None:
                             self._last_stream_tick_ts = time.time()
