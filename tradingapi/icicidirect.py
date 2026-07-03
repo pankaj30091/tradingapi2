@@ -2456,8 +2456,26 @@ class IciciDirect(BrokerBase):
             )
             status_raw = str(rec.get("status", rec.get("order_status", "")))
             status = self._normalize_order_status(status_raw, fill_size, order_size, exchange_order_id)
+            terminal_message = str(
+                rec.get("reason", rec.get("remarks", rec.get("message", rec.get("reject_reason", ""))))
+                or ""
+            )
 
-            return OrderInfo(
+            order = kwargs.get("order")
+            if order is None:
+                order_data = self.redis_o.hgetall(order_id) if hasattr(self, "redis_o") else {}
+                if order_data:
+                    order = Order(**order_data)
+                else:
+                    order = Order(
+                        broker_order_id=order_id,
+                        broker=self.broker.name,
+                        exch_order_id=exchange_order_id,
+                    )
+            if terminal_message:
+                order.message = terminal_message
+
+            order_info = OrderInfo(
                 order_size=order_size,
                 order_price=order_price,
                 fill_size=fill_size,
@@ -2467,6 +2485,11 @@ class IciciDirect(BrokerBase):
                 exchange_order_id=exchange_order_id,
                 broker=self.broker,
             )
+            if kwargs.get("resolve_terminal", True):
+                order_info = self._apply_broker_side_terminal_resolution(
+                    order, order_info, message=terminal_message or order.message
+                )
+            return order_info
         except (ValidationError, BrokerConnectionError, OrderError):
             raise
         except Exception as e:

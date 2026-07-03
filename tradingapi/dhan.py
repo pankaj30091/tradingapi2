@@ -1476,7 +1476,11 @@ class Dhan(BrokerBase):
 
             fills = None
             try:
-                fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
+                fills = self.get_order_info(
+                    broker_order_id=broker_order_id,
+                    order=order,
+                    resolve_terminal=kwargs.get("resolve_terminal", False),
+                )
             except Exception:
                 pass
 
@@ -1617,15 +1621,7 @@ class Dhan(BrokerBase):
             if order is not None and error_message:
                 order.message = error_message
 
-            if status == OrderStatus.REJECTED:
-                try:
-                    internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
-                    if internal_order_id:
-                        delete_broker_order_id(self, internal_order_id, broker_order_id)
-                except Exception:
-                    pass
-
-            return OrderInfo(
+            order_info = OrderInfo(
                 order_size=order_qty,
                 order_price=order_price,
                 fill_size=fill_size,
@@ -1635,6 +1631,20 @@ class Dhan(BrokerBase):
                 exchange_order_id=exch_order_id,
                 broker=self.broker,
             )
+            if kwargs.get("resolve_terminal", True):
+                order_info = self._apply_broker_side_terminal_resolution(
+                    order, order_info, message=error_message or order.message
+                )
+
+            if order_info.status == OrderStatus.REJECTED:
+                try:
+                    internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
+                    if internal_order_id:
+                        delete_broker_order_id(self, internal_order_id, broker_order_id)
+                except Exception:
+                    pass
+
+            return order_info
 
         except (ValidationError, OrderError, BrokerConnectionError):
             raise

@@ -27,7 +27,17 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .broker_base import BrokerBase, HistoricalData, Order, OrderInfo, OrderStatus, Position, Price
+from .broker_base import (
+    BrokerBase,
+    HistoricalData,
+    Order,
+    OrderInfo,
+    OrderStatus,
+    Position,
+    Price,
+    is_broker_side_terminal_order,
+    is_missing_exchange_order_id,
+)
 from .config import get_config, get_fno_freeze_limit
 from .exceptions import (
     SymbolError,
@@ -692,10 +702,8 @@ def get_pnl_table(
                 # Refresh status if requested
                 if refresh_status:
                     try:
-                        for entry_key in entry_keys:
-                            order = Order(**cast(dict[str, Any], broker.redis_o.hgetall(entry_key)))
-                            broker_order_id = order.broker_order_id
-                            update_order_status(broker, int_order_id, broker_order_id, eod=eod)
+                        _prune_terminal_entry_legs(broker, int_order_id, eod=eod)
+                        symbol = cast(str, broker.redis_o.hget(int_order_id, "long_symbol") or symbol)
                     except Exception as e:
                         trading_logger.log_error(
                             f"Error refreshing entry status for {int_order_id}",
@@ -721,9 +729,9 @@ def get_pnl_table(
                             for leg_symbol, expected_qty in expected_legs.items()
                         )
                         if not fully_filled:
-                            derived_symbol = _build_effective_symbol_from_positions(entry_position)
-                            if derived_symbol:
-                                effective_symbol = derived_symbol
+                            resolved_symbol = _resolve_effective_combo_symbol(symbol, entry_position)
+                            if resolved_symbol:
+                                effective_symbol = resolved_symbol
                     if "?" not in effective_symbol and entry_order_type:
                         side = entry_order_type
                     base_position = parse_combo_symbol(effective_symbol)
@@ -1300,6 +1308,38 @@ def _build_effective_symbol_from_positions(positions: Dict[str, Position]) -> st
     return ":".join(f"{sym}?{int(size / norm)}" for sym, size in non_zero)
 
 
+def _resolve_effective_combo_symbol(
+    original_combo: str,
+    entry_position: Dict[str, Position],
+) -> str:
+    """Prefer subset of original combo with preserved leg ratios; GCD infer only as fallback."""
+    active_legs = {sym for sym, pos in entry_position.items() if pos.size != 0}
+    if not active_legs:
+        return original_combo
+    if "?" not in original_combo:
+        if original_combo in active_legs and len(active_legs) == 1:
+            return original_combo
+        if len(active_legs) == 1:
+            return next(iter(active_legs))
+        return _build_effective_symbol_from_positions(entry_position)
+
+    try:
+        original_legs = parse_combo_symbol(original_combo)
+    except Exception:
+        return _build_effective_symbol_from_positions(entry_position)
+
+    remaining_parts = [
+        f"{leg_sym}?{ratio}" for leg_sym, ratio in original_legs.items() if leg_sym in active_legs
+    ]
+    if not remaining_parts:
+        return _build_effective_symbol_from_positions(entry_position)
+    if len(remaining_parts) == len(original_legs):
+        return original_combo
+    if len(remaining_parts) == 1:
+        return remaining_parts[0]
+    return ":".join(remaining_parts)
+
+
 @log_execution_time
 @validate_inputs(combo_symbol=lambda x: isinstance(x, str) and len(x.strip()) > 0)
 def parse_combo_symbol(combo_symbol):
@@ -1639,6 +1679,8 @@ def transmit_entry_order(
         temp_order.price = lmt_price
         out = broker.place_order(temp_order)
         int_order_id = _process_broker_order_update(broker, out, order.long_symbol)
+    if int_order_id:
+        _prune_terminal_entry_legs(broker, int_order_id)
     return int_order_id
 
 
@@ -1878,6 +1920,66 @@ def exit_is_expiration(broker: BrokerBase, internal_order_id: str) -> bool:
     return out
 
 
+def _order_info_fill_size(fills: OrderInfo) -> float:
+    try:
+        return float(fills.fill_size or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def should_prune_terminal_zero_fill_leg(
+    fills: OrderInfo,
+    *,
+    redis_order: Optional[Order] = None,
+) -> bool:
+    """True when a zero-fill leg is terminal and safe to remove from entry_keys."""
+    if _order_info_fill_size(fills) > 0:
+        return False
+    if fills.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
+        return True
+    message = str(getattr(fills, "message", "") or "")
+    exch_order_id = getattr(fills, "exchange_order_id", "")
+    if redis_order is not None:
+        if not message.strip():
+            message = str(redis_order.message or "")
+        if is_missing_exchange_order_id(exch_order_id):
+            exch_order_id = redis_order.exch_order_id
+    return is_broker_side_terminal_order(exch_order_id, message)
+
+
+def _sync_internal_order_long_symbol(broker: BrokerBase, internal_order_id: str) -> None:
+    """Rewrite parent long_symbol to match remaining filled entry legs after pruning."""
+    if not internal_order_id or not cast(bool, broker.redis_o.exists(internal_order_id)):
+        return
+    long_symbol = cast(str, broker.redis_o.hget(internal_order_id, "long_symbol") or "")
+    if "?" not in long_symbol:
+        return
+    entry_keys = hget_with_default(broker, internal_order_id, "entry_keys", "").split()
+    if not entry_keys or not any(k.strip() for k in entry_keys):
+        return
+    positions = get_open_position_by_order(broker, internal_order_id, exclude_zero=True, side=["entry"])
+    resolved = _resolve_effective_combo_symbol(long_symbol, positions)
+    if resolved and resolved != long_symbol:
+        cast(bool, broker.redis_o.hset(internal_order_id, "long_symbol", resolved))
+        trading_logger.log_info(
+            "Updated internal order long_symbol after terminal leg prune",
+            {"internal_order_id": internal_order_id, "old_symbol": long_symbol, "new_symbol": resolved},
+        )
+
+
+def _prune_terminal_entry_legs(broker: BrokerBase, internal_order_id: str, *, eod: bool = False) -> None:
+    """Refresh entry legs and delete zero-fill terminal legs; sync combo long_symbol."""
+    if not internal_order_id or not cast(bool, broker.redis_o.exists(internal_order_id)):
+        return
+    entry_keys = hget_with_default(broker, internal_order_id, "entry_keys", "").split()
+    for entry_key in list(entry_keys):
+        if not entry_key or not cast(bool, broker.redis_o.exists(entry_key)):
+            continue
+        order = Order(**cast(dict[str, Any], broker.redis_o.hgetall(entry_key)))
+        update_order_status(broker, internal_order_id, str(order.broker_order_id), eod=eod)
+    _sync_internal_order_long_symbol(broker, internal_order_id)
+
+
 def delete_broker_order_id(
     broker,
     internal_order_id: str,
@@ -1978,8 +2080,20 @@ def update_order_status(
     if not broker_order_id_str or broker_order_id_str == "0" or broker_order_id_str.upper().endswith("P"):
         return None
 
+    redis_order: Optional[Order] = None
     try:
-        fills = broker.get_order_info(broker_order_id=broker_order_id_str)
+        redis_order_data = cast(dict[str, Any], broker.redis_o.hgetall(broker_order_id_str))
+        if redis_order_data:
+            redis_order = Order(**redis_order_data)
+    except Exception:
+        redis_order = None
+
+    get_order_info_kwargs: dict[str, Any] = {"broker_order_id": broker_order_id_str}
+    if redis_order is not None:
+        get_order_info_kwargs["order"] = redis_order
+
+    try:
+        fills = broker.get_order_info(**get_order_info_kwargs)
     except Exception as e:
         trading_logger.log_error(
             "Error calling get_order_info in update_order_status",
@@ -2006,22 +2120,22 @@ def update_order_status(
             )
             if attr == "exchange_order_id":
                 trading_logger.log_info(msg)
-            else:
-                trading_logger.log_error(msg)
+                continue
+            trading_logger.log_error(msg)
             return fills
 
     if broker.broker != fills.broker:
         return fills
 
-    if fills.status == OrderStatus.CANCELLED and fills.fill_size > 0:
+    if fills.status == OrderStatus.CANCELLED and _order_info_fill_size(fills) > 0:
         broker.redis_o.hset(broker_order_id, "price", str(fills.fill_price))
         broker.redis_o.hset(broker_order_id, "quantity", str(fills.fill_size))
         broker.redis_o.hset(broker_order_id, "status", fills.status.name)
         broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
-    elif (fills.status == OrderStatus.CANCELLED and fills.fill_size == 0) or (fills.status == OrderStatus.REJECTED):
+    elif should_prune_terminal_zero_fill_leg(fills, redis_order=redis_order):
         delete_broker_order_id(broker, internal_order_id, broker_order_id)
     elif eod:
-        if fills.fill_size > 0:
+        if _order_info_fill_size(fills) > 0:
             broker.redis_o.hset(broker_order_id, "price", str(fills.fill_price))
             broker.redis_o.hset(broker_order_id, "quantity", str(fills.fill_size))
             broker.redis_o.hset(broker_order_id, "status", fills.status.name)

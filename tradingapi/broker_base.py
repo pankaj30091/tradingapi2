@@ -95,6 +95,49 @@ class OrderStatus(Enum):
     CANCELLED = 7  # Cancelled by Exchange
 
 
+_BROKER_SIDE_TERMINAL_KEYWORDS = (
+    "illiquid",
+    "not allowed",
+    "not permitted",
+    "barred",
+    "freeze",
+    "frozen",
+    "restricted",
+    "invalid contract",
+    "invalid scrip",
+    "security not available",
+    "order rejected",
+    "rejected by",
+    "cannot place",
+    "unable to place",
+    "trading disabled",
+    "not tradable",
+    "not tradeable",
+    "margin shortfall",
+    "insufficient margin",
+    "insufficient funds",
+    "rms reject",
+)
+
+
+def is_missing_exchange_order_id(exch_order_id) -> bool:
+    value = str(exch_order_id or "").strip()
+    return value in {"", "0", "None", "NONE", "null", "nan", "NaN"}
+
+
+def is_broker_side_terminal_message(message: str) -> bool:
+    msg = str(message or "").strip().lower()
+    if not msg:
+        return False
+    if "reject" in msg or "cancel" in msg:
+        return True
+    return any(keyword in msg for keyword in _BROKER_SIDE_TERMINAL_KEYWORDS)
+
+
+def is_broker_side_terminal_order(exch_order_id, message: str) -> bool:
+    return is_missing_exchange_order_id(exch_order_id) and is_broker_side_terminal_message(message)
+
+
 def _validate_quantity(quantity):
     """
     Validate quantity parameter that can be int, float, or string representation.
@@ -755,6 +798,86 @@ class BrokerBase(ABC):
             "contracttick_map": {},
             "symbol_map_reversed": {},
         }
+
+    def _request_cancel_broker_side_terminal_order(self, order: "Order") -> bool:
+        """Send an explicit broker cancel when the order may still be live."""
+        broker_order_id = str(getattr(order, "broker_order_id", "") or "").strip()
+        if not broker_order_id or broker_order_id == "0" or broker_order_id.upper().endswith("P"):
+            return False
+        if getattr(order, "paper", False) in (True, "True", "true"):
+            return False
+        try:
+            self.cancel_order(broker_order_id=broker_order_id, resolve_terminal=False)
+            return True
+        except Exception as e:
+            _get_trading_logger().log_warning(
+                "Cancel request failed for broker-side terminal order",
+                {"broker_order_id": broker_order_id, "error": str(e)},
+            )
+            return False
+
+    def _resolve_broker_side_terminal_order(
+        self,
+        order: "Order",
+        message: str,
+        *,
+        order_size=None,
+        order_price=None,
+    ) -> OrderInfo:
+        """Cancel if possible and return a zero-fill CANCELLED OrderInfo."""
+        broker_order_id = str(getattr(order, "broker_order_id", "") or "").strip()
+        if message:
+            order.message = message
+            if broker_order_id:
+                try:
+                    self.redis_o.hset(broker_order_id, "message", message)
+                except Exception:
+                    pass
+
+        cancel_requested = self._request_cancel_broker_side_terminal_order(order)
+        order.status = OrderStatus.CANCELLED
+        if broker_order_id:
+            try:
+                self.redis_o.hset(broker_order_id, "status", OrderStatus.CANCELLED.name)
+            except Exception:
+                pass
+
+        _get_trading_logger().log_info(
+            "Broker-side terminal order resolved as cancelled",
+            {
+                "broker_order_id": broker_order_id,
+                "long_symbol": getattr(order, "long_symbol", ""),
+                "message": message,
+                "cancel_requested": cancel_requested,
+            },
+        )
+        return OrderInfo(
+            order_size=order_size if order_size is not None else order.quantity,
+            order_price=order_price if order_price is not None else order.price,
+            fill_size=0,
+            fill_price=0,
+            status=OrderStatus.CANCELLED,
+            broker_order_id=broker_order_id,
+            exchange_order_id=getattr(order, "exch_order_id", ""),
+            broker=getattr(order, "broker", None) or self.broker,
+        )
+
+    def _apply_broker_side_terminal_resolution(
+        self,
+        order: "Order",
+        order_info: OrderInfo,
+        message: Optional[str] = None,
+    ) -> OrderInfo:
+        msg = str(message if message is not None else getattr(order, "message", "") or "").strip()
+        exch_id = order_info.exchange_order_id or getattr(order, "exch_order_id", "")
+        if not is_broker_side_terminal_order(exch_id, msg):
+            return order_info
+        return self._resolve_broker_side_terminal_order(
+            order,
+            msg,
+            order_size=order_info.order_size,
+            order_price=order_info.order_price,
+        )
 
     @abstractmethod
     def update_symbology(self, **kwargs):

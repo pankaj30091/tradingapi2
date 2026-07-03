@@ -1608,7 +1608,7 @@ class FlatTrade(BrokerBase):
             except (ValueError, TypeError):
                 date_matches = False
             if date_matches:
-                fills = self.get_order_info(broker_order_id=broker_order_id)
+                fills = self.get_order_info(broker_order_id=broker_order_id, resolve_terminal=kwargs.get("resolve_terminal", False))
                 if fills.fill_size < round(float(order.quantity)):
                     trading_logger.log_info(
                         "Cancelling broker order",
@@ -1644,6 +1644,7 @@ class FlatTrade(BrokerBase):
             raise BrokerConnectionError("FlatTrade API is not initialized")
 
         trading_logger.log_debug("Getting order info", {"broker_order_id": kwargs.get("broker_order_id")})
+        resolve_terminal = kwargs.get("resolve_terminal", True)
 
         def return_db_as_fills(order: Order) -> OrderInfo:
             order_info = OrderInfo()
@@ -1728,6 +1729,9 @@ class FlatTrade(BrokerBase):
             order_info.status = status_mapping[latest_status.get("status")]
         else:
             order_info.status = OrderStatus.UNDEFINED
+        if resolve_terminal:
+            terminal_message = latest_status.get("rejreason") or latest_status.get("emsg") or order.message
+            order_info = self._apply_broker_side_terminal_resolution(order, order_info, message=terminal_message)
         return order_info
 
     # ------------------------------------------------------------------

@@ -85,7 +85,19 @@ def _patch_py5paisa_for_mom(api) -> None:
     api.multi_order_Margin = fixed_multi_order_Margin
     api._tradingapi_patched = True
 
-from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
+from .broker_base import (
+    BrokerBase,
+    Brokers,
+    HistoricalData,
+    Order,
+    OrderInfo,
+    OrderStatus,
+    Price,
+    _normalize_as_of_date,
+    is_broker_side_terminal_message,
+    is_broker_side_terminal_order,
+    is_missing_exchange_order_id,
+)
 from .config import get_config
 from .utils import (
     delete_broker_order_id,
@@ -1916,6 +1928,17 @@ class FivePaisa(BrokerBase):
 
     @log_execution_time
     @validate_inputs(broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0)
+    def _request_cancel_broker_side_terminal_order(self, order: Order) -> bool:
+        if is_missing_exchange_order_id(getattr(order, "exch_order_id", None)):
+            trading_logger.log_info(
+                "FivePaisa order blocked before exchange; marking cancelled locally",
+                {"broker_order_id": order.broker_order_id, "message": order.message},
+            )
+            return False
+        return super()._request_cancel_broker_side_terminal_order(order)
+
+    @log_execution_time
+    @validate_inputs(broker_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0)
     def cancel_order(self, **kwargs) -> Order:
         """
         Cancel an existing order with the FivePaisa broker with enhanced error handling.
@@ -1968,7 +1991,11 @@ class FivePaisa(BrokerBase):
                     if date_matches:
                         # Get current order info
                         try:
-                            fills = self.get_order_info(broker_order_id=broker_order_id, order=order)
+                            fills = self.get_order_info(
+                                broker_order_id=broker_order_id,
+                                order=order,
+                                resolve_terminal=kwargs.get("resolve_terminal", False),
+                            )
                         except Exception as e:
                             trading_logger.log_error(
                                 "Failed to get order info for cancellation",
@@ -2247,6 +2274,7 @@ class FivePaisa(BrokerBase):
         """
         try:
             trading_logger.log_debug("Getting order info", {"broker_order_id": kwargs.get("broker_order_id")})
+            resolve_terminal = kwargs.get("resolve_terminal", True)
 
             def return_db_as_fills(order: Order):
                 """Return order info from database for historical orders."""
@@ -2272,6 +2300,11 @@ class FivePaisa(BrokerBase):
                     trading_logger.log_error("Error in return_db_as_fills", e, {"order": str(order)})
                     raise
 
+            def _finalize_order_book_info(order: Order, order_info: OrderInfo, reason: str = "") -> OrderInfo:
+                if not resolve_terminal:
+                    return order_info
+                return self._apply_broker_side_terminal_resolution(order, order_info, message=reason or order.message)
+
             def get_orderinfo_from_orders(exch_order_id: str, order: Order, broker_order_id: str) -> OrderInfo:
                 """Get order info from order book."""
                 try:
@@ -2281,21 +2314,18 @@ class FivePaisa(BrokerBase):
                     if len(orders) > 0:
                         fivepaisa_order = orders[orders.BrokerOrderId.astype(str) == str(broker_order_id)]
                         if len(fivepaisa_order) == 1:
-                            if fivepaisa_order.OrderStatus.str.lower().str.contains("rejected").iloc[0] is True:
-                                # order cancelled by broker before reaching exchange
-                                trading_logger.log_info(
-                                    "Order rejected by broker",
-                                    {"broker_order_id": broker_order_id, "reason": str(fivepaisa_order.Reason.iloc[0])},
-                                )
-                                broker_order_id = str(fivepaisa_order.BrokerOrderId.iloc[0])
-                                try:
-                                    internal_order_id = self.redis_o.hget(broker_order_id, "orderRef")
-                                    if internal_order_id is not None:
-                                        delete_broker_order_id(self, internal_order_id, broker_order_id)
-                                except Exception as e:
-                                    trading_logger.log_warning(
-                                        "Failed to delete broker order ID",
-                                        {"broker_order_id": broker_order_id, "error": str(e)},
+                            reason = str(fivepaisa_order.Reason.iloc[0] if "Reason" in fivepaisa_order.columns else "")
+                            exch_id = fivepaisa_order.ExchOrderID.iloc[0]
+                            if (
+                                fivepaisa_order.OrderStatus.str.lower().str.contains("rejected").iloc[0] is True
+                                or is_broker_side_terminal_order(exch_id, reason or order.message)
+                            ):
+                                if resolve_terminal:
+                                    return self._resolve_broker_side_terminal_order(
+                                        order,
+                                        reason or order.message,
+                                        order_size=order.quantity,
+                                        order_price=order.price,
                                     )
                                 return OrderInfo(
                                     order_size=order.quantity,
@@ -2304,7 +2334,7 @@ class FivePaisa(BrokerBase):
                                     fill_price=0,
                                     status=OrderStatus.REJECTED,
                                     broker_order_id=order.broker_order_id,
-                                    exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
+                                    exchange_order_id=exch_id,
                                     broker=self.broker,
                                 )
                             else:
@@ -2332,15 +2362,19 @@ class FivePaisa(BrokerBase):
                                         contract_size = self.exchange_mappings[order.exchange]["contractsize_map"].get(
                                             long_symbol
                                         )
-                                        return OrderInfo(
-                                            order_size=order.quantity,
-                                            order_price=order.price,
-                                            fill_size=fill_size * contract_size,
-                                            fill_price=fill_price,
-                                            status=status,
-                                            broker_order_id=order.broker_order_id,
-                                            exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
-                                            broker=self.broker,
+                                        return _finalize_order_book_info(
+                                            order,
+                                            OrderInfo(
+                                                order_size=order.quantity,
+                                                order_price=order.price,
+                                                fill_size=fill_size * contract_size,
+                                                fill_price=fill_price,
+                                                status=status,
+                                                broker_order_id=order.broker_order_id,
+                                                exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
+                                                broker=self.broker,
+                                            ),
+                                            reason,
                                         )
                                     except Exception as e:
                                         trading_logger.log_error(
@@ -2350,15 +2384,19 @@ class FivePaisa(BrokerBase):
                                         )
                                         raise
                                 else:
-                                    return OrderInfo(
-                                        order_size=order.quantity,
-                                        order_price=order.price,
-                                        fill_size=fill_size,
-                                        fill_price=fill_price,
-                                        status=status,
-                                        broker_order_id=order.broker_order_id,
-                                        exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
-                                        broker=self.broker,
+                                    return _finalize_order_book_info(
+                                        order,
+                                        OrderInfo(
+                                            order_size=order.quantity,
+                                            order_price=order.price,
+                                            fill_size=fill_size,
+                                            fill_price=fill_price,
+                                            status=status,
+                                            broker_order_id=order.broker_order_id,
+                                            exchange_order_id=fivepaisa_order.ExchOrderID.iloc[0],
+                                            broker=self.broker,
+                                        ),
+                                        reason,
                                     )
                         else:
                             trading_logger.log_debug(
@@ -2400,15 +2438,19 @@ class FivePaisa(BrokerBase):
                                             contract_size = self.exchange_mappings[order.exchange][
                                                 "contractsize_map"
                                             ].get(long_symbol)
-                                            return OrderInfo(
-                                                order_size=order_size,
-                                                order_price=order_price,
-                                                fill_size=fill_size * contract_size,
-                                                fill_price=fill_price,
-                                                status=status,
-                                                broker_order_id=broker_order_id,
-                                                exchange_order_id=row["ExchOrderID"],
-                                                broker=self.broker,
+                                            return _finalize_order_book_info(
+                                                order,
+                                                OrderInfo(
+                                                    order_size=order_size,
+                                                    order_price=order_price,
+                                                    fill_size=fill_size * contract_size,
+                                                    fill_price=fill_price,
+                                                    status=status,
+                                                    broker_order_id=broker_order_id,
+                                                    exchange_order_id=row["ExchOrderID"],
+                                                    broker=self.broker,
+                                                ),
+                                                str(row.get("Reason", "")),
                                             )
                                         except Exception as e:
                                             trading_logger.log_error(
@@ -2418,15 +2460,19 @@ class FivePaisa(BrokerBase):
                                             )
                                             raise
                                     else:
-                                        return OrderInfo(
-                                            order_size=order_size,
-                                            order_price=order_price,
-                                            fill_size=fill_size,
-                                            fill_price=fill_price,
-                                            status=status,
-                                            broker_order_id=broker_order_id,
-                                            exchange_order_id=row["ExchOrderID"],
-                                            broker=self.broker,
+                                        return _finalize_order_book_info(
+                                            order,
+                                            OrderInfo(
+                                                order_size=order_size,
+                                                order_price=order_price,
+                                                fill_size=fill_size,
+                                                fill_price=fill_price,
+                                                status=status,
+                                                broker_order_id=broker_order_id,
+                                                exchange_order_id=row["ExchOrderID"],
+                                                broker=self.broker,
+                                            ),
+                                            str(row.get("Reason", "")),
                                         )
                     return OrderInfo(
                         order_size=order.quantity,
@@ -2534,20 +2580,14 @@ class FivePaisa(BrokerBase):
                 )
 
             # Handle orders with no exchange order ID
-            if order.exch_order_id in [0, "0", None, "None"]:
-                if "reject" in order.message.lower() or "cancel" in order.message.lower():
-                    fills = OrderInfo()
-                    if "reject" in order.message.lower():
-                        fills.status = OrderStatus.REJECTED
-                    if "cancel" in order.message.lower():
-                        fills.status = OrderStatus.CANCELLED
-                    fills.fill_price = 0
-                    fills.fill_size = 0
-                    fills.broker = self.broker
-                    fills.broker_order_id = order.broker_order_id
-                    fills.order_price = order.price
-                    fills.order_size = order.quantity
-                    return fills
+            if is_missing_exchange_order_id(order.exch_order_id):
+                if resolve_terminal and is_broker_side_terminal_message(order.message):
+                    return self._resolve_broker_side_terminal_order(
+                        order,
+                        order.message,
+                        order_size=order.quantity,
+                        order_price=order.price,
+                    )
                 return get_orderinfo_from_orders("0", order=order, broker_order_id=broker_order_id)
             else:
                 # Handle orders with exchange order ID
