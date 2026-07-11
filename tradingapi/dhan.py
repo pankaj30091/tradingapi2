@@ -287,11 +287,21 @@ def save_symbol_data(saveToFolder: bool = False):
         dest_file = f"{bhavcopyfolder}/{dt.datetime.today().strftime('%Y%m%d')}_dhan_codes.csv"
 
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
-        response = requests.get(DHAN_SECURITY_LIST_URL, headers=headers, timeout=(10, 300))
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch Dhan symbol data. Status: {response.status_code}")
+        if os.path.exists(dest_file):
+            df = pd.read_csv(dest_file, low_memory=False)
+        else:
+            from .proxy_utils import request_get_with_broker_proxy
 
-        df = pd.read_csv(io.BytesIO(response.content), low_memory=False)
+            response = request_get_with_broker_proxy(
+                DHAN_SECURITY_LIST_URL,
+                "DHAN",
+                purpose="symbol_download",
+                headers=headers,
+                timeout=(10, 300),
+            )
+            with open(dest_file, "wb") as f:
+                f.write(response.content)
+            df = pd.read_csv(dest_file, low_memory=False)
         df.columns = [col.strip() for col in df.columns]
         object_cols = df.select_dtypes(include=["object"]).columns
         for col in object_cols:
@@ -1985,6 +1995,11 @@ class Dhan(BrokerBase):
                 market_feed.low = float(ohlc.get("low", data.get("dayLow", float("nan"))) or float("nan"))
                 market_feed.prior_close = float(ohlc.get("close", data.get("previousClosePrice", float("nan"))) or float("nan"))
                 market_feed.volume = int(data.get("volume", data.get("totalTradedVolume", 0)) or 0)
+                raw_oi = data.get("OI", data.get("oi", data.get("open_interest", data.get("openInterest", 0))))
+                try:
+                    market_feed.oi = int(str(raw_oi).strip() or 0)
+                except (TypeError, ValueError):
+                    market_feed.oi = int(float(raw_oi or 0))
                 depth = data.get("depth", {})
                 buy_qty = depth.get("buy", [{}])
                 sell_qty = depth.get("sell", [{}])
@@ -2340,9 +2355,12 @@ class Dhan(BrokerBase):
                 if value in (None, "", "nan"):
                     return 0
                 try:
-                    return int(float(value))
+                    return int(str(value).strip())
                 except (TypeError, ValueError):
-                    return 0
+                    try:
+                        return int(float(value))
+                    except (TypeError, ValueError):
+                        return 0
 
             def _apply_if_valid(current: float, value: Any) -> float:
                 parsed = _to_float(value)
@@ -2391,6 +2409,9 @@ class Dhan(BrokerBase):
                     volume = _to_int(response.get("volume"))
                     if volume:
                         price.volume = volume
+                    oi = _to_int(response.get("OI") or response.get("oi") or response.get("open_interest") or response.get("openInterest"))
+                    if oi:
+                        price.oi = oi
                     price.bid = _apply_if_valid(price.bid, response.get("bidPrice"))
                     price.ask = _apply_if_valid(price.ask, response.get("askPrice"))
                     bid_qty = _to_int(response.get("bidQty"))

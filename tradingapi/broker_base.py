@@ -571,6 +571,7 @@ class Price:
         high: float = float("nan"),
         low: float = float("nan"),
         volume: int = 0,
+        oi: int = 0,
         symbol: str = "",
         exchange: str = "",
         src: str = "",
@@ -589,6 +590,7 @@ class Price:
             high: High price
             low: Low price
             volume: Total volume
+            oi: Open interest
             symbol: Trading symbol
             exchange: Exchange name
             src: Source of the price data
@@ -606,6 +608,7 @@ class Price:
         self.high = high
         self.low = low
         self.volume = volume
+        self.oi = oi
         self.symbol = symbol
         self.exchange = exchange
         self.src = src
@@ -633,6 +636,7 @@ class Price:
             high=safe_add(self.high, other.high),
             low=safe_add(self.low, other.low),
             volume=safe_add_volume(self.volume, other.volume),
+            oi=safe_add_volume(self.oi, other.oi),
         )
         # dont change symbol
 
@@ -646,6 +650,7 @@ class Price:
         self.high = other.high * size if other.high * size is not float("nan") else self.high
         self.low = other.low * size if other.low * size is not float("nan") else self.low
         self.volume = other.volume if other.volume is not float("nan") else self.volume
+        self.oi = other.oi if other.oi is not float("nan") else self.oi
         self.symbol = other.symbol
         self.exchange = other.exchange
         self.src = other.src
@@ -662,6 +667,7 @@ class Price:
             "high": self.high,
             "low": self.low,
             "volume": self.volume,
+            "oi": self.oi,
             "symbol": self.symbol,
             "exchange": self.exchange,
             "src": self.src,
@@ -680,6 +686,7 @@ class Price:
             high=data.get("high", float("nan")),
             low=data.get("low", float("nan")),
             volume=data.get("volume", 0),
+            oi=data.get("oi", 0),
             symbol=data.get("symbol", ""),
             exchange=data.get("exchange", ""),
             src=data.get("src", ""),

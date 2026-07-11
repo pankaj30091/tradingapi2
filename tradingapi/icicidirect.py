@@ -135,7 +135,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
     try:
         from .proxy_utils import get_proxies_for_broker
 
-        _proxies = get_proxies_for_broker("ICICIDIRECT")
+        _proxies = get_proxies_for_broker("ICICIDIRECT", purpose="symbol_download")
     except Exception:
         pass
     _prev_ipv6 = _temporarily_force_ipv4()
@@ -1553,9 +1553,12 @@ class IciciDirect(BrokerBase):
             if v in [None, ""]:
                 return default
             try:
-                return int(float(cast(Union[int, float, str], v)))
+                return int(str(cast(Union[int, float, str], v)).strip())
             except Exception:
-                return default
+                try:
+                    return int(float(cast(Union[int, float, str], v)))
+                except Exception:
+                    return default
 
         market_feed.bid = _f("bPrice")
         market_feed.ask = _f("sPrice")
@@ -1566,6 +1569,10 @@ class IciciDirect(BrokerBase):
         market_feed.low = _f("low")
         market_feed.prior_close = _f("close")
         market_feed.volume = _i("ttq")
+        for oi_key in ("open_interest", "oi", "OpenInterest", "OI"):
+            if tick.get(oi_key) not in [None, ""]:
+                market_feed.oi = _i(oi_key)
+                break
         if isinstance(tick.get("ltt"), str) and tick.get("ltt"):
             ltt = str(tick.get("ltt"))
             try:

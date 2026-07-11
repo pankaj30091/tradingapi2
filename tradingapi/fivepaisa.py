@@ -1,4 +1,5 @@
 import datetime as dt
+import copy
 import inspect
 import io
 import json
@@ -157,7 +158,7 @@ def save_symbol_data(saveToFolder: bool = False):
         _proxies = None
         try:
             from .proxy_utils import get_proxies_for_broker
-            _proxies = get_proxies_for_broker("FIVEPAISA")
+            _proxies = get_proxies_for_broker("FIVEPAISA", purpose="symbol_download")
         except Exception:
             pass
         headers = {
@@ -2020,7 +2021,8 @@ class FivePaisa(BrokerBase):
                                 if self.api is None:
                                     raise BrokerConnectionError("API client not initialized")
                                 out = self.api.cancel_order(exch_order_id=order.exch_order_id)
-                                self.log_and_return(out)
+                                if out is not None:
+                                    self.log_and_return(out)
 
                                 if out and "BrokerOrderID" in out:
                                     # Convert broker_order_id to string for consistency
@@ -3482,10 +3484,14 @@ class FivePaisa(BrokerBase):
                 raise MarketDataError(f"Exchange mapping not found: {str(e)}", context)
 
             if scrip_code is None:
+                symbol_map = self.exchange_mappings[mapped_exchange]["symbol_map"]
+                symbol_prefix = str(long_symbol).split("_", 1)[0]
+                matching_symbols = [symbol for symbol in symbol_map if str(symbol).startswith(f"{symbol_prefix}_")]
                 context = create_error_context(
                     long_symbol=long_symbol,
                     mapped_exchange=mapped_exchange,
-                    available_symbols=list(self.exchange_mappings[mapped_exchange]["symbol_map"].keys()),
+                    available_symbol_count=len(symbol_map),
+                    matching_symbol_sample=matching_symbols[:20],
                 )
                 trading_logger.log_warning("No scrip code found for symbol", context)
                 return market_feed  # Return default Price object if no scrip code is found
@@ -3495,11 +3501,32 @@ class FivePaisa(BrokerBase):
             ]
 
             try:
-                # Fetch market feed
                 if self.api is None:
                     raise BrokerConnectionError("API client not initialized")
+
+                def safe_float(value, default=float("nan")):
+                    if value in [None, "", 0, "0", "0.00", float("nan")]:
+                        return default
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return default
+
+                def safe_int(value, default=0):
+                    if value in [None, "", 0, "0", "0.00", float("nan")]:
+                        return default
+                    try:
+                        return int(str(value).strip())
+                    except (TypeError, ValueError):
+                        try:
+                            return int(float(cast(Union[int, float, str], value)))
+                        except (TypeError, ValueError):
+                            return default
+
                 self._wait_for_quote_rate_limit()
-                out = self.api.fetch_market_feed_scrip(req_list)
+                out = self.api.fetch_market_snapshot(
+                    [{"Exchange": mapped_exchange, "ExchangeType": exch_type, "ScripCode": str(scrip_code)}]
+                )
                 if not out or "Data" not in out or len(out["Data"]) == 0:
                     context = create_error_context(
                         long_symbol=long_symbol,
@@ -3507,7 +3534,7 @@ class FivePaisa(BrokerBase):
                         scrip_code=scrip_code,
                         api_response=out,
                     )
-                    raise MarketDataError("No market feed data received", context)
+                    raise MarketDataError("No market snapshot data received", context)
 
                 snapshot = out["Data"][0]
 
@@ -3555,12 +3582,13 @@ class FivePaisa(BrokerBase):
                         if best_ask_quantity is not None and best_ask_quantity > 0
                         else market_feed.ask_volume
                     )
-                market_feed.exchange = snapshot["Exch"]
-                market_feed.high = snapshot["High"] if snapshot["High"] > 0 else market_feed.high
-                market_feed.low = snapshot["Low"] if snapshot["Low"] > 0 else market_feed.low
-                market_feed.last = snapshot["LastRate"] if snapshot["LastRate"] > 0 else market_feed.last
-                market_feed.prior_close = snapshot["PClose"] if snapshot["PClose"] > 0 else market_feed.prior_close
-                market_feed.volume = snapshot["TotalQty"] if snapshot["TotalQty"] > 0 else market_feed.volume
+                market_feed.exchange = snapshot.get("Exchange", mapped_exchange)
+                market_feed.high = safe_float(snapshot.get("High"), market_feed.high)
+                market_feed.low = safe_float(snapshot.get("Low"), market_feed.low)
+                market_feed.last = safe_float(snapshot.get("LastTradedPrice"), market_feed.last)
+                market_feed.prior_close = safe_float(snapshot.get("PClose"), market_feed.prior_close)
+                market_feed.volume = safe_int(snapshot.get("Volume"), market_feed.volume)
+                market_feed.oi = safe_int(snapshot.get("OpenInterest"), market_feed.oi)
                 market_feed.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 trading_logger.log_debug(
@@ -3629,9 +3657,22 @@ class FivePaisa(BrokerBase):
                 context = create_error_context(symbols=symbols, exchange=exchange, error=str(e))
                 raise MarketDataError(f"Failed to map exchange: {str(e)}", context)
 
+            prices: Dict[str, Price] = {}
+
+            def safe_int(value, default=0) -> int:
+                if value in [None, "", 0, "0", "0.00", float("nan")]:
+                    return default
+                try:
+                    return int(str(value).strip())
+                except (TypeError, ValueError):
+                    try:
+                        return int(float(cast(Union[int, float, str], value)))
+                    except (TypeError, ValueError):
+                        return default
+
             def resolve_symbol_and_exchange(json_data):
                 """Resolve a token to the correct symbol/exchange even when the tick exchange key is incomplete."""
-                token = json_data.get("Token")
+                token = json_data.get("Token", json_data.get("ScripCode"))
                 try:
                     token_int = int(token) if token is not None else None
                 except (TypeError, ValueError):
@@ -3671,22 +3712,13 @@ class FivePaisa(BrokerBase):
                     return False
                 if data.get("ReqType"):
                     return False
-                return any(k in data for k in ("Token", "LastRate", "BidRate", "TickDt"))
+                return any(k in data for k in ("Token", "ScripCode", "LastRate", "BidRate", "TickDt", "OpenInterest"))
 
             def map_to_price(json_data):
                 """Map JSON data to Price object."""
                 try:
                     price = Price()
                     price.src = "fp"
-                    price.bid = json_data.get("BidRate", float("nan"))
-                    price.ask = json_data.get("OffRate", float("nan"))
-                    price.bid_volume = json_data.get("BidQty", float("nan"))
-                    price.ask_volume = json_data.get("OffQty", float("nan"))
-                    price.last = json_data.get("LastRate", float("nan"))
-                    price.prior_close = json_data.get("PClose", float("nan"))
-                    price.high = json_data.get("High", float("nan"))
-                    price.low = json_data.get("Low", float("nan"))
-                    price.volume = json_data.get("TotalQty", float("nan"))
                     price.symbol, resolved_exchange = resolve_symbol_and_exchange(json_data)
                     if price.symbol is None:
                         trading_logger.log_warning(
@@ -3700,8 +3732,36 @@ class FivePaisa(BrokerBase):
                             },
                         )
                         return None
+                    resolved_symbol = price.symbol
+                    price = prices.get(resolved_symbol, price)
+                    price.src = "fp"
+                    if "BidRate" in json_data:
+                        price.bid = json_data.get("BidRate", price.bid)
+                    if "OffRate" in json_data:
+                        price.ask = json_data.get("OffRate", price.ask)
+                    if "BidQty" in json_data:
+                        price.bid_volume = json_data.get("BidQty", price.bid_volume)
+                    if "OffQty" in json_data:
+                        price.ask_volume = json_data.get("OffQty", price.ask_volume)
+                    if "LastRate" in json_data:
+                        price.last = json_data.get("LastRate", price.last)
+                    if "PClose" in json_data:
+                        price.prior_close = json_data.get("PClose", price.prior_close)
+                    if "High" in json_data:
+                        price.high = json_data.get("High", price.high)
+                    if "Low" in json_data:
+                        price.low = json_data.get("Low", price.low)
+                    if "TotalQty" in json_data:
+                        price.volume = json_data.get("TotalQty", price.volume)
+                    if "OpenInterest" in json_data:
+                        price.oi = safe_int(json_data.get("OpenInterest"), price.oi)
+                    price.symbol = resolved_symbol
                     price.exchange = self.map_exchange_for_db(price.symbol, resolved_exchange)
-                    price.timestamp = self.convert_to_ist(json_data["TickDt"])
+                    if json_data.get("TickDt"):
+                        price.timestamp = self.convert_to_ist(json_data["TickDt"])
+                    else:
+                        price.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    prices[resolved_symbol] = price
                     return price
                 except Exception as e:
                     trading_logger.log_error("Error mapping price data", e, {"json_data": json_data})
@@ -3837,14 +3897,26 @@ class FivePaisa(BrokerBase):
                     with self._stream_reconnect_lock:
                         self._stream_reconnect_active = False
 
-            def connect_and_receive(req_data):
+            def connect_and_receive(req_data, extra_req_data=None):
                 """Connect and receive data."""
                 try:
                     if self.api is None:
                         raise BrokerConnectionError("API client not initialized")
                     self.api.connect(req_data)
-                    self.api.error_data(error_data)
                     ws = getattr(self.api, "ws", None)
+                    if ws is not None and extra_req_data:
+                        original_on_open = getattr(ws, "on_open", None)
+
+                        def on_open_with_extra_requests(opened_ws):
+                            if callable(original_on_open):
+                                original_on_open(opened_ws)
+                            for extra_req in extra_req_data or []:
+                                if extra_req:
+                                    self._wait_for_stream_request_rate_limit()
+                                    opened_ws.send(json.dumps(extra_req))
+
+                        ws.on_open = on_open_with_extra_requests
+                    self.api.error_data(error_data)
                     if ws is not None:
                         ws.on_close = close_data
                     self.api.receive_data(on_message)
@@ -3852,14 +3924,19 @@ class FivePaisa(BrokerBase):
                     trading_logger.log_error("Error in connect_and_receive", e, {"req_data": req_data})
                     raise
 
+            def is_ws_connected(ws) -> bool:
+                sock = getattr(ws, "sock", None)
+                return bool(sock is not None and getattr(sock, "connected", False))
+
             def has_live_stream():
                 """Return True only when the streaming thread and websocket are both usable."""
+                ws = getattr(self.api, "ws", None) if self.api is not None else None
                 return (
                     self.subscribe_thread is not None
                     and self.subscribe_thread.is_alive()
-                    and self.api is not None
-                    and getattr(self.api, "ws", None) is not None
-                    and callable(getattr(self.api.ws, "send", None))
+                    and ws is not None
+                    and callable(getattr(ws, "send", None))
+                    and is_ws_connected(ws)
                 )
 
             def reconnect_stream():
@@ -3899,11 +3976,15 @@ class FivePaisa(BrokerBase):
                         raise MarketDataError("No symbols to reconnect after socket closure", context)
                     if self.api is None:
                         raise BrokerConnectionError("API client not initialized")
-                    req_data_full = self.api.Request_Feed("mf", "s", req_list_full)
+                    req_data_full = copy.deepcopy(self.api.Request_Feed("mf", "s", req_list_full))
+                    oi_req_list_full = [dict(item) for item in req_list_full if item.get("ExchType") == "D"]
+                    extra_req_data_full = [
+                        copy.deepcopy(self.api.Request_Feed("oi", "s", oi_req_list_full))
+                    ] if oi_req_list_full else []
                     reconnect_started_ts = time.time()
                     self.subscribe_thread = threading.Thread(
                         target=connect_and_receive,
-                        args=(req_data_full,),
+                        args=(req_data_full, extra_req_data_full),
                         name="MarketDataStreamer",
                     )
                     self.subscribe_thread.start()
@@ -3934,6 +4015,8 @@ class FivePaisa(BrokerBase):
                 ws = getattr(self.api, "ws", None)
                 if ws is None or not callable(getattr(ws, "send", None)):
                     raise AttributeError("WebSocket client does not support send")
+                if not is_ws_connected(ws):
+                    raise WebSocketConnectionClosedException("Connection is already closed.")
                 self._wait_for_stream_request_rate_limit()
                 ws.send(json.dumps(req_data))
 
@@ -4020,7 +4103,9 @@ class FivePaisa(BrokerBase):
                 if req_list is not None and len(req_list) > 0:
                     if self.api is None:
                         raise BrokerConnectionError("API client not initialized")
-                    req_data = self.api.Request_Feed("mf", operation, req_list)
+                    req_data = copy.deepcopy(self.api.Request_Feed("mf", operation, req_list))
+                    oi_req_list = [dict(item) for item in req_list if item.get("ExchType") == "D"]
+                    oi_req_data = copy.deepcopy(self.api.Request_Feed("oi", operation, oi_req_list)) if oi_req_list else None
 
                     # Start the connection and receiving data in a separate thread
                     if not has_live_stream():
@@ -4033,6 +4118,8 @@ class FivePaisa(BrokerBase):
                         )
                         try:
                             send_stream_request(req_data)
+                            if oi_req_data:
+                                send_stream_request(oi_req_data)
                         except (AttributeError, WebSocketConnectionClosedException):
                             trading_logger.log_info(
                                 "WebSocket closed, reconnecting...",

@@ -2790,6 +2790,7 @@ def get_price(
             ask_volume=sum(price.ask_volume for price in prices),
             prior_close=sum(price.prior_close for price in prices),
             last=sum(price.last for price in prices),
+            oi=sum(price.oi for price in prices),
             symbol=prices[0].symbol,  # Assuming symbol remains the same for all prices
         )
 

@@ -108,7 +108,7 @@ def save_symbol_data(saveToFolder: bool = True):
     _proxies = None
     try:
         from .proxy_utils import get_proxies_for_broker
-        _proxies = get_proxies_for_broker("FLATTRADE")
+        _proxies = get_proxies_for_broker("FLATTRADE", purpose="symbol_download")
     except Exception:
         pass
     url = "https://api.shoonya.com/NSE_symbols.txt.zip"
@@ -2398,6 +2398,7 @@ class FlatTrade(BrokerBase):
                 market_feed.high = safe_float(tick_data.get("h"))
                 market_feed.low = safe_float(tick_data.get("l"))
                 market_feed.volume = safe_int(tick_data.get("v"))
+                market_feed.oi = safe_int(tick_data.get("oi"))
 
                 # Handle exchange mapping
                 try:
@@ -2482,6 +2483,17 @@ class FlatTrade(BrokerBase):
             prices = {}
             mapped_exchange = self.map_exchange_for_api(symbols[0], exchange)
 
+            def safe_int_value(value, default=0):
+                if value in [None, "", 0, "0", "0.00", float("nan")]:
+                    return default
+                try:
+                    return int(str(value).strip())
+                except (TypeError, ValueError):
+                    try:
+                        return int(float(value))
+                    except (ValueError, TypeError):
+                        return default
+
             # Function to map JSON data to a Price object
             def map_to_price(json_data):
                 price = Price()
@@ -2527,6 +2539,7 @@ class FlatTrade(BrokerBase):
                     else float(json_data.get("l"))
                 )
                 price.volume = float("nan") if json_data.get("v") in [None, float("nan")] else float(json_data.get("v"))
+                price.oi = safe_int_value(json_data.get("oi"))
                 symbol = self.exchange_mappings[json_data.get("e")]["symbol_map_reversed"].get(int(json_data.get("tk")))
                 price.exchange = self.map_exchange_for_db(symbol, json_data.get("e"))
                 price.timestamp = self.convert_ft_to_ist(int(json_data.get("ft", 0)))
@@ -2541,9 +2554,11 @@ class FlatTrade(BrokerBase):
                     if ext_callback:
                         ext_callback(price)
                 elif message.get("t") == "tf":
-                    required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l"}
+                    required_keys = {"bp1", "sp1", "c", "lp", "bq1", "sq1", "h", "l", "oi"}
                     if required_keys & message.keys():
                         price = prices.get(message.get("tk"))
+                        if price is None:
+                            return
                         if message.get("bp1"):
                             price.bid = float(message.get("bp1"))
                         if message.get("sp1"):
@@ -2562,6 +2577,8 @@ class FlatTrade(BrokerBase):
                             price.low = float(message.get("l"))
                         if message.get("v"):
                             price.volume = float(message.get("v"))
+                        if message.get("oi") not in [None, "", float("nan")]:
+                            price.oi = safe_int_value(message.get("oi"), price.oi)
                         price.timestamp = self.convert_ft_to_ist(int(message.get("ft", 0)))
                         prices[message.get("tk")] = price
                         if ext_callback:

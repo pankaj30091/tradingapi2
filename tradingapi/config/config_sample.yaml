@@ -2,13 +2,14 @@
 bhavcopy_folder : /home/psharma/onedrive/rfiles/data/bhavcopy
 
 # Optional: proxy for broker HTTP requests (e.g. connect, save_symbol_data).
-# When a broker has USE_PROXY: true, proxies are fetched from the source (e.g. webshare).
+# USE_PROXY: trading API calls. USE_PROXY_SYMBOL_DOWNLOAD: symbol master download only.
 proxy:
   source: webshare
   api_key: # Webshare API key (or set WEBSHARE_PROXY_API_KEY env)
   username: # Optional: override per-proxy username from API
   password: # Optional: override per-proxy password from API
   country_code: # Optional: e.g. IN
+  max_proxies: 30 # NordVPN servers to try when rotating (symbol download)
   mode: direct
 
 commissions:
@@ -22,6 +23,7 @@ commissions:
 FIVEPAISA:
   EXCHANGES: [NSE, BSE, MCX]
   USE_PROXY: false
+  USE_PROXY_SYMBOL_DOWNLOAD: false
   APP_NAME:
   APP_SOURCE:
   USER_ID:
@@ -41,6 +43,7 @@ FIVEPAISA:
 SHOONYA:
   EXCHANGES: [NSE, BSE, MCX]
   USE_PROXY: false
+  USE_PROXY_SYMBOL_DOWNLOAD: false
   USER:
   PWD:
   VC:
@@ -56,6 +59,7 @@ SHOONYA:
 ICICIDIRECT:
   EXCHANGES: [NSE, BSE, MCX]
   USE_PROXY: false
+  USE_PROXY_SYMBOL_DOWNLOAD: false
   API_KEY:
   API_SECRET:
   USER_ID: # Optional: used by icicidirect-generate-session (AUTO_SESSION_TOKEN_CMD)
@@ -91,6 +95,7 @@ ICICIDIRECT:
 DHAN:
   EXCHANGES: [NSE, BSE]
   USE_PROXY: false
+  USE_PROXY_SYMBOL_DOWNLOAD: false
   CLIENT_ID:
   ACCESS_TOKEN: # Optional fallback if TOTP/PIN flow is not used
   TOTP_TOKEN: # Optional: used for auto token refresh
@@ -107,6 +112,7 @@ DHAN:
 DHAN_ACCOUNT2:
   EXCHANGES: [NSE, BSE]
   USE_PROXY: false
+  USE_PROXY_SYMBOL_DOWNLOAD: false
   CLIENT_ID:
   ACCESS_TOKEN:
   TOTP_TOKEN:
