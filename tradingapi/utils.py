@@ -2732,7 +2732,10 @@ def is_within_60_seconds(json_price):
     # Ensure timestamp is a datetime object for type checker
     assert isinstance(timestamp, dt.datetime), f"Expected datetime object, got {type(timestamp)}"
     now = dt.datetime.now()
-    return now <= timestamp + dt.timedelta(seconds=60)
+    # Accept only ticks that are not older than 60 seconds and not materially in the future.
+    # A small forward tolerance avoids rejecting near-synchronous clock skew, but prevents
+    # malformed future timestamps from being treated as fresh indefinitely.
+    return (now - dt.timedelta(seconds=60)) <= timestamp <= (now + dt.timedelta(seconds=5))
 
 
 def _get_price_mds(brok: BrokerBase, symbol: str, exchange: str = "NSE", channel: str = "mds"):
@@ -3142,6 +3145,36 @@ def get_future_underlying_price(
 def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", mds: Optional[str] = None, last=True):
     if isinstance(brokers, BrokerBase):
         brokers = [brokers]
+    if "?" in long_symbol:
+        # Combo: mid of the summed quote breaks when the combo has short legs
+        # (summed bid/ask/mid can be <= 0) or any leg lacks a side, silently
+        # falling back to summed last prices. Price each leg's mid instead and
+        # sum weighted by leg quantity.
+        try:
+            legs = parse_combo_symbol(long_symbol)
+        except Exception as e:
+            trading_logger.log_error(f"Error parsing combo symbol {long_symbol}: {e}")
+            return float("nan")
+        combo_mid = 0.0
+        for leg_symbol, leg_qty in legs.items():
+            try:
+                leg_quote = get_price(brokers, leg_symbol, exchange=exchange, mds=mds)
+            except Exception as e:
+                trading_logger.log_error(f"Error getting price for combo leg {leg_symbol} on {exchange}: {e}")
+                return float("nan")
+            # Raw mid (no tick rounding) so combo MTM matches per-leg mark pricing
+            leg_mid = float("nan")
+            if leg_quote.bid > 0 and leg_quote.ask > 0:
+                leg_mid = (leg_quote.bid + leg_quote.ask) / 2
+            if math.isnan(leg_mid) and last:
+                leg_mid = leg_quote.last
+            if leg_mid is None or math.isnan(leg_mid):
+                trading_logger.log_warning(
+                    f"No mid price for combo leg {leg_symbol} of {long_symbol}, combo mid unavailable"
+                )
+                return float("nan")
+            combo_mid += leg_mid * leg_qty
+        return combo_mid
     try:
         quote = get_price(brokers, long_symbol, exchange=exchange, mds=mds)
     except Exception as e:
