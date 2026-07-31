@@ -411,6 +411,7 @@ class Shoonya(BrokerBase):
         self._last_market_data_api_call_ts = 0.0
         self._global_market_data_rate_limit_key = "shoonya:market_data:last_call_ts"
         self._global_market_data_rate_limit_lock_key = "shoonya:market_data:lock"
+        self._session_refresh_lock = threading.RLock()
 
     def _get_adjusted_expiry_date(self, year, month) -> dt.datetime:
         """
@@ -696,7 +697,7 @@ class Shoonya(BrokerBase):
         except Exception:
             pass
 
-        def _fresh_login(susertoken_path, max_attempts: int = max_attempts) -> None:
+        def _fresh_login_unlocked(susertoken_path, max_attempts: int = max_attempts) -> None:
             """Perform fresh login with TOTP retry logic."""
             try:
                 trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
@@ -802,6 +803,45 @@ class Shoonya(BrokerBase):
                 trading_logger.log_error("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
+        def _fresh_login(susertoken_path, max_attempts: int = max_attempts) -> None:
+            """Serialize TOTP login and shared-token writes across processes."""
+            with self._session_refresh_lock:
+                token_mtime_before = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                distributed_lock = None
+                lock_acquired = False
+                try:
+                    lock_redis = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+                    distributed_lock = lock_redis.lock(
+                        f"shoonya:session-refresh:{self.account_key}",
+                        timeout=300,
+                        blocking_timeout=310,
+                    )
+                    lock_acquired = bool(distributed_lock.acquire(blocking=True))
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Distributed Shoonya session lock unavailable; using process-local lock",
+                        {"broker": self.broker.name, "error": str(e)},
+                    )
+
+                try:
+                    token_mtime_after = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                    token_was_refreshed = token_mtime_after is not None and (
+                        token_mtime_before is None or token_mtime_after > token_mtime_before
+                    )
+                    if lock_acquired and token_was_refreshed and _restore_session_from_token(susertoken_path):
+                        trading_logger.log_info(
+                            "Reused session refreshed by another process",
+                            {"broker": self.broker.name},
+                        )
+                        return
+                    return _fresh_login_unlocked(susertoken_path, max_attempts)
+                finally:
+                    if lock_acquired and distributed_lock is not None:
+                        try:
+                            distributed_lock.release()
+                        except Exception:
+                            pass
+
         def get_connected() -> bool:
             """Main connection logic with robust session management."""
             susertoken_path = config.get(f"{self.account_key}.USERTOKEN")
@@ -879,8 +919,9 @@ class Shoonya(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to update symbology", {"error": str(e)})
 
-            # Get connected using robust session management
-            get_connected()
+            # Session replacement is single-flight for callers sharing this broker instance.
+            with self._session_refresh_lock:
+                get_connected()
 
             # Initialize Redis connection with error handling
             try:

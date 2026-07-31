@@ -349,6 +349,8 @@ class FivePaisa(BrokerBase):
             self._fp_susertoken_path: Optional[str] = None
             self._fp_restore_session_from_token: Optional[Callable[[str], bool]] = None
             self._fp_fresh_login: Optional[Callable[[str], None]] = None
+            self._session_refresh_lock = threading.RLock()
+            self._session_generation = 0
             self._stream_reconnect_lock = threading.Lock()
             self._stream_reconnect_serial_lock = threading.Lock()
             self._stream_subscriptions_lock = threading.Lock()
@@ -697,7 +699,7 @@ class FivePaisa(BrokerBase):
                 trading_logger.log_error("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
-        def _fresh_login(susertoken_path):
+        def _fresh_login_unlocked(susertoken_path):
             """Perform fresh login with TOTP retry logic."""
             try:
                 trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
@@ -769,6 +771,49 @@ class FivePaisa(BrokerBase):
             except Exception as e:
                 context = create_error_context(susertoken_path=susertoken_path, error=str(e))
                 raise AuthenticationError(f"Error in _fresh_login: {str(e)}", context)
+
+        def _fresh_login(susertoken_path):
+            """Serialize session replacement locally and across processes using this account."""
+            with self._session_refresh_lock:
+                token_mtime_before = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                distributed_lock = None
+                lock_acquired = False
+                try:
+                    lock_redis = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+                    distributed_lock = lock_redis.lock(
+                        f"fivepaisa:session-refresh:{self.account_key}",
+                        timeout=300,
+                        blocking_timeout=310,
+                    )
+                    lock_acquired = bool(distributed_lock.acquire(blocking=True))
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Distributed FivePaisa session lock unavailable; using process-local lock",
+                        {"broker": self.broker.name, "error": str(e)},
+                    )
+
+                try:
+                    token_mtime_after = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                    token_was_refreshed = token_mtime_after is not None and (
+                        token_mtime_before is None or token_mtime_after > token_mtime_before
+                    )
+                    if lock_acquired and token_was_refreshed and _restore_session_from_token(susertoken_path):
+                        self._session_generation += 1
+                        trading_logger.log_info(
+                            "Reused session refreshed by another process",
+                            {"broker": self.broker.name},
+                        )
+                        return None
+
+                    result = _fresh_login_unlocked(susertoken_path)
+                    self._session_generation += 1
+                    return result
+                finally:
+                    if lock_acquired and distributed_lock is not None:
+                        try:
+                            distributed_lock.release()
+                        except Exception:
+                            pass
 
         self._fp_restore_session_from_token = _restore_session_from_token
         self._fp_fresh_login = _fresh_login
@@ -852,9 +897,11 @@ class FivePaisa(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to update symbology", {"error": str(e)})
 
-            # Get connected using robust session management
-            get_connected()
-            self._configure_api_proxy_session()
+            # Session replacement is single-flight for publishers sharing this broker instance.
+            with self._session_refresh_lock:
+                get_connected()
+                self._configure_api_proxy_session()
+                self._session_generation += 1
 
             # Set up Redis connection
             try:
@@ -2964,21 +3011,45 @@ class FivePaisa(BrokerBase):
                         )
                         continue
 
+                    def fetch_historical_data():
+                        api = self.api
+                        if api is None:
+                            raise BrokerConnectionError("API client not initialized")
+                        self._wait_for_historical_rate_limit()
+                        return api.historical_data(
+                            exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
+                        )
+
+                    session_generation = self._session_generation
                     data = None
                     first_error = None
                     try:
-                        if self.api is None:
-                            raise BrokerConnectionError("API client not initialized")
-                        self._wait_for_historical_rate_limit()
-                        data = self.api.historical_data(
-                            exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
-                        )
+                        data = fetch_historical_data()
                     except Exception as e:
                         first_error = e
 
+                    # py5paisa swallows all historical-data exceptions and returns None.
+                    # Retry once on the current session before treating it as a session failure.
+                    if data is None:
+                        trading_logger.log_info(
+                            "Historical API returned None; retrying current session once",
+                            {
+                                "symbol": row_outer["long_symbol"],
+                                "exch": exch,
+                                "exch_type": exch_type,
+                                "scripcode": row_outer["Scripcode"],
+                                "error": str(first_error) if first_error else None,
+                            },
+                        )
+                        try:
+                            data = fetch_historical_data()
+                            first_error = None
+                        except Exception as e:
+                            first_error = e
+
                     if first_error is not None or data is None:
                         trading_logger.log_info(
-                            "Historical API failed/None; reconnecting and retrying once",
+                            "Historical API failed after current-session retry; refreshing session once",
                             {
                                 "symbol": row_outer["long_symbol"],
                                 "exch": exch,
@@ -2998,13 +3069,14 @@ class FivePaisa(BrokerBase):
                             )
                             if redis_db is None:
                                 raise BrokerConnectionError("Redis DB unavailable for reconnect retry")
-                            self.connect(redis_db=int(redis_db))
+                            # Multiple publishers share this broker. Only the first failed
+                            # caller refreshes the session; queued callers reuse it.
+                            with self._session_refresh_lock:
+                                if self._session_generation == session_generation:
+                                    self.connect(redis_db=int(redis_db))
                             if self.api is None:
                                 raise BrokerConnectionError("API client not initialized after reconnect")
-                            self._wait_for_historical_rate_limit()
-                            data = self.api.historical_data(
-                                exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
-                            )
+                            data = fetch_historical_data()
                         except Exception as retry_error:
                             trading_logger.log_error(
                                 "Error fetching historical data from API after reconnect retry",
