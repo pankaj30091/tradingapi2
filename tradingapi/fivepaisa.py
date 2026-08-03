@@ -3969,7 +3969,12 @@ class FivePaisa(BrokerBase):
                             {"close_status_code": close_status_code, "close_msg": close_msg},
                         )
                         return
-                    trading_logger.log_warning(
+                    log_close = (
+                        trading_logger.log_info
+                        if self._suppress_stream_reconnect
+                        else trading_logger.log_warning
+                    )
+                    log_close(
                         "WebSocket closed",
                         {"close_status_code": close_status_code, "close_msg": close_msg},
                     )
