@@ -6,6 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, "/home/psharma/onedrive/code/tradingapi2")
 
 from tradingapi import config
+from tradingapi import market_hours
 from tradingapi import utils
 
 
@@ -69,6 +70,21 @@ class MarketHoursConfigTest(unittest.TestCase):
                 symbol="SENSEX_OPT_20260827_CALL_80000", as_of="2026-08-03"
             ),
             "15:40:00",
+        )
+
+    def test_session_bounds_uses_symbol_segment(self):
+        session_date = dt.date(2026, 8, 3)
+        cash = market_hours.session_bounds(session_date, exchange="NSE", symbol="NIFTY_IND___")
+        fno = market_hours.session_bounds(
+            session_date, exchange="NSE", symbol="NIFTY_OPT_20260827_CALL_25000"
+        )
+        self.assertEqual(cash[1].time(), dt.time(15, 35))
+        self.assertEqual(fno[1].time(), dt.time(15, 40))
+
+    def test_latest_close_covers_mixed_market_services(self):
+        self.assertEqual(
+            market_hours.latest_close_datetime(dt.date(2026, 8, 3)).time(),
+            dt.time(15, 40),
         )
 
     def test_latest_effective_schedule_wins(self):
