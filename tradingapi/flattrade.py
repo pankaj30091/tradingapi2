@@ -43,7 +43,12 @@ def _filter_epoch_historical_rows(rows: List["HistoricalData"]) -> List["Histori
 from NorenRestApiPy.NorenApi import NorenApi, position as FlatTradePosition
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
-from .config import get_config
+from .config import (
+    get_config,
+    get_market_close_time,
+    get_market_open_time,
+    is_within_market_hours,
+)
 from .utils import json_serializer_default, parse_combo_symbol, set_starting_internal_ids_int, update_order_status
 from . import globals as tradingapi_globals
 from .globals import get_tradingapi_now
@@ -1840,7 +1845,7 @@ class FlatTrade(BrokerBase):
         date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     )
     def get_historical(
         self,
@@ -1849,8 +1854,8 @@ class FlatTrade(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange="NSE",
         periodicity="1m",
-        market_open_time="09:15:00",
-        market_close_time="15:30:00",
+        market_open_time: Optional[str] = None,
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -1862,7 +1867,8 @@ class FlatTrade(BrokerBase):
             date_start (str): Date formatted as YYYY-MM-DD.
             date_end (str): Date formatted as YYYY-MM-DD.
             periodicity (str): Defaults to '1m'.
-            market_close_time (str): Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            market_open_time: Optional override; configured exchange/market open is used when omitted.
+            market_close_time: Optional override; configured exchange/market close is used when omitted.
             refresh_mapping: If True, load symbol mapping from date_end's symbols CSV file instead of using cached mapping.
                 Defaults to False.
 
@@ -1992,6 +1998,12 @@ class FlatTrade(BrokerBase):
                 exchange = self.map_exchange_for_api(row_outer["long_symbol"], exchange)
                 historical_data_list = []
                 exch = exchange
+                resolved_market_close_time = market_close_time or get_market_close_time(
+                    exchange=exchange, symbol=row_outer["long_symbol"], as_of=date_end
+                )
+                resolved_market_open_time = market_open_time or get_market_open_time(
+                    exchange=exchange, symbol=row_outer["long_symbol"], as_of=date_start
+                )
                 s = row_outer["long_symbol"].replace("/", "-")
                 row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
                 # we do the above remapping for downloading permin data to database for legacy reasons.
@@ -2010,7 +2022,7 @@ class FlatTrade(BrokerBase):
                 ):
                     raise ValueError(f"Invalid date_start format: {date_start}")
                 date_start_dt = dt.datetime.strptime(
-                    date_start_parsed.strftime("%Y-%m-%d") + " " + market_open_time,
+                    date_start_parsed.strftime("%Y-%m-%d") + " " + resolved_market_open_time,
                     "%Y-%m-%d %H:%M:%S",
                 )
 
@@ -2027,7 +2039,7 @@ class FlatTrade(BrokerBase):
                 ):
                     raise ValueError(f"Invalid date_end format: {date_end}")
                 date_end_dt = dt.datetime.strptime(
-                    date_end_parsed.strftime("%Y-%m-%d") + " " + market_close_time,
+                    date_end_parsed.strftime("%Y-%m-%d") + " " + resolved_market_close_time,
                     "%Y-%m-%d %H:%M:%S",
                 )
                 try:
@@ -2098,8 +2110,6 @@ class FlatTrade(BrokerBase):
                     data = None
 
                 if not (data is None or len(data) == 0):
-                    market_open = pd.to_datetime(market_open_time).time()
-                    market_close = pd.to_datetime(market_close_time).time()
                     for d in data:
                         if isinstance(d, str):
                             d = json.loads(d)
@@ -2108,7 +2118,13 @@ class FlatTrade(BrokerBase):
                                 timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S"))
                             )
                             # Filter by market open/close time for intraday
-                            if not (market_open <= date.time() < market_close):
+                            if not is_within_market_hours(
+                                date,
+                                exchange=exchange,
+                                symbol=row_outer["long_symbol"],
+                                market_open_time=market_open_time,
+                                market_close_time=market_close_time,
+                            ):
                                 continue
                         elif periodicity == "1d":
                             date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))

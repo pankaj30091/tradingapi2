@@ -43,7 +43,7 @@ from .broker_base import (
     Price,
     _normalize_as_of_date,
 )
-from .config import get_config
+from .config import get_config, is_within_market_hours
 from .utils import set_starting_internal_ids_int, update_order_status
 from .exceptions import (
     AuthenticationError,
@@ -1963,7 +1963,7 @@ class IciciDirect(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
-        market_close_time: str = "15:30:00",
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -2055,6 +2055,18 @@ class IciciDirect(BrokerBase):
                         oi=int(float(row.get("open_interest", 0) or 0)),
                     )
                 )
+
+            if periodicity not in ("1d", "D"):
+                out = [
+                    row
+                    for row in out
+                    if is_within_market_hours(
+                        row.date,
+                        exchange=mapped_exchange,
+                        symbol=symbol,
+                        market_close_time=market_close_time,
+                    )
+                ]
 
             # For 1d periodicity, when date_end is today, update with today's OHLCV from intraday (like Shoonya).
             today_date = get_tradingapi_now().date()

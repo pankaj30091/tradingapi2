@@ -193,6 +193,16 @@ commissions:
 tz: "Asia/Kolkata"
 datapath: "/path/to/data"
 market_open_time: "09:15:00"
+market_close_time: "15:30:00" # Fallback when no schedule applies
+market_hours:
+  - effective_date: "2026-08-03"
+    exchanges:
+      NSE:
+        CASH: {open_time: "09:15:00", close_time: "15:35:00"}
+        FNO: {open_time: "09:15:00", close_time: "15:40:00"}
+      BSE:
+        CASH: {open_time: "09:15:00", close_time: "15:35:00"}
+        FNO: {open_time: "09:15:00", close_time: "15:40:00"}
 
 # FivePaisa Broker Configuration
 FIVEPAISA:
@@ -549,7 +559,7 @@ historical_data = broker.get_historical(
     date_end="2024-12-16",
     exchange="N",
     periodicity="1m",  # 1m, 5m, 1d, etc.
-    market_close_time="15:30:00"
+    # market_close_time="15:40:00"  # Optional per-call override
 )
 
 # Access data

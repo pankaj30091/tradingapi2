@@ -38,7 +38,7 @@ from .broker_base import (
     is_broker_side_terminal_order,
     is_missing_exchange_order_id,
 )
-from .config import get_config, get_fno_freeze_limit
+from .config import get_config, get_fno_freeze_limit, get_market_close_time
 from .exceptions import (
     SymbolError,
     TradingAPIError,
@@ -537,7 +537,7 @@ def needs_refresh_status_from_redis(broker: BrokerBase, pnl_df: pd.DataFrame) ->
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     start_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
     end_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
 )
 def get_pnl_table(
     broker: BrokerBase,
@@ -545,7 +545,7 @@ def get_pnl_table(
     start_time: str = "1970-01-01 00:00:00",
     end_time: Optional[str] = None,
     refresh_status=False,
-    market_close_time="15:30:00",
+    market_close_time: Optional[str] = None,
     eod=False,
 ) -> pd.DataFrame:
     """Get P&L table for a specified strategy with enhanced error handling.
@@ -556,7 +556,7 @@ def get_pnl_table(
         start_time (str, optional): Start Date for strategy pnl. Defaults to "1970-01-01 00:00:00".
         end_time (str, optional): End Date for strategy pnl. Defaults to current time when function is called.
         refresh_status (bool, optional): Whether to refresh order status. Defaults to False.
-        market_close_time (str, optional): closing time for option expiry, defaults to "15:30:00"
+        market_close_time: Optional override for derivative expiry time.
         eod (bool, optional): Whether this is end-of-day processing. Defaults to False.
 
     Returns:
@@ -810,7 +810,14 @@ def get_pnl_table(
 
                 if eod:
                     # Handle option expiration
-                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(effective_symbol, market_close_time):
+                    expiry_exchange = (
+                        hget_with_default(broker, entry_keys[0], "exchange", "NSE")
+                        if entry_keys
+                        else "NSE"
+                    )
+                    if exit_quantity + entry_quantity != 0 and contains_earlier_date(
+                        effective_symbol, market_close_time, exchange=expiry_exchange
+                    ):
                         try:
                             # are options expiration needed?
                             get_open_position_by_order(
@@ -949,9 +956,13 @@ def get_pnl_table(
 @log_execution_time
 @validate_inputs(
     input_string=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
 )
-def contains_earlier_date(input_string: str, market_close_time: str) -> bool:
+def contains_earlier_date(
+    input_string: str,
+    market_close_time: Optional[str] = None,
+    exchange: Optional[str] = None,
+) -> bool:
     """True if current time is after (expiry date from input_string + market_close_time)."""
     if ":" in input_string:
         segment = input_string.split(":", 1)[0].split("?", 1)[0].strip()
@@ -961,6 +972,9 @@ def contains_earlier_date(input_string: str, market_close_time: str) -> bool:
     if not match:
         return False
     expiry_date = match.group(0)
+    market_close_time = market_close_time or get_market_close_time(
+        exchange=exchange, symbol=segment, market="FNO", as_of=expiry_date
+    )
     close_t = dt.datetime.strptime(market_close_time, "%H:%M:%S").time()
     expiry_dt = dt.datetime.strptime(expiry_date, "%Y%m%d").replace(
         hour=close_t.hour, minute=close_t.minute, second=close_t.second, microsecond=0
@@ -1121,14 +1135,14 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
 @log_execution_time
 @validate_inputs(
     int_order_id=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
 )
 def get_open_position_by_order(
     broker: BrokerBase,
     int_order_id: str,
     exclude_zero: bool = True,
     side: List[str] = ["entry", "exit"],
-    market_close_time: str = "15:30:00",
+    market_close_time: Optional[str] = None,
 ) -> Dict[str, Position]:
     """Get open positions for a specific internal order ID.
 
@@ -1282,7 +1296,25 @@ def get_open_position_by_order(
         # check for expired contracts
         for symbol, position in positions.items():
             if position.size != 0:
-                expired = _expire_derivative(broker, int_order_id, symbol, position.size, market_close_time)
+                entry_keys = hget_with_default(broker, int_order_id, "entry_keys", "").split()
+                expiry_exchange = (
+                    hget_with_default(broker, entry_keys[0], "exchange", "NSE")
+                    if entry_keys
+                    else "NSE"
+                )
+                resolved_market_close_time = market_close_time or get_market_close_time(
+                    exchange=expiry_exchange,
+                    symbol=symbol,
+                    market="FNO",
+                    as_of=symbol.split("_")[2],
+                )
+                expired = _expire_derivative(
+                    broker,
+                    int_order_id,
+                    symbol,
+                    position.size,
+                    resolved_market_close_time,
+                )
                 if expired:
                     expired_contracts.append(symbol)
         positions = {key: value for key, value in positions.items() if value.symbol not in expired_contracts}
@@ -2902,7 +2934,7 @@ def get_price(
 
 # ---------------------------------------------------------------------------
 # Unified price cache: (symbol, time_key) -> price. Used for EOD and intraday.
-# time_key: "YYYYMMDD_1529" for EOD, "YYYYMMDD_HHMM" for intraday. No TTL.
+# time_key: "YYYYMMDD_HHMM" using the configured EOD/intraday minute. No TTL.
 # ---------------------------------------------------------------------------
 _price_cache: Dict[Tuple[str, str], float] = {}
 _GET_HISTORICAL_CALL_LOG_FILE = os.path.join(os.path.expanduser("~/logs"), "get_historical_calls.log")
@@ -2985,7 +3017,7 @@ def get_historical_close_at_time(
     """
     Get historical close price at a specific time or EOD for a date.
 
-    - If `at` is a date (or date-only str): return EOD close (15:29 bar) for that date.
+    - If `at` is a date (or date-only str): return the last configured market minute.
     - If `at` is a datetime with time: return close of 1m bar at or just before that time.
 
     Priority: (1) cache, (2) ohlcutils load_symbol if available, (3) broker.get_historical.
@@ -3000,16 +3032,22 @@ def get_historical_close_at_time(
             at = at.to_pydatetime()
         if isinstance(at, dt.date) and not isinstance(at, dt.datetime):
             d = at
-            target_dt = dt.datetime.combine(d, dt.time(15, 29, 0))
+            close_time = get_market_close_time(exchange=exchange, symbol=symbol, as_of=d)
+            target_dt = dt.datetime.combine(
+                d, dt.datetime.strptime(close_time, "%H:%M:%S").time()
+            ) - dt.timedelta(minutes=1)
             date_str = d.strftime("%Y-%m-%d")
-            time_key = d.strftime("%Y%m%d") + "_1529"
+            time_key = target_dt.strftime("%Y%m%d_%H%M")
         elif isinstance(at, str):
             at_parsed = parse_datetime(at)
             if hasattr(at_parsed, "hour") and at_parsed.hour == 0 and at_parsed.minute == 0:
                 d = at_parsed.date()
-                target_dt = dt.datetime.combine(d, dt.time(15, 29, 0))
+                close_time = get_market_close_time(exchange=exchange, symbol=symbol, as_of=d)
+                target_dt = dt.datetime.combine(
+                    d, dt.datetime.strptime(close_time, "%H:%M:%S").time()
+                ) - dt.timedelta(minutes=1)
                 date_str = d.strftime("%Y-%m-%d")
-                time_key = d.strftime("%Y%m%d") + "_1529"
+                time_key = target_dt.strftime("%Y%m%d_%H%M")
             else:
                 target_dt = at_parsed.replace(tzinfo=None) if at_parsed.tzinfo else at_parsed
                 target_dt = target_dt.replace(second=0, microsecond=0)
@@ -3020,8 +3058,13 @@ def get_historical_close_at_time(
             target_dt = at_dt.replace(tzinfo=None) if at_dt.tzinfo else at_dt
             target_dt = target_dt.replace(second=0, microsecond=0)
             if target_dt.hour == 0 and target_dt.minute == 0:
-                target_dt = dt.datetime.combine(target_dt.date(), dt.time(15, 29, 0))
-                time_key = target_dt.strftime("%Y%m%d") + "_1529"
+                close_time = get_market_close_time(
+                    exchange=exchange, symbol=symbol, as_of=target_dt.date()
+                )
+                target_dt = dt.datetime.combine(
+                    target_dt.date(), dt.datetime.strptime(close_time, "%H:%M:%S").time()
+                ) - dt.timedelta(minutes=1)
+                time_key = target_dt.strftime("%Y%m%d_%H%M")
             else:
                 time_key = target_dt.strftime("%Y%m%d_%H%M")
             date_str = target_dt.strftime("%Y-%m-%d")
@@ -3032,6 +3075,9 @@ def get_historical_close_at_time(
     if cached is not None:
         return cached
 
+    resolved_market_close_time = get_market_close_time(
+        exchange=exchange, symbol=symbol, as_of=date_str
+    )
     if _ohlcutils_available and load_symbol is not None and Periodicity is not None:
         try:
             date_str_fmt = date_str if "-" in date_str else f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
@@ -3041,7 +3087,7 @@ def get_historical_close_at_time(
                 end_time=date_str_fmt + " 23:59:59",
                 src=Periodicity.PERMIN,
                 exchange=exchange,
-                market_close_time="15:30:00",
+                market_close_time=resolved_market_close_time,
             )
             if df is not None and not df.empty and "close" in df.columns:
                 import pytz
@@ -3069,7 +3115,7 @@ def get_historical_close_at_time(
             date_end=date_str,
             exchange=exchange,
             periodicity="1m",
-            market_close_time="15:30:00",
+            market_close_time=resolved_market_close_time,
             refresh_mapping=refresh_mapping,
         )
         if symbol.startswith("NIFTY_"):
@@ -3193,6 +3239,18 @@ def get_mid_price(brokers: list[BrokerBase], long_symbol: str, exchange="NSE", m
     return mid
 
 
+def _derivative_expiry_datetime(
+    expiry: str,
+    symbol: str,
+    exchange: str,
+    market_close_time: Optional[str] = None,
+) -> dt.datetime:
+    close_time = market_close_time or get_market_close_time(
+        exchange=exchange, market="FNO", symbol=symbol, as_of=expiry
+    )
+    return dt.datetime.strptime(f"{expiry} {close_time}", "%Y%m%d %H:%M:%S")
+
+
 def get_option_underlying_price(
     brokers: list[BrokerBase],
     symbol: str,
@@ -3238,10 +3296,10 @@ def get_option_underlying_price(
                 return None
             as_of_dt = parse_datetime(as_of)
             t_o = calc_fractional_business_days(
-                as_of_dt, dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+                as_of_dt, _derivative_expiry_datetime(opt_expiry, symbol, exchange)
             )
             t_f = calc_fractional_business_days(
-                as_of_dt, dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+                as_of_dt, _derivative_expiry_datetime(fut_expiry, symbol, exchange)
             )
             if t_f and t_f > 0:
                 price_f = price_u + (price_f - price_u) * t_o / t_f
@@ -3277,10 +3335,10 @@ def get_option_underlying_price(
 
     if is_index and fut_expiry:
         t_o = calc_fractional_business_days(
-            dt.datetime.now(), dt.datetime.strptime(opt_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+            dt.datetime.now(), _derivative_expiry_datetime(opt_expiry, symbol, exchange)
         )
         t_f = calc_fractional_business_days(
-            dt.datetime.now(), dt.datetime.strptime(fut_expiry + " 15:30:00", "%Y%m%d %H:%M:%S")
+            dt.datetime.now(), _derivative_expiry_datetime(fut_expiry, symbol, exchange)
         )
         underlying_ind = f"{base}_IND___"
         last_price = get_mid_price(brokers, underlying_ind, exchange=exchange, mds=mds, last=True)
@@ -3345,11 +3403,14 @@ def _option_mark_price(
 
 def _years_to_expiry(
     long_symbol: str,
-    market_close_time="15:30:00",
+    market_close_time: Optional[str] = None,
+    exchange: str = "NSE",
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ) -> float:
     ref_time = get_tradingapi_now() if as_of is None else _asof_to_ref_time_naive(as_of)
-    expiry = dt.datetime.strptime(long_symbol.split("_")[2] + " " + market_close_time, "%Y%m%d %H:%M:%S")
+    expiry = _derivative_expiry_datetime(
+        long_symbol.split("_")[2], long_symbol, exchange, market_close_time
+    )
     return calc_fractional_business_days(ref_time, expiry) / 252
 
 
@@ -3379,12 +3440,14 @@ def calculate_delta(
     brokers: list[BrokerBase],
     long_symbol,
     price_f,
-    market_close_time="15:30:00",
+    market_close_time: Optional[str] = None,
     exchange="NSE",
     mds: Optional[str] = None,
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
 ):
-    t = _years_to_expiry(long_symbol, market_close_time, as_of=as_of)
+    t = _years_to_expiry(
+        long_symbol, market_close_time, exchange=exchange, as_of=as_of
+    )
     vol = _implied_vol_for_option(brokers, long_symbol, price_f, t, exchange=exchange, mds=mds, as_of=as_of)
     if math.isnan(vol):
         return float("nan")
@@ -3413,7 +3476,7 @@ def find_option_with_delta(
     option_chain,
     target_delta,
     return_lower_delta,
-    market_close_time="15:30:00",
+    market_close_time: Optional[str] = None,
     exchange="NSE",
     mds: Optional[str] = "mds",
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,
@@ -3447,7 +3510,9 @@ def find_option_with_delta(
 
     strikes = [float(sym.split("_")[4]) for sym in option_chain]
     option_type = option_chain[0].split("_")[3]
-    years = _years_to_expiry(option_chain[0], market_close_time, as_of=as_of)
+    years = _years_to_expiry(
+        option_chain[0], market_close_time, exchange=exchange, as_of=as_of
+    )
     if years <= 0:
         trading_logger.log_warning(
             f"find_option_with_delta: option expired or T<=0. symbol={option_chain[0]} years={years}"
@@ -3544,7 +3609,7 @@ def find_option_with_delta(
     opt_expiry=lambda x: isinstance(x, str) and len(x.strip()) == 8,
     option_type=lambda x: isinstance(x, str) and x in ["CALL", "PUT"],
     exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-    market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+    market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     as_of=lambda x: x is None
     or isinstance(x, (dt.datetime, dt.date, str))
     or isinstance(x, pd.Timestamp),
@@ -3560,7 +3625,7 @@ def get_delta_strike(
     return_lower_delta=True,
     use_future=True,
     search_range=[0.8, 1.2],
-    market_close_time="15:30:00",
+    market_close_time: Optional[str] = None,
     exchange="NSE",
     mds: Optional[str] = None,
     as_of: Optional[Union[dt.datetime, dt.date, str, pd.Timestamp]] = None,

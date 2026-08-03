@@ -99,7 +99,11 @@ from .broker_base import (
     is_broker_side_terminal_order,
     is_missing_exchange_order_id,
 )
-from .config import get_config
+from .config import (
+    get_config,
+    get_market_open_time,
+    is_within_market_hours,
+)
 from .utils import (
     delete_broker_order_id,
     get_price,
@@ -2833,7 +2837,7 @@ class FivePaisa(BrokerBase):
         date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     )
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_historical(
@@ -2843,8 +2847,8 @@ class FivePaisa(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
-        market_open_time: str = "09:15:00",
-        market_close_time: str = "15:30:00",
+        market_open_time: Optional[str] = None,
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -2857,7 +2861,8 @@ class FivePaisa(BrokerBase):
             date_end: End date (can be string, datetime, or date object).
             exchange: Exchange name. Defaults to "N".
             periodicity: Defaults to '1m'.
-            market_close_time: Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            market_open_time: Optional override; configured exchange/market open is used when omitted.
+            market_close_time: Optional override; configured exchange/market close is used when omitted.
             refresh_mapping: If True, load symbol mapping from date_end's symbols CSV file instead of using cached mapping.
                 Defaults to False.
 
@@ -3106,11 +3111,16 @@ class FivePaisa(BrokerBase):
                             data["date"] = pd.to_datetime(data["date"])
                             data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
                             if "m" in periodicity:
-                                market_open = pd.to_datetime(market_open_time).time()
-                                market_close = pd.to_datetime(market_close_time).time()
-                                data = data[
-                                    (data["date"].dt.time >= market_open) & (data["date"].dt.time < market_close)
-                                ]
+                                in_session = data["date"].map(
+                                    lambda timestamp: is_within_market_hours(
+                                        timestamp,
+                                        exchange=exchange,
+                                        symbol=row_outer["long_symbol"],
+                                        market_open_time=market_open_time,
+                                        market_close_time=market_close_time,
+                                    )
+                                )
+                                data = data[in_session]
                             # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
                             if any(period in periodicity for period in ["d"]):
                                 data["date"] = data["date"].dt.floor("D")
@@ -3444,12 +3454,19 @@ class FivePaisa(BrokerBase):
 
     @log_execution_time
     @validate_inputs(date_string=lambda x: isinstance(x, str) and len(x.strip()) > 0)
-    def convert_to_ist(self, date_string):
+    def convert_to_ist(
+        self,
+        date_string,
+        exchange: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ):
         """
         Convert a string in the format '/Date(1732010010000)/' to IST date and time with enhanced error handling.
 
         Args:
             date_string: The string containing the date in /Date(milliseconds)/ format.
+            exchange: Optional exchange used for configured fallback time.
+            symbol: Optional long symbol used for configured fallback time.
 
         Returns:
             str: The corresponding date and time in IST (yyyy-mm-dd hh:mm:ss).
@@ -3469,7 +3486,13 @@ class FivePaisa(BrokerBase):
                 now_ist = get_tradingapi_now()
                 if now_ist.tzinfo is not None:
                     now_ist = now_ist.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).replace(tzinfo=None)
-                market_open = dt.datetime.combine(now_ist.date(), dt.time(9, 15))
+                market_open_value = get_market_open_time(
+                    exchange=exchange, symbol=symbol, as_of=now_ist
+                )
+                market_open = dt.datetime.combine(
+                    now_ist.date(),
+                    dt.datetime.strptime(market_open_value, "%H:%M:%S").time(),
+                )
                 return market_open.strftime("%Y-%m-%d %H:%M:%S")
 
             # Extract the timestamp using regex (allow negative for .NET min-date, treated as invalid)
@@ -3848,14 +3871,28 @@ class FivePaisa(BrokerBase):
                     price.symbol = resolved_symbol
                     price.exchange = self.map_exchange_for_db(price.symbol, resolved_exchange)
                     if json_data.get("TickDt"):
-                        price.timestamp = self.convert_to_ist(json_data["TickDt"])
+                        price.timestamp = self.convert_to_ist(
+                            json_data["TickDt"],
+                            exchange=resolved_exchange,
+                            symbol=resolved_symbol,
+                        )
                     else:
                         now_ist = get_tradingapi_now()
                         if now_ist.tzinfo is not None:
                             now_ist = now_ist.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).replace(
                                 tzinfo=None
                             )
-                        price.timestamp = dt.datetime.combine(now_ist.date(), dt.time(9, 15)).strftime(
+                        market_open_value = get_market_open_time(
+                            exchange=resolved_exchange,
+                            symbol=resolved_symbol,
+                            as_of=now_ist,
+                        )
+                        price.timestamp = dt.datetime.combine(
+                            now_ist.date(),
+                            dt.datetime.strptime(
+                                market_open_value, "%H:%M:%S"
+                            ).time(),
+                        ).strftime(
                             "%Y-%m-%d %H:%M:%S"
                         )
                     prices[resolved_symbol] = price

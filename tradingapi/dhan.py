@@ -34,7 +34,12 @@ from .broker_base import (
     Price,
     _normalize_as_of_date,
 )
-from .config import get_config
+from .config import (
+    get_config,
+    get_market_close_time,
+    get_market_open_time,
+    is_within_market_hours,
+)
 from chameli.dateutils import parse_datetime
 from .utils import (
     delete_broker_order_id,
@@ -1672,7 +1677,7 @@ class Dhan(BrokerBase):
         date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     )
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_historical(
@@ -1682,8 +1687,8 @@ class Dhan(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
-        market_open_time: str = "09:15:00",
-        market_close_time: str = "15:30:00",
+        market_open_time: Optional[str] = None,
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -1749,6 +1754,12 @@ class Dhan(BrokerBase):
                     out[long_symbol] = []
                     continue
                 security_id = int(security_id)
+                resolved_market_close_time = market_close_time or get_market_close_time(
+                    exchange=exchange, symbol=long_symbol, as_of=date_end
+                )
+                resolved_market_open_time = market_open_time or get_market_open_time(
+                    exchange=exchange, symbol=long_symbol, as_of=date_end
+                )
 
                 # Determine instrument_type from exchange_segment
                 _INDEX_UNDERLYINGS = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")
@@ -1800,9 +1811,6 @@ class Dhan(BrokerBase):
                     open_interest = raw.get("open_interest", [])
 
                     tz_ist = pytz.timezone("Asia/Kolkata")
-                    market_open = pd.to_datetime(market_open_time).time()
-                    market_close = pd.to_datetime(market_close_time).time()
-
                     for i in range(len(timestamps)):
                         try:
                             epoch = int(timestamps[i])
@@ -1811,7 +1819,13 @@ class Dhan(BrokerBase):
                             )
 
                             if use_intraday:
-                                if not (market_open <= ts.time() < market_close):
+                                if not is_within_market_hours(
+                                    ts,
+                                    exchange=exchange,
+                                    symbol=long_symbol,
+                                    market_open_time=market_open_time,
+                                    market_close_time=market_close_time,
+                                ):
                                     continue
                             else:
                                 ts = ts.floor("D")
@@ -1853,8 +1867,8 @@ class Dhan(BrokerBase):
                     # Always attempt when end date is today; replace any existing bar for that calendar day.
                     tz_ist = pytz.timezone("Asia/Kolkata")
                     target_d = date_end_dt.date()
-                    market_open_t = pd.to_datetime(market_open_time).time()
-                    market_close_t = pd.to_datetime(market_close_time).time()
+                    market_open_t = pd.to_datetime(resolved_market_open_time).time()
+                    market_close_t = pd.to_datetime(resolved_market_close_time).time()
 
                     intraday_response = self._fetch_dhan_historical(
                         security_id=security_id,

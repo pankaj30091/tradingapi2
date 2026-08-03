@@ -346,7 +346,7 @@ class IB(BrokerBase):
         date_end=None,
         exchange: str = "NSE",
         periodicity: str = "1m",
-        market_close_time: str = "15:30:00",
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         if date_end is None:
