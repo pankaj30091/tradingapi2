@@ -1605,6 +1605,22 @@ class Dhan(BrokerBase):
                 data = data[0] if data else {}
             if not isinstance(data, dict):
                 raise OrderError(f"Unexpected get_order_by_id payload type: {type(data).__name__}")
+            # success + empty payload = wrong account / order not visible — do not invent a zero fill
+            if not data:
+                trading_logger.log_warning(
+                    "get_order_by_id returned empty data; skipping status update",
+                    {"order_id": broker_order_id, "account": self.account_key},
+                )
+                return OrderInfo(
+                    order_size=order.quantity,
+                    order_price=order.price,
+                    fill_size=0,
+                    fill_price=0,
+                    status=OrderStatus.UNDEFINED,
+                    broker_order_id=broker_order_id,
+                    exchange_order_id=getattr(order, "exch_order_id", "") or "",
+                    broker=self.broker,
+                )
 
             # Dhan order status mapping
             dhan_status = str(data.get("orderStatus", "")).upper()

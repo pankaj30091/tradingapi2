@@ -2172,8 +2172,21 @@ def update_order_status(
             broker.redis_o.hset(broker_order_id, "quantity", str(fills.fill_size))
             broker.redis_o.hset(broker_order_id, "status", fills.status.name)
             broker.redis_o.hset(broker_order_id, "exch_order_id", fills.exchange_order_id)
-        else:
+        elif fills.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.FILLED):
+            # Broker confirmed terminal zero-fill — safe to prune.
             delete_broker_order_id(broker, internal_order_id, broker_order_id)
+        else:
+            # UNDEFINED/OPEN/PENDING with fill_size=0 is often a failed/wrong-account
+            # lookup; never delete Redis state in that case.
+            trading_logger.log_warning(
+                "EOD skip delete for ambiguous zero-fill order status",
+                {
+                    "internal_order_id": internal_order_id,
+                    "broker_order_id": broker_order_id,
+                    "status": getattr(fills.status, "name", str(fills.status)),
+                    "fill_size": fills.fill_size,
+                },
+            )
     else:
         if fills.status == OrderStatus.HISTORICAL:
             return fills
