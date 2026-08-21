@@ -392,6 +392,7 @@ class Shoonya(BrokerBase):
         self.api = None
         self.subscribe_thread = None
         self.subscribed_symbols = []
+        self.subscribed_req_tokens: List[str] = []
         self.socket_opened = False
         self._is_connected_cache_ttl_secs = 3.0
         self._last_is_connected_check_ts = 0.0
@@ -2880,7 +2881,9 @@ class Shoonya(BrokerBase):
                                     list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
                                 )
                                 if active_symbols:
-                                    reconnect_req_list = expand_symbols_to_request(active_symbols)
+                                    reconnect_req_list = list(self.subscribed_req_tokens) or expand_symbols_to_request(
+                                        active_symbols
+                                    )
                                     trading_logger.log_info(
                                         "Resubscribing to symbols after reconnection",
                                         {
@@ -2937,11 +2940,20 @@ class Shoonya(BrokerBase):
                     time.sleep(1)
 
             def resolve_exchange_from_symbology(long_symbol: str):
-                """Resolve API exchange for a symbol from symbology (which exchange's symbol_map contains it)."""
+                """Prefer the caller's exchange so dual-listed names (e.g. INFY) stay on NSE vs BSE."""
+                preferred = None
+                try:
+                    preferred = self.map_exchange_for_api(long_symbol, exchange)
+                except Exception:
+                    preferred = mapped_exchange
+                if preferred:
+                    symbol_map = self.exchange_mappings.get(preferred, {}).get("symbol_map", {})
+                    if long_symbol in symbol_map:
+                        return preferred
                 for exch in self.exchange_mappings:
                     if long_symbol in self.exchange_mappings[exch]["symbol_map"]:
                         return exch
-                return None
+                return preferred
 
             # Function to expand symbols into request format
             def expand_symbols_to_request(symbol_list) -> List[str]:
@@ -2982,40 +2994,58 @@ class Shoonya(BrokerBase):
                 return req_list
 
             # Function to update the subscription list
-            def update_subscription_list(operation, symbols) -> None:
+            def update_subscription_list(operation, symbols, tokens) -> None:
                 if operation == "s":
                     self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
+                    self.subscribed_req_tokens = list(set(self.subscribed_req_tokens + tokens))
                 elif operation == "u":
                     self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
+                    self.subscribed_req_tokens = [t for t in self.subscribed_req_tokens if t not in tokens]
 
-            # Update subscriptions and request list
-            update_subscription_list(operation, symbols)
             req_list = expand_symbols_to_request(symbols)
+            update_subscription_list(operation, symbols, req_list)
 
             # Start the WebSocket connection if not already started
             if self.subscribe_thread is None:
                 self.subscribe_thread = threading.Thread(target=connect_and_subscribe, name="MarketDataStreamer")
                 self.subscribe_thread.start()
 
-            # Wait until the socket is opened before subscribing/unsubscribing
             while not self.socket_opened:
                 time.sleep(1)
 
-                # Manage subscription based on operation
-                if req_list:
-                    if operation == "s":
-                        trading_logger.log_info("Requesting streaming", {"req_list": req_list})
-                        self._wait_for_stream_request_rate_limit()
-                        self.api.subscribe(req_list)
-                    elif operation == "u":
-                        trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
-                        self.api.unsubscribe(req_list)
+            if req_list:
+                if operation == "s":
+                    trading_logger.log_info("Requesting streaming", {"req_list": req_list})
+                    self._wait_for_stream_request_rate_limit()
+                    self.api.subscribe(req_list)
+                elif operation == "u":
+                    trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
+                    self.api.unsubscribe(req_list)
         except Exception as e:
             trading_logger.log_error(
                 "Unexpected error in start_quotes_streaming",
                 e,
                 {"operation": operation, "symbols_count": len(symbols) if symbols else 0, "exchange": exchange},
             )
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def stop_streaming(self):
+        try:
+            trading_logger.log_info("Stopping quotes streaming")
+            if hasattr(self, "api") and self.api and getattr(self, "socket_opened", False):
+                try:
+                    self.api.close_websocket()
+                except Exception as e:
+                    trading_logger.log_warning("Failed to close WebSocket", {"error": str(e)})
+            self.socket_opened = False
+            self.subscribe_thread = None
+            self.subscribed_symbols = []
+            self.subscribed_req_tokens = []
+            trading_logger.log_info("Streaming stopped successfully")
+        except Exception as e:
+            context = create_error_context(error=str(e))
+            raise BrokerConnectionError(f"Failed to stop streaming: {str(e)}", context)
 
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0))
@@ -3039,6 +3069,8 @@ class Shoonya(BrokerBase):
                         holding = pd.DataFrame([raw_holding])
                     else:
                         holding = pd.DataFrame(columns=["long_symbol", "quantity"])
+                    if len(holding) == 0:
+                        holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
                     if len(holding) > 0:
                         try:
                             # Resolve long_symbol from mappings using Scripcode + Exchange
@@ -3310,14 +3342,37 @@ class Shoonya(BrokerBase):
                 {"row_count": len(scripcode)},
             )
 
+            def mapping_keys(exchange_val):
+                raw = (
+                    ""
+                    if exchange_val is None or (isinstance(exchange_val, float) and pd.isna(exchange_val))
+                    else str(exchange_val).strip()
+                )
+                if raw in self.exchange_mappings:
+                    return [raw]
+                up = raw.upper()
+                if up in self.exchange_mappings:
+                    return [up]
+                if not up:
+                    return list(self.exchange_mappings.keys())
+                keyed = [k for k in self.exchange_mappings if str(k).upper().startswith(up[0])]
+                return keyed if keyed else list(self.exchange_mappings.keys())
+
             def lookup(scripcode_val, exchange_val):
                 try:
-                    exch_map = self.exchange_mappings.get(exchange_val, {})
-                    rev = exch_map.get("symbol_map_reversed", {})
-                    code = int(scripcode_val) if scripcode_val is not None else None
+                    code = (
+                        int(float(scripcode_val))
+                        if scripcode_val is not None and not pd.isna(scripcode_val)
+                        else None
+                    )
                     if code is None:
                         return None
-                    return rev.get(code) or rev.get(scripcode_val)
+                    for key in mapping_keys(exchange_val):
+                        rev = self.exchange_mappings.get(key, {}).get("symbol_map_reversed", {})
+                        found = rev.get(code) or rev.get(scripcode_val)
+                        if found:
+                            return found
+                    return None
                 except (TypeError, ValueError, KeyError):
                     return None
 

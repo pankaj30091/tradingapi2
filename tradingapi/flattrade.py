@@ -95,8 +95,8 @@ class FlatTradeApiPy(NorenApi):
     def __init__(self):
         NorenApi.__init__(
             self,
-            host="https://piconnect.flattrade.in/PiConnectTP/",
-            websocket="wss://piconnect.flattrade.in/PiConnectWSTp/",
+            host="https://piconnect.flattrade.in/PiConnectAPI",
+            websocket="wss://piconnect.flattrade.in/PiConnectWSAPI/",
         )
 
 
@@ -268,12 +268,16 @@ def save_symbol_data(saveToFolder: bool = True):
 
                 def process_row(row):
                     symbol = row["Symbol"]
-                    if row["Instrument"].startswith("OPT"):
+                    instrument = row["Instrument"]
+                    if pd.isna(instrument) or pd.isna(symbol):
+                        return None
+                    if str(instrument).startswith("OPT"):
                         return f"{symbol}_OPT_{row['Expiry']}_{'CALL' if row['OptionType']=='CE' else 'PUT'}_{row['StrikePrice']:g}".upper()
                     else:
                         return f"{symbol}_FUT_{row['Expiry']}__".upper()
 
                 codes_fno["long_symbol"] = codes_fno.apply(process_row, axis=1)
+                codes_fno = codes_fno.dropna(subset=["long_symbol"])
                 codes_fno["Exch"] = "NFO"
                 codes_fno["ExchType"] = "NFO"
                 new_column_names = {
@@ -312,18 +316,24 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes_fno["Expiry"] = pd.to_datetime(
                     codes_fno["Expiry"], format="%d-%b-%Y", errors="coerce"
                 ).dt.strftime("%Y%m%d")
-                codes_fno["Symbol"] = codes_fno["TradingSymbol"].str.extract(
-                    r"^([A-Z]+(?:50)?)(?=\d{2}(?:[A-Z]\d+|\d+)[A-Z]{2})"
+                codes_fno[["Symbol", "ts_rest"]] = codes_fno["TradingSymbol"].str.extract(
+                    r"^(SENSEX50|[A-Z0-9&-]*?[A-Z&-])(?=(?:\d{2}|FUT))(.*)$",
+                    expand=True,
                 )
+                codes_fno["Symbol"] = codes_fno["Symbol"].fillna(codes_fno["TradingSymbol"])
 
                 def process_row(row):
                     symbol = row["Symbol"]
-                    if row["Instrument"].startswith("OPT"):
+                    instrument = row["Instrument"]
+                    if pd.isna(instrument) or pd.isna(symbol):
+                        return None
+                    if str(instrument).startswith("OPT"):
                         return f"{symbol}_OPT_{row['Expiry']}_{'CALL' if row['OptionType']=='CE' else 'PUT'}_{row['StrikePrice']:g}".upper()
                     else:
                         return f"{symbol}_FUT_{row['Expiry']}__".upper()
 
                 codes_fno["long_symbol"] = codes_fno.apply(process_row, axis=1)
+                codes_fno = codes_fno.dropna(subset=["long_symbol"])
                 codes_fno["Exch"] = "BFO"
                 codes_fno["ExchType"] = "BFO"
                 new_column_names = {
@@ -365,6 +375,7 @@ class FlatTrade(BrokerBase):
         self.api = None
         self.subscribe_thread = None
         self.subscribed_symbols = []
+        self.subscribed_req_tokens = []
         self.socket_opened = False
         self._is_connected_cache_ttl_secs = 3.0
         self._last_is_connected_check_ts = 0.0
@@ -501,6 +512,19 @@ class FlatTrade(BrokerBase):
             """Verify if the current session is valid using existing is_connected method."""
             return self.is_connected()
 
+        def _apply_api_session(user, pwd, susertoken):
+            self.api = FlatTradeApiPy()
+            kwargs = {"userid": user, "password": pwd, "usertoken": susertoken}
+            try:
+                params = inspect.signature(self.api.set_session).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "accesstoken" in params:
+                kwargs["accesstoken"] = susertoken
+            self.api.set_session(**kwargs)
+            if hasattr(self.api, "injectOAuthHeader"):
+                self.api.injectOAuthHeader(susertoken, user, user)
+
         def _restore_session_from_token(susertoken_path):
             """Attempt to restore session from existing token."""
             try:
@@ -515,8 +539,7 @@ class FlatTrade(BrokerBase):
                     trading_logger.log_warning("Empty token file", {"broker": self.broker.name})
                     return False
 
-                self.api = FlatTradeApiPy()
-                self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
+                _apply_api_session(user, pwd, susertoken)
 
                 # Verify the session is actually working
                 if _verify_session(self):
@@ -557,13 +580,27 @@ class FlatTrade(BrokerBase):
                     "Accept": "application/json",
                     "Accept-Language": "en-US,en;q=0.5",
                     "Host": "authapi.flattrade.in",
-                    "Origin": f"{HOST}",
-                    "Referer": f"{HOST}/",
+                    "Origin": HOST,
+                    "Referer": f"{HOST}/?app_key={api_key}",
                 }
 
                 def encode_item(item):
                     encoded_item = hashlib.sha256(item.encode()).hexdigest()
                     return encoded_item
+
+                def ftauth_payload(sid, override=""):
+                    return {
+                        "UserName": user,
+                        "Password": encode_item(pwd),
+                        "App": "",
+                        "ClientID": "",
+                        "Key": "",
+                        "APIKey": api_key,
+                        "PAN_DOB": pyotp.TOTP(token).now(),
+                        "Sid": sid,
+                        "Override": override,
+                        "Version": "2",
+                    }
 
                 def get_authcode():
                     try:
@@ -578,17 +615,7 @@ class FlatTrade(BrokerBase):
 
                                 response = session.post(
                                     routes["ftauth"],
-                                    json={
-                                        "UserName": user,
-                                        "Password": encode_item(pwd),
-                                        "App": "",
-                                        "ClientID": "",
-                                        "Key": "",
-                                        "APIKey": api_key,
-                                        "PAN_DOB": pyotp.TOTP(token).now(),
-                                        "Sid": sid,
-                                        "Override": "",
-                                    },
+                                    json=ftauth_payload(sid),
                                 )
 
                                 if response.status_code == 200:
@@ -600,17 +627,7 @@ class FlatTrade(BrokerBase):
                                         )
                                         response = session.post(
                                             routes["ftauth"],
-                                            json={
-                                                "UserName": user,
-                                                "Password": encode_item(pwd),
-                                                "App": "",
-                                                "ClientID": "",
-                                                "Key": "",
-                                                "APIKey": api_key,
-                                                "PAN_DOB": pyotp.TOTP(token).now(),
-                                                "Sid": sid,
-                                                "Override": "Y",
-                                            },
+                                            json=ftauth_payload(sid, "Y"),
                                         )
                                         if response.status_code == 200:
                                             response_data = response.json()
@@ -716,8 +733,7 @@ class FlatTrade(BrokerBase):
 
                         # Initialize API
                         try:
-                            self.api = FlatTradeApiPy()
-                            self.api.set_session(userid=user, password=pwd, usertoken=susertoken)
+                            _apply_api_session(user, pwd, susertoken)
                             trading_logger.log_info("API session established", {"user": user})
                         except Exception as e:
                             context = create_error_context(user=user, error=str(e))
@@ -1165,13 +1181,17 @@ class FlatTrade(BrokerBase):
         # Iterate through the data frame and create mappings based on exchange
 
         for exchange, group in codes.groupby("Exch"):
+            scrip_int = pd.to_numeric(group["Scripcode"], errors="coerce")
+            scrip_int = scrip_int.apply(lambda x: int(x) if pd.notna(x) else None)
             self.exchange_mappings[exchange] = {
-                "symbol_map": dict(zip(group["long_symbol"], group["Scripcode"])),
+                "symbol_map": dict(zip(group["long_symbol"], scrip_int)),
                 "contractsize_map": dict(zip(group["long_symbol"], group["LotSize"])),
                 "exchange_map": dict(zip(group["long_symbol"], group["Exch"])),
                 "exchangetype_map": dict(zip(group["long_symbol"], group["ExchType"])),
                 "contracttick_map": dict(zip(group["long_symbol"], group["TickSize"])),
-                "symbol_map_reversed": dict(zip(group["Scripcode"], group["long_symbol"])),
+                "symbol_map_reversed": {
+                    code: name for code, name in zip(scrip_int, group["long_symbol"]) if code is not None
+                },
                 "tradingsymbol_map": dict(zip(group["long_symbol"], group["trading_symbol"])),
             }
         return codes
@@ -2647,7 +2667,9 @@ class FlatTrade(BrokerBase):
                                     list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
                                 )
                                 if active_symbols:
-                                    reconnect_req_list = expand_symbols_to_request(active_symbols)
+                                    reconnect_req_list = list(self.subscribed_req_tokens) or expand_symbols_to_request(
+                                        active_symbols
+                                    )
                                     trading_logger.log_info(
                                         "Resubscribing to symbols after reconnection",
                                         {"symbols_count": len(active_symbols), "req_list": reconnect_req_list},
@@ -2700,11 +2722,20 @@ class FlatTrade(BrokerBase):
                     time.sleep(1)
 
             def resolve_exchange_from_symbology(long_symbol: str):
-                """Resolve API exchange for a symbol from symbology (which exchange's symbol_map contains it)."""
+                """Prefer the caller's exchange so dual-listed names (e.g. INFY) stay on NSE vs BSE."""
+                preferred = None
+                try:
+                    preferred = self.map_exchange_for_api(long_symbol, exchange)
+                except Exception:
+                    preferred = mapped_exchange
+                if preferred:
+                    symbol_map = self.exchange_mappings.get(preferred, {}).get("symbol_map", {})
+                    if long_symbol in symbol_map:
+                        return preferred
                 for exch in self.exchange_mappings:
                     if long_symbol in self.exchange_mappings[exch]["symbol_map"]:
                         return exch
-                return None
+                return preferred
 
             # Function to expand symbols into request format
             def expand_symbols_to_request(symbol_list):
@@ -2745,40 +2776,57 @@ class FlatTrade(BrokerBase):
                 return req_list
 
             # Function to update the subscription list
-            def update_subscription_list(operation, symbols):
+            def update_subscription_list(operation, symbols, tokens):
                 if operation == "s":
                     self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
+                    self.subscribed_req_tokens = list(set(self.subscribed_req_tokens + tokens))
                 elif operation == "u":
                     self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
+                    self.subscribed_req_tokens = [t for t in self.subscribed_req_tokens if t not in tokens]
 
-            # Update subscriptions and request list
-            update_subscription_list(operation, symbols)
             req_list = expand_symbols_to_request(symbols)
+            update_subscription_list(operation, symbols, req_list)
 
-            # Start the WebSocket connection if not already started
             if self.subscribe_thread is None:
                 self.subscribe_thread = threading.Thread(target=connect_and_subscribe, name="MarketDataStreamer")
                 self.subscribe_thread.start()
 
-            # Wait until the socket is opened before subscribing/unsubscribing
             while not self.socket_opened:
                 time.sleep(1)
 
-                # Manage subscription based on operation
-                if req_list:
-                    if operation == "s":
-                        trading_logger.log_info("Requesting streaming", {"req_list": req_list})
-                        self._wait_for_stream_request_rate_limit()
-                        self.api.subscribe(req_list)
-                    elif operation == "u":
-                        trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
-                        self.api.unsubscribe(req_list)
+            if req_list:
+                if operation == "s":
+                    trading_logger.log_info("Requesting streaming", {"req_list": req_list})
+                    self._wait_for_stream_request_rate_limit()
+                    self.api.subscribe(req_list)
+                elif operation == "u":
+                    trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
+                    self.api.unsubscribe(req_list)
         except Exception as e:
             trading_logger.log_error(
                 "Unexpected error in start_quotes_streaming",
                 e,
                 {"operation": operation, "symbols_count": len(symbols) if symbols else 0, "exchange": exchange},
             )
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def stop_streaming(self):
+        try:
+            trading_logger.log_info("Stopping quotes streaming")
+            if hasattr(self, "api") and self.api and getattr(self, "socket_opened", False):
+                try:
+                    self.api.close_websocket()
+                except Exception as e:
+                    trading_logger.log_warning("Failed to close WebSocket", {"error": str(e)})
+            self.socket_opened = False
+            self.subscribe_thread = None
+            self.subscribed_symbols = []
+            self.subscribed_req_tokens = []
+            trading_logger.log_info("Streaming stopped successfully")
+        except Exception as e:
+            context = create_error_context(error=str(e))
+            raise BrokerConnectionError(f"Failed to stop streaming: {str(e)}", context)
 
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0))
@@ -2802,7 +2850,8 @@ class FlatTrade(BrokerBase):
                         holding = pd.DataFrame([raw_holding])
                     else:
                         holding = pd.DataFrame(columns=["long_symbol", "quantity"])
-
+                    if len(holding) == 0:
+                        holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
                     if len(holding) > 0:
                         try:
                             if "exch" not in holding.columns and "exch_tsym" not in holding.columns:
@@ -3056,14 +3105,29 @@ class FlatTrade(BrokerBase):
                 {"row_count": len(scripcode)},
             )
 
+            def mapping_keys(exchange_val):
+                raw = "" if exchange_val is None or (isinstance(exchange_val, float) and pd.isna(exchange_val)) else str(exchange_val).strip()
+                if raw in self.exchange_mappings:
+                    return [raw]
+                up = raw.upper()
+                if up in self.exchange_mappings:
+                    return [up]
+                if not up:
+                    return list(self.exchange_mappings.keys())
+                keyed = [k for k in self.exchange_mappings if str(k).upper().startswith(up[0])]
+                return keyed if keyed else list(self.exchange_mappings.keys())
+
             def lookup(scripcode_val, exchange_val):
                 try:
-                    exch_map = self.exchange_mappings.get(exchange_val, {})
-                    rev = exch_map.get("symbol_map_reversed", {})
-                    code = int(scripcode_val) if scripcode_val is not None else None
+                    code = int(float(scripcode_val)) if scripcode_val is not None and not pd.isna(scripcode_val) else None
                     if code is None:
                         return None
-                    return rev.get(code) or rev.get(scripcode_val)
+                    for key in mapping_keys(exchange_val):
+                        rev = self.exchange_mappings.get(key, {}).get("symbol_map_reversed", {})
+                        found = rev.get(code) or rev.get(scripcode_val)
+                        if found:
+                            return found
+                    return None
                 except (TypeError, ValueError, KeyError):
                     return None
 
@@ -3114,9 +3178,19 @@ class FlatTrade(BrokerBase):
                 )
                 raise SymbolError(f"Exchange mapping not found: {str(e)}", context)
 
+            lot_from_map = self.exchange_mappings[exchange]["contractsize_map"].get(long_symbol)
+            if lot_from_map is not None and pd.notna(lot_from_map):
+                return int(lot_from_map)
+
             if code is not None:
                 try:
-                    series = cast(pd.Series, self.codes.loc[self.codes.Scripcode == code, "LotSize"])
+                    series = cast(
+                        pd.Series,
+                        self.codes.loc[
+                            (self.codes.Scripcode == code) & (self.codes.Exch == exchange),
+                            "LotSize",
+                        ],
+                    )
                     if len(series) > 0:
                         lot_size = int(series.iloc[0])
                     else:

@@ -151,6 +151,10 @@ The package requires:
 - Redis (for order tracking and logging)
 - Broker-specific SDKs (automatically installed via dependencies)
 
+## Adding a new broker
+
+Step-by-step checklist (package, YAML, website, PnL/EOD, order manager): [`docs/ADDING_A_BROKER.md`](docs/ADDING_A_BROKER.md).
+
 ## Configuration
 
 ### Configuration File Structure
