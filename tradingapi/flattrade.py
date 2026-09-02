@@ -110,6 +110,19 @@ def save_symbol_data(saveToFolder: bool = True):
             return lst[0]
 
     bhavcopyfolder = config.get("bhavcopy_folder")
+    symbol_columns = [
+        "long_symbol",
+        "LotSize",
+        "Scripcode",
+        "Exch",
+        "ExchType",
+        "TickSize",
+        "trading_symbol",
+    ]
+    codes_nse_cash = pd.DataFrame(columns=symbol_columns)
+    codes_bse_cash = pd.DataFrame(columns=symbol_columns)
+    codes_nse_fno = pd.DataFrame(columns=symbol_columns)
+    codes_bse_fno = pd.DataFrame(columns=symbol_columns)
     _proxies = None
     try:
         from .proxy_utils import get_proxies_for_broker
@@ -152,14 +165,14 @@ def save_symbol_data(saveToFolder: bool = True):
                 codes = codes[(codes.Instrument.isin(["EQ", "BE", "XX", "BZ", "RR", "IV", "INDEX"]))]
                 codes["long_symbol"] = None
 
-                def process_row(row):
+                def process_nse_cash_row(row):
                     symbol = row["Symbol"]
                     if row["Instrument"] == "INDEX":
                         return f"{symbol}_IND___".upper()
                     else:
                         return f"{symbol}_STK___".upper()
 
-                codes["long_symbol"] = codes.apply(process_row, axis=1)
+                codes["long_symbol"] = codes.apply(process_nse_cash_row, axis=1)
                 codes["Exch"] = "NSE"
                 codes["ExchType"] = "CASH"
                 new_column_names = {
@@ -206,14 +219,14 @@ def save_symbol_data(saveToFolder: bool = True):
                 ]
                 codes["long_symbol"] = None
 
-                def process_row(row):
+                def process_bse_cash_row(row):
                     symbol = row["Symbol"]
                     if row["Instrument"] == "INDEX":
                         return f"{symbol}_IND___".upper()
                     else:
                         return f"{symbol}_STK___".upper()
 
-                codes["long_symbol"] = codes.apply(process_row, axis=1)
+                codes["long_symbol"] = codes.apply(process_bse_cash_row, axis=1)
                 codes["Exch"] = "BSE"
                 codes["ExchType"] = "CASH"
                 new_column_names = {
@@ -266,7 +279,7 @@ def save_symbol_data(saveToFolder: bool = True):
                     codes_fno["Expiry"], format="%d-%b-%Y", errors="coerce"
                 ).dt.strftime("%Y%m%d")
 
-                def process_row(row):
+                def process_nse_fno_row(row):
                     symbol = row["Symbol"]
                     instrument = row["Instrument"]
                     if pd.isna(instrument) or pd.isna(symbol):
@@ -276,7 +289,7 @@ def save_symbol_data(saveToFolder: bool = True):
                     else:
                         return f"{symbol}_FUT_{row['Expiry']}__".upper()
 
-                codes_fno["long_symbol"] = codes_fno.apply(process_row, axis=1)
+                codes_fno["long_symbol"] = codes_fno.apply(process_nse_fno_row, axis=1)
                 codes_fno = codes_fno.dropna(subset=["long_symbol"])
                 codes_fno["Exch"] = "NFO"
                 codes_fno["ExchType"] = "NFO"
@@ -322,7 +335,7 @@ def save_symbol_data(saveToFolder: bool = True):
                 )
                 codes_fno["Symbol"] = codes_fno["Symbol"].fillna(codes_fno["TradingSymbol"])
 
-                def process_row(row):
+                def process_bse_fno_row(row):
                     symbol = row["Symbol"]
                     instrument = row["Instrument"]
                     if pd.isna(instrument) or pd.isna(symbol):
@@ -332,7 +345,7 @@ def save_symbol_data(saveToFolder: bool = True):
                     else:
                         return f"{symbol}_FUT_{row['Expiry']}__".upper()
 
-                codes_fno["long_symbol"] = codes_fno.apply(process_row, axis=1)
+                codes_fno["long_symbol"] = codes_fno.apply(process_bse_fno_row, axis=1)
                 codes_fno = codes_fno.dropna(subset=["long_symbol"])
                 codes_fno["Exch"] = "BFO"
                 codes_fno["ExchType"] = "BFO"
@@ -522,8 +535,9 @@ class FlatTrade(BrokerBase):
             if "accesstoken" in params:
                 kwargs["accesstoken"] = susertoken
             self.api.set_session(**kwargs)
-            if hasattr(self.api, "injectOAuthHeader"):
-                self.api.injectOAuthHeader(susertoken, user, user)
+            inject_oauth_header = getattr(self.api, "injectOAuthHeader", None)
+            if callable(inject_oauth_header):
+                inject_oauth_header(susertoken, user, user)
 
         def _restore_session_from_token(susertoken_path):
             """Attempt to restore session from existing token."""
@@ -1168,7 +1182,10 @@ class FlatTrade(BrokerBase):
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def update_symbology(self, **kwargs):
         dt_today = get_tradingapi_now().date()
-        symbols_path = os.path.join(config.get(f"{self.account_key}.SYMBOLCODES"), f"{dt_today}_symbols.csv")
+        symbols_path = os.path.join(
+            config.get(f"{self.account_key}.SYMBOLCODES"),
+            f"{dt_today:%Y%m%d}_symbols.csv",
+        )
         if not os.path.exists(symbols_path):
             codes = save_symbol_data(saveToFolder=False)
             codes = codes.dropna(subset=["long_symbol"])
@@ -1399,6 +1416,7 @@ class FlatTrade(BrokerBase):
                                 order.message = "No broker order ID in response"
                                 return order
 
+                            fills = None
                             try:
                                 fills = self.get_order_info(broker_order_id=order.broker_order_id)
                                 order.exch_order_id = fills.exchange_order_id
@@ -1417,9 +1435,8 @@ class FlatTrade(BrokerBase):
                                     "Error getting order history", e, {"broker_order_id": order.broker_order_id}
                                 )
 
-                            if order.price == 0:
-                                if fills.fill_price > 0 and order.price == 0:
-                                    order.price = fills.fill_price
+                            if order.price == 0 and fills is not None and fills.fill_price > 0:
+                                order.price = fills.fill_price
 
                             trading_logger.log_info("Placed Order", {"order": str(order)})
                         else:
@@ -1718,13 +1735,13 @@ class FlatTrade(BrokerBase):
                 broker=self.broker,
             )
 
+        valid_date = None
         try:
             valid_date = parse_datetime(order.remote_order_id[:8])
-            date_valid = True
         except (ValueError, TypeError):
-            date_valid = False
+            pass
         # Compare as string: valid_date is datetime from parse_datetime; only use return_db_as_fills for past days
-        if date_valid and (
+        if valid_date is not None and (
             valid_date.strftime("%Y-%m-%d") != dt.datetime.today().strftime("%Y-%m-%d")
             or (order.remote_order_id != "" and order.broker != self.broker)
         ):
@@ -1924,16 +1941,14 @@ class FlatTrade(BrokerBase):
             if refresh_mapping:
                 try:
                     # Parse date_end to get YYYYMMDD format
+                    date_end_for_mapping = None
                     try:
-                        date_end_dt = parse_datetime(date_end)
-                        date_end_str = date_end_dt.strftime("%Y-%m-%d")
-                        date_end_valid = True
+                        date_end_for_mapping = parse_datetime(date_end)
                     except (ValueError, TypeError):
-                        date_end_valid = False
-                    if not date_end_valid:
+                        pass
+                    if not isinstance(date_end_for_mapping, (dt.datetime, dt.date)):
                         raise ValueError(f"Invalid date_end format: {date_end}")
-                    date_end_obj = dt.datetime.strptime(str(date_end_str), "%Y-%m-%d")
-                    date_end_yyyymmdd = date_end_obj.strftime("%Y%m%d")
+                    date_end_yyyymmdd = date_end_for_mapping.strftime("%Y%m%d")
 
                     # Get symbol codes path from config
                     symbol_codes_path = config.get(f"{self.account_key}.SYMBOLCODES")
@@ -2030,16 +2045,12 @@ class FlatTrade(BrokerBase):
                 # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
 
                 # Parse date_start (accepts datetime, date, or string) -> datetime for API
+                date_start_parsed = None
                 try:
                     date_start_parsed = parse_datetime(date_start)
-                    date_start_valid = True
                 except (ValueError, TypeError):
-                    date_start_valid = False
-                if (
-                    not date_start_valid
-                    or date_start_parsed is None
-                    or not isinstance(date_start_parsed, (dt.datetime, dt.date))
-                ):
+                    pass
+                if not isinstance(date_start_parsed, (dt.datetime, dt.date)):
                     raise ValueError(f"Invalid date_start format: {date_start}")
                 date_start_dt = dt.datetime.strptime(
                     date_start_parsed.strftime("%Y-%m-%d") + " " + resolved_market_open_time,
@@ -2047,16 +2058,12 @@ class FlatTrade(BrokerBase):
                 )
 
                 # Parse date_end (accepts datetime, date, or string) -> datetime for API
+                date_end_parsed = None
                 try:
                     date_end_parsed = parse_datetime(date_end)
-                    date_end_valid = True
                 except (ValueError, TypeError):
-                    date_end_valid = False
-                if (
-                    not date_end_valid
-                    or date_end_parsed is None
-                    or not isinstance(date_end_parsed, (dt.datetime, dt.date))
-                ):
+                    pass
+                if not isinstance(date_end_parsed, (dt.datetime, dt.date)):
                     raise ValueError(f"Invalid date_end format: {date_end}")
                 date_end_dt = dt.datetime.strptime(
                     date_end_parsed.strftime("%Y-%m-%d") + " " + resolved_market_close_time,
@@ -2372,12 +2379,12 @@ class FlatTrade(BrokerBase):
         if self.api is None:
             raise BrokerConnectionError("FlatTrade API is not initialized")
 
+        market_feed = Price()
+        market_feed.src = "sh"
+        market_feed.symbol = long_symbol
         try:
             trading_logger.log_debug("Fetching quote", {"long_symbol": long_symbol, "exchange": exchange})
             mapped_exchange = self.map_exchange_for_api(long_symbol, exchange)
-            market_feed = Price()  # Initialize with default values
-            market_feed.src = "sh"
-            market_feed.symbol = long_symbol
 
             # Validate exchange mapping exists
             if mapped_exchange not in self.exchange_mappings:
