@@ -51,7 +51,12 @@ def _filter_epoch_historical_rows(rows: List["HistoricalData"]) -> List["Histori
 from NorenRestApiPy.NorenApi import NorenApi, position as ShoonyaPosition
 
 from .broker_base import BrokerBase, Brokers, HistoricalData, Order, OrderInfo, OrderStatus, Price, _normalize_as_of_date
-from .config import get_config
+from .config import (
+    get_config,
+    get_market_close_time,
+    get_market_open_time,
+    is_within_market_hours,
+)
 from .utils import json_serializer_default, parse_combo_symbol, set_starting_internal_ids_int, update_order_status
 from .exceptions import (
     BrokerConnectionError,
@@ -293,7 +298,7 @@ def save_symbol_data(saveToFolder: bool = True) -> pd.DataFrame:
 
                 def process_row(row) -> str:
                     symbol = row["Symbol"]
-                    if row["Instrument"].startswith("OPT"):
+                    if str(row["Instrument"]).startswith("OPT"):
                         return f"{symbol}_OPT_{row['Expiry']}_{'CALL' if row['OptionType']=='CE' else 'PUT'}_{row['StrikePrice']:g}".upper()
                     else:
                         return f"{symbol}_FUT_{row['Expiry']}__".upper()
@@ -387,6 +392,7 @@ class Shoonya(BrokerBase):
         self.api = None
         self.subscribe_thread = None
         self.subscribed_symbols = []
+        self.subscribed_req_tokens: List[str] = []
         self.socket_opened = False
         self._is_connected_cache_ttl_secs = 3.0
         self._last_is_connected_check_ts = 0.0
@@ -411,6 +417,7 @@ class Shoonya(BrokerBase):
         self._last_market_data_api_call_ts = 0.0
         self._global_market_data_rate_limit_key = "shoonya:market_data:last_call_ts"
         self._global_market_data_rate_limit_lock_key = "shoonya:market_data:lock"
+        self._session_refresh_lock = threading.RLock()
 
     def _get_adjusted_expiry_date(self, year, month) -> dt.datetime:
         """
@@ -696,7 +703,7 @@ class Shoonya(BrokerBase):
         except Exception:
             pass
 
-        def _fresh_login(susertoken_path, max_attempts: int = max_attempts) -> None:
+        def _fresh_login_unlocked(susertoken_path, max_attempts: int = max_attempts) -> None:
             """Perform fresh login with TOTP retry logic."""
             try:
                 trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
@@ -802,6 +809,45 @@ class Shoonya(BrokerBase):
                 trading_logger.log_error("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
+        def _fresh_login(susertoken_path, max_attempts: int = max_attempts) -> None:
+            """Serialize TOTP login and shared-token writes across processes."""
+            with self._session_refresh_lock:
+                token_mtime_before = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                distributed_lock = None
+                lock_acquired = False
+                try:
+                    lock_redis = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+                    distributed_lock = lock_redis.lock(
+                        f"shoonya:session-refresh:{self.account_key}",
+                        timeout=300,
+                        blocking_timeout=310,
+                    )
+                    lock_acquired = bool(distributed_lock.acquire(blocking=True))
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Distributed Shoonya session lock unavailable; using process-local lock",
+                        {"broker": self.broker.name, "error": str(e)},
+                    )
+
+                try:
+                    token_mtime_after = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                    token_was_refreshed = token_mtime_after is not None and (
+                        token_mtime_before is None or token_mtime_after > token_mtime_before
+                    )
+                    if lock_acquired and token_was_refreshed and _restore_session_from_token(susertoken_path):
+                        trading_logger.log_info(
+                            "Reused session refreshed by another process",
+                            {"broker": self.broker.name},
+                        )
+                        return
+                    return _fresh_login_unlocked(susertoken_path, max_attempts)
+                finally:
+                    if lock_acquired and distributed_lock is not None:
+                        try:
+                            distributed_lock.release()
+                        except Exception:
+                            pass
+
         def get_connected() -> bool:
             """Main connection logic with robust session management."""
             susertoken_path = config.get(f"{self.account_key}.USERTOKEN")
@@ -879,8 +925,9 @@ class Shoonya(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to update symbology", {"error": str(e)})
 
-            # Get connected using robust session management
-            get_connected()
+            # Session replacement is single-flight for callers sharing this broker instance.
+            with self._session_refresh_lock:
+                get_connected()
 
             # Initialize Redis connection with error handling
             try:
@@ -1956,7 +2003,7 @@ class Shoonya(BrokerBase):
         date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     )
     def get_historical(
         self,
@@ -1965,8 +2012,8 @@ class Shoonya(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange="NSE",
         periodicity="1m",
-        market_open_time="09:15:00",
-        market_close_time="15:30:00",
+        market_open_time: Optional[str] = None,
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -1978,7 +2025,8 @@ class Shoonya(BrokerBase):
             date_start (str): Date formatted as YYYY-MM-DD.
             date_end (str): Date formatted as YYYY-MM-DD.
             periodicity (str): Defaults to '1m'.
-            market_close_time (str): Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            market_open_time: Optional override; configured exchange/market open is used when omitted.
+            market_close_time: Optional override; configured exchange/market close is used when omitted.
             refresh_mapping: If True, load symbol mapping from date_end's symbols CSV file instead of using cached mapping.
                 Defaults to False.
 
@@ -2158,6 +2206,12 @@ class Shoonya(BrokerBase):
                 exchange = self.map_exchange_for_api(long_symbol, exchange)
                 historical_data_list = []
                 exch = exchange
+                resolved_market_close_time = market_close_time or get_market_close_time(
+                    exchange=exchange, symbol=long_symbol, as_of=date_end
+                )
+                resolved_market_open_time = market_open_time or get_market_open_time(
+                    exchange=exchange, symbol=long_symbol, as_of=date_start
+                )
 
                 # Parse date_start (accepts datetime, date, or string) -> datetime for API
                 try:
@@ -2172,7 +2226,7 @@ class Shoonya(BrokerBase):
                 ):
                     raise ValueError(f"Invalid date_start format: {date_start}")
                 date_start_dt = dt.datetime.strptime(
-                    date_start_parsed.strftime("%Y-%m-%d") + " " + market_open_time,
+                    date_start_parsed.strftime("%Y-%m-%d") + " " + resolved_market_open_time,
                     "%Y-%m-%d %H:%M:%S",
                 )
 
@@ -2189,7 +2243,7 @@ class Shoonya(BrokerBase):
                 ):
                     raise ValueError(f"Invalid date_end format: {date_end}")
                 date_end_dt = dt.datetime.strptime(
-                    date_end_parsed.strftime("%Y-%m-%d") + " " + market_close_time,
+                    date_end_parsed.strftime("%Y-%m-%d") + " " + resolved_market_close_time,
                     "%Y-%m-%d %H:%M:%S",
                 )
                 data: Optional[List] = None
@@ -2263,8 +2317,6 @@ class Shoonya(BrokerBase):
                 # Process data if available
                 if data is not None and isinstance(data, list):  # type: ignore[reportUnreachable]
                     if len(data) > 0:
-                        market_open = pd.to_datetime(market_open_time).time()
-                        market_close = pd.to_datetime(market_close_time).time()
                         for d in data:
                             if isinstance(d, str):
                                 d = json.loads(d)
@@ -2273,7 +2325,13 @@ class Shoonya(BrokerBase):
                                     timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%m-%Y %H:%M:%S"))
                                 )
                                 # Filter by market open/close time for intraday
-                                if not (market_open <= date.time() < market_close):
+                                if not is_within_market_hours(
+                                    date,
+                                    exchange=exchange,
+                                    symbol=long_symbol,
+                                    market_open_time=market_open_time,
+                                    market_close_time=market_close_time,
+                                ):
                                     continue
                             elif periodicity == "1d":
                                 date = pd.Timestamp(timezone.localize(dt.datetime.strptime(d.get("time"), "%d-%b-%Y")))
@@ -2823,7 +2881,9 @@ class Shoonya(BrokerBase):
                                     list(self.subscribed_symbols) if hasattr(self, "subscribed_symbols") else []
                                 )
                                 if active_symbols:
-                                    reconnect_req_list = expand_symbols_to_request(active_symbols)
+                                    reconnect_req_list = list(self.subscribed_req_tokens) or expand_symbols_to_request(
+                                        active_symbols
+                                    )
                                     trading_logger.log_info(
                                         "Resubscribing to symbols after reconnection",
                                         {
@@ -2880,11 +2940,20 @@ class Shoonya(BrokerBase):
                     time.sleep(1)
 
             def resolve_exchange_from_symbology(long_symbol: str):
-                """Resolve API exchange for a symbol from symbology (which exchange's symbol_map contains it)."""
+                """Prefer the caller's exchange so dual-listed names (e.g. INFY) stay on NSE vs BSE."""
+                preferred = None
+                try:
+                    preferred = self.map_exchange_for_api(long_symbol, exchange)
+                except Exception:
+                    preferred = mapped_exchange
+                if preferred:
+                    symbol_map = self.exchange_mappings.get(preferred, {}).get("symbol_map", {})
+                    if long_symbol in symbol_map:
+                        return preferred
                 for exch in self.exchange_mappings:
                     if long_symbol in self.exchange_mappings[exch]["symbol_map"]:
                         return exch
-                return None
+                return preferred
 
             # Function to expand symbols into request format
             def expand_symbols_to_request(symbol_list) -> List[str]:
@@ -2925,40 +2994,58 @@ class Shoonya(BrokerBase):
                 return req_list
 
             # Function to update the subscription list
-            def update_subscription_list(operation, symbols) -> None:
+            def update_subscription_list(operation, symbols, tokens) -> None:
                 if operation == "s":
                     self.subscribed_symbols = list(set(self.subscribed_symbols + symbols))
+                    self.subscribed_req_tokens = list(set(self.subscribed_req_tokens + tokens))
                 elif operation == "u":
                     self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
+                    self.subscribed_req_tokens = [t for t in self.subscribed_req_tokens if t not in tokens]
 
-            # Update subscriptions and request list
-            update_subscription_list(operation, symbols)
             req_list = expand_symbols_to_request(symbols)
+            update_subscription_list(operation, symbols, req_list)
 
             # Start the WebSocket connection if not already started
             if self.subscribe_thread is None:
                 self.subscribe_thread = threading.Thread(target=connect_and_subscribe, name="MarketDataStreamer")
                 self.subscribe_thread.start()
 
-            # Wait until the socket is opened before subscribing/unsubscribing
             while not self.socket_opened:
                 time.sleep(1)
 
-                # Manage subscription based on operation
-                if req_list:
-                    if operation == "s":
-                        trading_logger.log_info("Requesting streaming", {"req_list": req_list})
-                        self._wait_for_stream_request_rate_limit()
-                        self.api.subscribe(req_list)
-                    elif operation == "u":
-                        trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
-                        self.api.unsubscribe(req_list)
+            if req_list:
+                if operation == "s":
+                    trading_logger.log_info("Requesting streaming", {"req_list": req_list})
+                    self._wait_for_stream_request_rate_limit()
+                    self.api.subscribe(req_list)
+                elif operation == "u":
+                    trading_logger.log_info("Unsubscribing streaming", {"req_list": req_list})
+                    self.api.unsubscribe(req_list)
         except Exception as e:
             trading_logger.log_error(
                 "Unexpected error in start_quotes_streaming",
                 e,
                 {"operation": operation, "symbols_count": len(symbols) if symbols else 0, "exchange": exchange},
             )
+
+    @log_execution_time
+    @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
+    def stop_streaming(self):
+        try:
+            trading_logger.log_info("Stopping quotes streaming")
+            if hasattr(self, "api") and self.api and getattr(self, "socket_opened", False):
+                try:
+                    self.api.close_websocket()
+                except Exception as e:
+                    trading_logger.log_warning("Failed to close WebSocket", {"error": str(e)})
+            self.socket_opened = False
+            self.subscribe_thread = None
+            self.subscribed_symbols = []
+            self.subscribed_req_tokens = []
+            trading_logger.log_info("Streaming stopped successfully")
+        except Exception as e:
+            context = create_error_context(error=str(e))
+            raise BrokerConnectionError(f"Failed to stop streaming: {str(e)}", context)
 
     @log_execution_time
     @validate_inputs(long_symbol=lambda x: x is None or (isinstance(x, str) and len(x.strip()) >= 0))
@@ -2982,6 +3069,8 @@ class Shoonya(BrokerBase):
                         holding = pd.DataFrame([raw_holding])
                     else:
                         holding = pd.DataFrame(columns=["long_symbol", "quantity"])
+                    if len(holding) == 0:
+                        holding = pd.DataFrame(columns=["long_symbol", "quantity"]).astype({"quantity": float})
                     if len(holding) > 0:
                         try:
                             # Resolve long_symbol from mappings using Scripcode + Exchange
@@ -3253,14 +3342,37 @@ class Shoonya(BrokerBase):
                 {"row_count": len(scripcode)},
             )
 
+            def mapping_keys(exchange_val):
+                raw = (
+                    ""
+                    if exchange_val is None or (isinstance(exchange_val, float) and pd.isna(exchange_val))
+                    else str(exchange_val).strip()
+                )
+                if raw in self.exchange_mappings:
+                    return [raw]
+                up = raw.upper()
+                if up in self.exchange_mappings:
+                    return [up]
+                if not up:
+                    return list(self.exchange_mappings.keys())
+                keyed = [k for k in self.exchange_mappings if str(k).upper().startswith(up[0])]
+                return keyed if keyed else list(self.exchange_mappings.keys())
+
             def lookup(scripcode_val, exchange_val):
                 try:
-                    exch_map = self.exchange_mappings.get(exchange_val, {})
-                    rev = exch_map.get("symbol_map_reversed", {})
-                    code = int(scripcode_val) if scripcode_val is not None else None
+                    code = (
+                        int(float(scripcode_val))
+                        if scripcode_val is not None and not pd.isna(scripcode_val)
+                        else None
+                    )
                     if code is None:
                         return None
-                    return rev.get(code) or rev.get(scripcode_val)
+                    for key in mapping_keys(exchange_val):
+                        rev = self.exchange_mappings.get(key, {}).get("symbol_map_reversed", {})
+                        found = rev.get(code) or rev.get(scripcode_val)
+                        if found:
+                            return found
+                    return None
                 except (TypeError, ValueError, KeyError):
                     return None
 

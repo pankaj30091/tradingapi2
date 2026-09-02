@@ -25,6 +25,7 @@ import pandas as pd
 
 from . import trading_logger
 from .broker_base import BrokerBase
+from .config import get_market_close_time
 from .utils import (
     get_price_at_time,
     get_future_underlying_price,
@@ -52,6 +53,17 @@ _HISTORICAL_BROKER_REDIS_DB = 0
 # Unified IV cache: (symbol, time_key) -> iv. Price cache lives in utils.
 # ---------------------------------------------------------------------------
 _iv_cache: Dict[Tuple[str, str], float] = {}  # (symbol, time_key) -> iv
+
+
+def _market_close_datetime(date_str: str, symbol: str, exchange: str) -> dt.datetime:
+    close_time = get_market_close_time(
+        exchange=exchange, symbol=symbol, as_of=date_str
+    )
+    return dt.datetime.strptime(f"{date_str} {close_time}", "%Y%m%d %H:%M:%S")
+
+
+def _market_eod_datetime(date_str: str, symbol: str, exchange: str) -> dt.datetime:
+    return _market_close_datetime(date_str, symbol, exchange) - dt.timedelta(minutes=1)
 
 
 def _is_missing_number(value: Any) -> bool:
@@ -141,7 +153,7 @@ def get_historical_close_price(
             return None
 
     hist_broker = _get_historical_broker(broker)
-    eod_dt = dt.datetime.strptime(date_key + " 15:29:00", "%Y%m%d %H:%M:%S")
+    eod_dt = _market_eod_datetime(date_key, symbol, exchange)
     result = get_price_at_time(
         cast(BrokerBase, hist_broker), symbol, exchange, as_of=eod_dt, mds="mds", refresh_mapping=False
     )
@@ -321,7 +333,7 @@ def get_iv_for_symbol(
     try:
         if "_OPT_" in symbol:
             expiry_str = symbol.split("_")[2]
-            expiry_dt = dt.datetime.strptime(expiry_str + " 15:30:00", "%Y%m%d %H:%M:%S")
+            expiry_dt = _market_close_datetime(expiry_str, symbol, exchange)
             if time >= expiry_dt:
                 return 0.0
     except Exception:
@@ -813,8 +825,14 @@ def calculate_attribution_for_trade(
                 )
                 if len(prior_biz_date_str) == 10 and prior_biz_date_str[4] == "-":
                     prior_biz_date_str = prior_biz_date_str.replace("-", "")
-                entry_dt = dt.datetime.strptime(prior_biz_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
-            attribution_day_market_close = dt.datetime.strptime(attribution_date_str + " 15:30:00", "%Y%m%d %H:%M:%S")
+                entry_exchange = "BSE" if "SENSEX" in combo_symbol else "NSE"
+                entry_dt = _market_eod_datetime(
+                    prior_biz_date_str, combo_symbol, entry_exchange
+                )
+            attribution_exchange = "BSE" if "SENSEX" in combo_symbol else "NSE"
+            attribution_day_market_close = _market_close_datetime(
+                attribution_date_str, combo_symbol, attribution_exchange
+            )
             current_naive = get_naive_dt(current_time)
             current_dt = (
                 current_naive.to_pydatetime()
@@ -1204,7 +1222,7 @@ def mtm_entry_price(
 
         try:
             exchange = "BSE" if "SENSEX" in symbol else "NSE"
-            prior_eod_dt = dt.datetime.strptime(prior_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+            prior_eod_dt = _market_eod_datetime(prior_date_str, symbol, exchange)
 
             if "?" in symbol:
                 legs = parse_combo_symbol(symbol)
@@ -1273,7 +1291,7 @@ def mtm_exit_price(
         except ValueError:
             mtm_date_obj = None
 
-    mtm_date_1530 = mtm_date_str + " 15:30:00"
+    mtm_close_dt = _market_close_datetime(mtm_date_str, symbol, exchange)
     today = dt.date.today()
 
     if broker is None:
@@ -1286,8 +1304,7 @@ def mtm_exit_price(
     else:
         try:
             exit_time_dt = parse_datetime(exit_time_str)
-            mtm_date_dt = parse_datetime(mtm_date_1530)
-            use_mtm_exit = exit_time_dt > mtm_date_dt
+            use_mtm_exit = exit_time_dt > mtm_close_dt
         except (ValueError, TypeError):
             use_mtm_exit = False
 
@@ -1318,7 +1335,7 @@ def mtm_exit_price(
     if use_mtm_exit:
         if mtm_date_obj and mtm_date_obj == today:
             current_time = dt.datetime.now().time()
-            market_close_time = dt.time(15, 30, 0)
+            market_close_time = mtm_close_dt.time()
             if current_time < market_close_time:
                 try:
                     price = _combo_or_single_price(None, last=True)
@@ -1330,7 +1347,7 @@ def mtm_exit_price(
                     )
 
             try:
-                mtm_eod_dt = dt.datetime.strptime(mtm_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+                mtm_eod_dt = _market_eod_datetime(mtm_date_str, symbol, exchange)
                 mtm_price = _combo_or_single_price(mtm_eod_dt, last=False)
                 if mtm_price is not None:
                     return float(mtm_price)
@@ -1340,7 +1357,7 @@ def mtm_exit_price(
                 return entry_price
         else:
             try:
-                mtm_eod_dt = dt.datetime.strptime(mtm_date_str + " 15:29:00", "%Y%m%d %H:%M:%S")
+                mtm_eod_dt = _market_eod_datetime(mtm_date_str, symbol, exchange)
                 mtm_price = _combo_or_single_price(mtm_eod_dt, last=False)
                 if mtm_price is not None:
                     return float(mtm_price)

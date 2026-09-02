@@ -1,6 +1,28 @@
 # bhavcopy path  - this is the path where symbol files from brokers are saved
 bhavcopy_folder : /home/psharma/onedrive/rfiles/data/bhavcopy
 
+tz: "Asia/Kolkata"
+datapath: "/path/to/data"
+market_open_time: "09:15:00"
+market_close_time: "15:30:00" # Backward-compatible fallback
+market_hours:
+  - effective_date: "2026-08-03"
+    exchanges:
+      NSE:
+        CASH:
+          open_time: "09:15:00"
+          close_time: "15:35:00"
+        FNO:
+          open_time: "09:15:00"
+          close_time: "15:40:00"
+      BSE:
+        CASH:
+          open_time: "09:15:00"
+          close_time: "15:35:00"
+        FNO:
+          open_time: "09:15:00"
+          close_time: "15:40:00"
+
 # Optional: proxy for broker HTTP requests (e.g. connect, save_symbol_data).
 # USE_PROXY: trading API calls. USE_PROXY_SYMBOL_DOWNLOAD: symbol master download only.
 proxy:

@@ -99,7 +99,11 @@ from .broker_base import (
     is_broker_side_terminal_order,
     is_missing_exchange_order_id,
 )
-from .config import get_config
+from .config import (
+    get_config,
+    get_market_open_time,
+    is_within_market_hours,
+)
 from .utils import (
     delete_broker_order_id,
     get_price,
@@ -349,8 +353,11 @@ class FivePaisa(BrokerBase):
             self._fp_susertoken_path: Optional[str] = None
             self._fp_restore_session_from_token: Optional[Callable[[str], bool]] = None
             self._fp_fresh_login: Optional[Callable[[str], None]] = None
+            self._session_refresh_lock = threading.RLock()
+            self._session_generation = 0
             self._stream_reconnect_lock = threading.Lock()
             self._stream_reconnect_serial_lock = threading.Lock()
+            self._stream_subscriptions_lock = threading.Lock()
             self._stream_reconnect_active = False
             self._suppress_stream_reconnect = False
             self._last_stream_tick_ts = 0.0
@@ -696,7 +703,7 @@ class FivePaisa(BrokerBase):
                 trading_logger.log_error("Failed to restore session", e, {"broker": self.broker.name})
                 return False
 
-        def _fresh_login(susertoken_path):
+        def _fresh_login_unlocked(susertoken_path):
             """Perform fresh login with TOTP retry logic."""
             try:
                 trading_logger.log_info("Performing fresh login", {"broker": self.broker.name})
@@ -768,6 +775,49 @@ class FivePaisa(BrokerBase):
             except Exception as e:
                 context = create_error_context(susertoken_path=susertoken_path, error=str(e))
                 raise AuthenticationError(f"Error in _fresh_login: {str(e)}", context)
+
+        def _fresh_login(susertoken_path):
+            """Serialize session replacement locally and across processes using this account."""
+            with self._session_refresh_lock:
+                token_mtime_before = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                distributed_lock = None
+                lock_acquired = False
+                try:
+                    lock_redis = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+                    distributed_lock = lock_redis.lock(
+                        f"fivepaisa:session-refresh:{self.account_key}",
+                        timeout=300,
+                        blocking_timeout=310,
+                    )
+                    lock_acquired = bool(distributed_lock.acquire(blocking=True))
+                except Exception as e:
+                    trading_logger.log_warning(
+                        "Distributed FivePaisa session lock unavailable; using process-local lock",
+                        {"broker": self.broker.name, "error": str(e)},
+                    )
+
+                try:
+                    token_mtime_after = os.path.getmtime(susertoken_path) if os.path.exists(susertoken_path) else None
+                    token_was_refreshed = token_mtime_after is not None and (
+                        token_mtime_before is None or token_mtime_after > token_mtime_before
+                    )
+                    if lock_acquired and token_was_refreshed and _restore_session_from_token(susertoken_path):
+                        self._session_generation += 1
+                        trading_logger.log_info(
+                            "Reused session refreshed by another process",
+                            {"broker": self.broker.name},
+                        )
+                        return None
+
+                    result = _fresh_login_unlocked(susertoken_path)
+                    self._session_generation += 1
+                    return result
+                finally:
+                    if lock_acquired and distributed_lock is not None:
+                        try:
+                            distributed_lock.release()
+                        except Exception:
+                            pass
 
         self._fp_restore_session_from_token = _restore_session_from_token
         self._fp_fresh_login = _fresh_login
@@ -851,9 +901,11 @@ class FivePaisa(BrokerBase):
             except Exception as e:
                 trading_logger.log_warning("Failed to update symbology", {"error": str(e)})
 
-            # Get connected using robust session management
-            get_connected()
-            self._configure_api_proxy_session()
+            # Session replacement is single-flight for publishers sharing this broker instance.
+            with self._session_refresh_lock:
+                get_connected()
+                self._configure_api_proxy_session()
+                self._session_generation += 1
 
             # Set up Redis connection
             try:
@@ -2785,7 +2837,7 @@ class FivePaisa(BrokerBase):
         date_end=lambda x: _validate_datetime_input(x),
         exchange=lambda x: isinstance(x, str) and len(x.strip()) > 0,
         periodicity=lambda x: isinstance(x, str) and len(x.strip()) > 0,
-        market_close_time=lambda x: isinstance(x, str) and len(x.strip()) > 0,
+        market_close_time=lambda x: x is None or (isinstance(x, str) and len(x.strip()) > 0),
     )
     @retry_on_error(max_retries=2, delay=1.0, backoff_factor=2.0)
     def get_historical(
@@ -2795,8 +2847,8 @@ class FivePaisa(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
-        market_open_time: str = "09:15:00",
-        market_close_time: str = "15:30:00",
+        market_open_time: Optional[str] = None,
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -2809,7 +2861,8 @@ class FivePaisa(BrokerBase):
             date_end: End date (can be string, datetime, or date object).
             exchange: Exchange name. Defaults to "N".
             periodicity: Defaults to '1m'.
-            market_close_time: Defaults to '15:30:00'. Only historical data with timestamp less than market_close_time is returned.
+            market_open_time: Optional override; configured exchange/market open is used when omitted.
+            market_close_time: Optional override; configured exchange/market close is used when omitted.
             refresh_mapping: If True, load symbol mapping from date_end's symbols CSV file instead of using cached mapping.
                 Defaults to False.
 
@@ -2963,21 +3016,45 @@ class FivePaisa(BrokerBase):
                         )
                         continue
 
+                    def fetch_historical_data():
+                        api = self.api
+                        if api is None:
+                            raise BrokerConnectionError("API client not initialized")
+                        self._wait_for_historical_rate_limit()
+                        return api.historical_data(
+                            exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
+                        )
+
+                    session_generation = self._session_generation
                     data = None
                     first_error = None
                     try:
-                        if self.api is None:
-                            raise BrokerConnectionError("API client not initialized")
-                        self._wait_for_historical_rate_limit()
-                        data = self.api.historical_data(
-                            exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
-                        )
+                        data = fetch_historical_data()
                     except Exception as e:
                         first_error = e
 
+                    # py5paisa swallows all historical-data exceptions and returns None.
+                    # Retry once on the current session before treating it as a session failure.
+                    if data is None:
+                        trading_logger.log_info(
+                            "Historical API returned None; retrying current session once",
+                            {
+                                "symbol": row_outer["long_symbol"],
+                                "exch": exch,
+                                "exch_type": exch_type,
+                                "scripcode": row_outer["Scripcode"],
+                                "error": str(first_error) if first_error else None,
+                            },
+                        )
+                        try:
+                            data = fetch_historical_data()
+                            first_error = None
+                        except Exception as e:
+                            first_error = e
+
                     if first_error is not None or data is None:
                         trading_logger.log_info(
-                            "Historical API failed/None; reconnecting and retrying once",
+                            "Historical API failed after current-session retry; refreshing session once",
                             {
                                 "symbol": row_outer["long_symbol"],
                                 "exch": exch,
@@ -2997,13 +3074,14 @@ class FivePaisa(BrokerBase):
                             )
                             if redis_db is None:
                                 raise BrokerConnectionError("Redis DB unavailable for reconnect retry")
-                            self.connect(redis_db=int(redis_db))
+                            # Multiple publishers share this broker. Only the first failed
+                            # caller refreshes the session; queued callers reuse it.
+                            with self._session_refresh_lock:
+                                if self._session_generation == session_generation:
+                                    self.connect(redis_db=int(redis_db))
                             if self.api is None:
                                 raise BrokerConnectionError("API client not initialized after reconnect")
-                            self._wait_for_historical_rate_limit()
-                            data = self.api.historical_data(
-                                exch, exch_type, row_outer["Scripcode"], periodicity, date_start_str, date_end_str
-                            )
+                            data = fetch_historical_data()
                         except Exception as retry_error:
                             trading_logger.log_error(
                                 "Error fetching historical data from API after reconnect retry",
@@ -3033,11 +3111,16 @@ class FivePaisa(BrokerBase):
                             data["date"] = pd.to_datetime(data["date"])
                             data["date"] = data["date"].dt.tz_localize("Asia/Kolkata")
                             if "m" in periodicity:
-                                market_open = pd.to_datetime(market_open_time).time()
-                                market_close = pd.to_datetime(market_close_time).time()
-                                data = data[
-                                    (data["date"].dt.time >= market_open) & (data["date"].dt.time < market_close)
-                                ]
+                                in_session = data["date"].map(
+                                    lambda timestamp: is_within_market_hours(
+                                        timestamp,
+                                        exchange=exchange,
+                                        symbol=row_outer["long_symbol"],
+                                        market_open_time=market_open_time,
+                                        market_close_time=market_close_time,
+                                    )
+                                )
+                                data = data[in_session]
                             # Ensure date has time set to 00:00:00 for 'd', 'w', or 'm' periodicity
                             if any(period in periodicity for period in ["d"]):
                                 data["date"] = data["date"].dt.floor("D")
@@ -3371,12 +3454,19 @@ class FivePaisa(BrokerBase):
 
     @log_execution_time
     @validate_inputs(date_string=lambda x: isinstance(x, str) and len(x.strip()) > 0)
-    def convert_to_ist(self, date_string):
+    def convert_to_ist(
+        self,
+        date_string,
+        exchange: Optional[str] = None,
+        symbol: Optional[str] = None,
+    ):
         """
         Convert a string in the format '/Date(1732010010000)/' to IST date and time with enhanced error handling.
 
         Args:
             date_string: The string containing the date in /Date(milliseconds)/ format.
+            exchange: Optional exchange used for configured fallback time.
+            symbol: Optional long symbol used for configured fallback time.
 
         Returns:
             str: The corresponding date and time in IST (yyyy-mm-dd hh:mm:ss).
@@ -3392,24 +3482,37 @@ class FivePaisa(BrokerBase):
                 context = create_error_context(date_string=date_string, date_string_type=type(date_string))
                 raise ValidationError("Invalid date string", context)
 
+            def _stale_market_open_timestamp() -> str:
+                now_ist = get_tradingapi_now()
+                if now_ist.tzinfo is not None:
+                    now_ist = now_ist.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).replace(tzinfo=None)
+                market_open_value = get_market_open_time(
+                    exchange=exchange, symbol=symbol, as_of=now_ist
+                )
+                market_open = dt.datetime.combine(
+                    now_ist.date(),
+                    dt.datetime.strptime(market_open_value, "%H:%M:%S").time(),
+                )
+                return market_open.strftime("%Y-%m-%d %H:%M:%S")
+
             # Extract the timestamp using regex (allow negative for .NET min-date, treated as invalid)
             match = re.search(r"/Date\((-?\d+)\)/", date_string)
             if not match:
                 trading_logger.log_warning(
                     "Invalid date format", {"date_string": date_string, "expected_format": "/Date(milliseconds)/"}
                 )
-                return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
+                return _stale_market_open_timestamp()
 
             try:
                 # Convert the timestamp from milliseconds to seconds
                 timestamp_ms = int(match.group(1))
-                # Treat negative timestamps (e.g. .NET min date) as invalid; substitute current time
+                # Treat negative timestamps (e.g. .NET min date) as invalid; substitute market-open stale time
                 if timestamp_ms < 0:
                     trading_logger.log_info(
                         "Invalid date (negative timestamp)",
                         {"date_string": date_string, "expected_format": "/Date(milliseconds)/"},
                     )
-                    return get_tradingapi_now().strftime("%Y-%m-%d %H:%M:%S")
+                    return _stale_market_open_timestamp()
                 timestamp_s = timestamp_ms / 1000
 
                 # Convert to UTC datetime
@@ -3429,18 +3532,28 @@ class FivePaisa(BrokerBase):
                 return result
 
             except (ValueError, OverflowError) as e:
-                context = create_error_context(
-                    date_string=date_string,
-                    timestamp_ms=timestamp_ms if "timestamp_ms" in locals() else None,
-                    error=str(e),
+                trading_logger.log_warning(
+                    "Error converting timestamp; using market-open stale timestamp",
+                    {
+                        "date_string": date_string,
+                        "timestamp_ms": timestamp_ms if "timestamp_ms" in locals() else None,
+                        "error": str(e),
+                    },
                 )
-                raise DataError(f"Error converting timestamp: {str(e)}", context)
+                return _stale_market_open_timestamp()
 
         except (ValidationError, DataError):
-            raise
+            trading_logger.log_warning(
+                "Validation/data error converting timestamp; using market-open stale timestamp",
+                {"date_string": date_string},
+            )
+            return _stale_market_open_timestamp()
         except Exception as e:
-            context = create_error_context(date_string=date_string, error=str(e))
-            raise DataError(f"Unexpected error converting to IST: {str(e)}", context)
+            trading_logger.log_warning(
+                "Unexpected error converting timestamp; using market-open stale timestamp",
+                {"date_string": date_string, "error": str(e)},
+            )
+            return _stale_market_open_timestamp()
 
     @log_execution_time
     @validate_inputs(
@@ -3758,9 +3871,30 @@ class FivePaisa(BrokerBase):
                     price.symbol = resolved_symbol
                     price.exchange = self.map_exchange_for_db(price.symbol, resolved_exchange)
                     if json_data.get("TickDt"):
-                        price.timestamp = self.convert_to_ist(json_data["TickDt"])
+                        price.timestamp = self.convert_to_ist(
+                            json_data["TickDt"],
+                            exchange=resolved_exchange,
+                            symbol=resolved_symbol,
+                        )
                     else:
-                        price.timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        now_ist = get_tradingapi_now()
+                        if now_ist.tzinfo is not None:
+                            now_ist = now_ist.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).replace(
+                                tzinfo=None
+                            )
+                        market_open_value = get_market_open_time(
+                            exchange=resolved_exchange,
+                            symbol=resolved_symbol,
+                            as_of=now_ist,
+                        )
+                        price.timestamp = dt.datetime.combine(
+                            now_ist.date(),
+                            dt.datetime.strptime(
+                                market_open_value, "%H:%M:%S"
+                            ).time(),
+                        ).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
                     prices[resolved_symbol] = price
                     return price
                 except Exception as e:
@@ -3835,7 +3969,12 @@ class FivePaisa(BrokerBase):
                             {"close_status_code": close_status_code, "close_msg": close_msg},
                         )
                         return
-                    trading_logger.log_warning(
+                    log_close = (
+                        trading_logger.log_info
+                        if self._suppress_stream_reconnect
+                        else trading_logger.log_warning
+                    )
+                    log_close(
                         "WebSocket closed",
                         {"close_status_code": close_status_code, "close_msg": close_msg},
                     )
@@ -3939,9 +4078,13 @@ class FivePaisa(BrokerBase):
                     and is_ws_connected(ws)
                 )
 
-            def reconnect_stream():
+            def reconnect_stream() -> bool:
                 """Start a fresh websocket and restore all subscriptions."""
                 with self._stream_reconnect_serial_lock:
+                    # Another caller may have restored the stream while this caller
+                    # waited for the serial reconnect lock.
+                    if has_live_stream():
+                        return False
                     previous_tick_ts = self._last_stream_tick_ts
                     try:
                         self._suppress_stream_reconnect = True
@@ -3970,7 +4113,9 @@ class FivePaisa(BrokerBase):
                     # rejects streaming on a token-restored session — subscriptions are accepted
                     # but no ticks are ever delivered. fresh_fn gets a genuine new session.
                     fresh_fn(token_path)
-                    req_list_full = expand_symbols_to_request(self.subscribed_symbols)
+                    with self._stream_subscriptions_lock:
+                        subscribed_symbols = list(self.subscribed_symbols)
+                    req_list_full = expand_symbols_to_request(subscribed_symbols)
                     if not req_list_full:
                         context = create_error_context(operation=operation, symbols=symbols, exchange=exchange)
                         raise MarketDataError("No symbols to reconnect after socket closure", context)
@@ -3982,31 +4127,34 @@ class FivePaisa(BrokerBase):
                         copy.deepcopy(self.api.Request_Feed("oi", "s", oi_req_list_full))
                     ] if oi_req_list_full else []
                     reconnect_started_ts = time.time()
-                    self.subscribe_thread = threading.Thread(
+                    stream_thread = threading.Thread(
                         target=connect_and_receive,
                         args=(req_data_full, extra_req_data_full),
                         name="MarketDataStreamer",
                     )
-                    self.subscribe_thread.start()
-                    should_verify_ticks = previous_tick_ts > 0 and bool(self.subscribed_symbols)
-                    if should_verify_ticks:
-                        deadline = time.time() + _stream_reconnect_verify_timeout_secs
-                        while time.time() < deadline:
-                            if self._last_stream_tick_ts >= reconnect_started_ts:
-                                break
-                            if not has_live_stream():
-                                raise BrokerConnectionError("WebSocket thread died during reconnect verification")
-                            time.sleep(0.5)
-                        else:
+                    self.subscribe_thread = stream_thread
+                    stream_thread.start()
+                    should_verify_ticks = previous_tick_ts > 0 and bool(subscribed_symbols)
+                    deadline = time.time() + _stream_reconnect_verify_timeout_secs
+                    while time.time() < deadline:
+                        if should_verify_ticks and self._last_stream_tick_ts >= reconnect_started_ts:
+                            break
+                        if not should_verify_ticks and has_live_stream():
+                            break
+                        if not stream_thread.is_alive():
+                            raise BrokerConnectionError("WebSocket thread died during reconnect verification")
+                        time.sleep(0.1)
+                    else:
+                        if should_verify_ticks:
                             raise BrokerConnectionError(
                                 "WebSocket reconnected but remained silent after reconnect verification"
                             )
-                    else:
-                        time.sleep(2)
+                        raise BrokerConnectionError("WebSocket did not connect during reconnect verification")
                     trading_logger.log_info(
                         "Reconnected after socket closure",
-                        {"subscribed_count": len(self.subscribed_symbols), "verified_ticks": should_verify_ticks},
+                        {"subscribed_count": len(subscribed_symbols), "verified_ticks": should_verify_ticks},
                     )
+                    return True
 
             def send_stream_request(req_data):
                 """Send an incremental subscribe/unsubscribe over an existing websocket."""
@@ -4079,17 +4227,21 @@ class FivePaisa(BrokerBase):
             def update_current_subscriptions(operation, symbols):
                 """Update current subscriptions."""
                 try:
-                    if operation == "s":
-                        self.subscribed_symbols.extend(symbols)
-                        trading_logger.log_info(
-                            "Symbols subscribed", {"symbols": symbols, "total_subscribed": len(self.subscribed_symbols)}
-                        )
-                    elif operation == "u":
-                        self.subscribed_symbols = list(set(self.subscribed_symbols) - set(symbols))
-                        trading_logger.log_info(
-                            "Symbols unsubscribed",
-                            {"symbols": symbols, "total_subscribed": len(self.subscribed_symbols)},
-                        )
+                    with self._stream_subscriptions_lock:
+                        if operation == "s":
+                            self.subscribed_symbols = list(dict.fromkeys([*self.subscribed_symbols, *symbols]))
+                            message = "Symbols subscribed"
+                        else:
+                            removed_symbols = set(symbols)
+                            self.subscribed_symbols = [
+                                symbol for symbol in self.subscribed_symbols if symbol not in removed_symbols
+                            ]
+                            message = "Symbols unsubscribed"
+                        total_subscribed = len(self.subscribed_symbols)
+                    trading_logger.log_info(
+                        message,
+                        {"symbols": symbols, "total_subscribed": total_subscribed},
+                    )
                 except Exception as e:
                     trading_logger.log_error(
                         "Error updating subscriptions", e, {"operation": operation, "symbols": symbols}
@@ -4111,7 +4263,10 @@ class FivePaisa(BrokerBase):
                     if not has_live_stream():
                         # WS is dead — full reconnect restoring all subscribed_symbols (already updated above).
                         # Connecting with just the current op's req_data would lose all prior subscriptions.
-                        reconnect_stream()
+                        if not reconnect_stream():
+                            send_stream_request(req_data)
+                            if oi_req_data:
+                                send_stream_request(oi_req_data)
                     else:
                         trading_logger.log_info(
                             "Requesting streaming for existing connection", {"req_data": json.dumps(req_data)}
@@ -4125,8 +4280,10 @@ class FivePaisa(BrokerBase):
                                 "WebSocket closed, reconnecting...",
                                 {"operation": operation, "symbols_count": len(symbols), "exchange": exchange},
                             )
-                            reconnect_stream()
-                            # New connection already has full subscription; no need to send again
+                            if not reconnect_stream():
+                                send_stream_request(req_data)
+                                if oi_req_data:
+                                    send_stream_request(oi_req_data)
                 else:
                     trading_logger.log_warning(
                         "No valid request list generated", {"symbols": symbols, "req_list": req_list}

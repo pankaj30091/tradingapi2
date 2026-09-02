@@ -11,6 +11,7 @@ _BUILTIN_MARKET_DATA_EXCHANGES_BY_BROKER: dict[str, frozenset[str]] = {
     "DHAN": frozenset({"NSE", "BSE"}),
     "FIVEPAISA": frozenset({"NSE", "BSE", "MCX"}),
     "SHOONYA": frozenset({"NSE", "BSE", "MCX"}),
+    "INTERACTIVEBROKERS": frozenset({"US", "NSE"}),
 }
 
 _DEFAULT_UNKNOWN_BROKER_EXCHANGES: frozenset[str] = frozenset({"NSE", "BSE", "MCX"})

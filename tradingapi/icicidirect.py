@@ -43,7 +43,7 @@ from .broker_base import (
     Price,
     _normalize_as_of_date,
 )
-from .config import get_config
+from .config import get_config, is_within_market_hours
 from .utils import set_starting_internal_ids_int, update_order_status
 from .exceptions import (
     AuthenticationError,
@@ -493,6 +493,7 @@ class IciciDirect(BrokerBase):
             self._stream_raw_tick_count = 0
             self._stream_mapped_tick_count = 0
             self._stream_last_tick_preview: Dict[str, object] = {}
+            self._session_refresh_lock = threading.RLock()
             self._quote_rate_limit_lock = threading.Lock()
             self._last_quote_api_call_ts = 0.0
             self._quote_rate_limit_interval_secs = 1.0
@@ -766,10 +767,39 @@ class IciciDirect(BrokerBase):
             if not bool(config.get(f"{self.account_key}.SELENIUM_HEADLESS", True)):
                 token_command += " --no-headless"
 
-        command_token = self._get_session_token_from_command(token_command)
-        if command_token:
-            self._write_session_token_to_file(token_file_path, command_token)
-            return command_token
+        distributed_lock = None
+        lock_acquired = False
+        try:
+            lock_redis = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+            distributed_lock = lock_redis.lock(
+                f"icicidirect:session-refresh:{self.account_key}",
+                timeout=300,
+                blocking_timeout=310,
+            )
+            lock_acquired = bool(distributed_lock.acquire(blocking=True))
+        except Exception as e:
+            trading_logger.log_warning(
+                "Distributed ICICIDirect session lock unavailable; generating token without it",
+                {"broker": self.broker.name, "error": str(e)},
+            )
+
+        try:
+            # A process that waited for the lock should reuse the token just written
+            # by its predecessor instead of starting another browser/TOTP flow.
+            cached_token = self._read_session_token_from_file(token_file_path, max_age_hours=max_age_hours)
+            if cached_token:
+                return cached_token
+
+            command_token = self._get_session_token_from_command(token_command)
+            if command_token:
+                self._write_session_token_to_file(token_file_path, command_token)
+                return command_token
+        finally:
+            if lock_acquired and distributed_lock is not None:
+                try:
+                    distributed_lock.release()
+                except Exception:
+                    pass
 
         raise ConfigurationError(
             "Unable to resolve ICICIDIRECT session token non-interactively. Configure one of: "
@@ -811,38 +841,39 @@ class IciciDirect(BrokerBase):
 
         _prev_ipv6 = _temporarily_force_ipv4()
         try:
-            api_key = config.get(f"{self.account_key}.API_KEY")
-            api_secret = config.get(f"{self.account_key}.API_SECRET")
-            session_token = self._resolve_session_token()
+            with self._session_refresh_lock:
+                api_key = config.get(f"{self.account_key}.API_KEY")
+                api_secret = config.get(f"{self.account_key}.API_SECRET")
+                session_token = self._resolve_session_token()
 
-            if not api_key or not api_secret:
-                raise ConfigurationError(
-                    "Missing ICICIDIRECT credentials in config",
-                    create_error_context(
-                        api_key_present=bool(api_key),
-                        api_secret_present=bool(api_secret),
-                    ),
-                )
+                if not api_key or not api_secret:
+                    raise ConfigurationError(
+                        "Missing ICICIDIRECT credentials in config",
+                        create_error_context(
+                            api_key_present=bool(api_key),
+                            api_secret_present=bool(api_secret),
+                        ),
+                    )
 
-            self.api = BreezeConnect(api_key=api_key)
-            self.api.generate_session(api_secret=api_secret, session_token=session_token)
+                self.api = BreezeConnect(api_key=api_key)
+                self.api.generate_session(api_secret=api_secret, session_token=session_token)
 
-            # Validate session immediately and persist latest token in cache file when configured.
-            customer_details = self.api.get_customer_details(api_session=session_token)
-            if not isinstance(customer_details, dict):
-                raise AuthenticationError(
-                    "Unexpected response validating ICICIDirect session",
-                    create_error_context(response_type=str(type(customer_details))),
-                )
+                # Validate session immediately and persist latest token in cache file when configured.
+                customer_details = self.api.get_customer_details(api_session=session_token)
+                if not isinstance(customer_details, dict):
+                    raise AuthenticationError(
+                        "Unexpected response validating ICICIDirect session",
+                        create_error_context(response_type=str(type(customer_details))),
+                    )
 
-            if customer_details.get("Error"):
-                raise AuthenticationError(
-                    f"ICICIDirect authentication failed: {customer_details.get('Error')}",
-                    create_error_context(response=customer_details),
-                )
+                if customer_details.get("Error"):
+                    raise AuthenticationError(
+                        f"ICICIDirect authentication failed: {customer_details.get('Error')}",
+                        create_error_context(response=customer_details),
+                    )
 
-            token_file_path = config.get(f"{self.account_key}.USERTOKEN")
-            self._write_session_token_to_file(token_file_path, session_token)
+                token_file_path = config.get(f"{self.account_key}.USERTOKEN")
+                self._write_session_token_to_file(token_file_path, session_token)
 
             self.redis_o = redis.Redis(db=redis_db, encoding="utf-8", decode_responses=True)
             self.starting_order_ids_int = set_starting_internal_ids_int(self.redis_o)
@@ -1932,7 +1963,7 @@ class IciciDirect(BrokerBase):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
-        market_close_time: str = "15:30:00",
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -2024,6 +2055,18 @@ class IciciDirect(BrokerBase):
                         oi=int(float(row.get("open_interest", 0) or 0)),
                     )
                 )
+
+            if periodicity not in ("1d", "D"):
+                out = [
+                    row
+                    for row in out
+                    if is_within_market_hours(
+                        row.date,
+                        exchange=mapped_exchange,
+                        symbol=symbol,
+                        market_close_time=market_close_time,
+                    )
+                ]
 
             # For 1d periodicity, when date_end is today, update with today's OHLCV from intraday (like Shoonya).
             today_date = get_tradingapi_now().date()

@@ -1024,7 +1024,7 @@ class BrokerBase(ABC):
         date_end: Union[str, dt.datetime, dt.date] = get_tradingapi_now().strftime("%Y-%m-%d"),
         exchange: str = "N",
         periodicity: str = "1m",
-        market_close_time: str = "15:30:00",
+        market_close_time: Optional[str] = None,
         refresh_mapping: bool = False,
     ) -> Dict[str, List[HistoricalData]]:
         """
@@ -1036,7 +1036,7 @@ class BrokerBase(ABC):
             date_end: End date for historical data (can be string, datetime, or date object)
             exchange: Exchange name
             periodicity: Data periodicity
-            market_close_time: Market close time
+            market_close_time: Optional override; configuration is used when omitted
             refresh_mapping: If True, load symbol mapping from date_end's symbols CSV instead of cached mapping.
 
         Returns:

@@ -541,6 +541,159 @@ def get_config() -> Config:
     return cast(Config, _config_instance)
 
 
+_EXCHANGE_ALIASES = {
+    "N": "NSE",
+    "NSE": "NSE",
+    "NFO": "NSE",
+    "B": "BSE",
+    "BSE": "BSE",
+    "BFO": "BSE",
+}
+_FNO_EXCHANGES = {"NFO", "BFO"}
+
+
+def _market_hours_date(value: Any) -> dt.date:
+    if value is None:
+        return dt.date.today()
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    text = str(value).strip()[:10]
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid market-hours date: {value}")
+
+
+def _market_time_or_default(value: Any, default: str) -> str:
+    candidate = str(value or default)
+    try:
+        dt.datetime.strptime(candidate, "%H:%M:%S")
+        return candidate
+    except ValueError:
+        return default
+
+
+def _get_market_session_time(
+    time_key: str,
+    fallback_key: str,
+    default: str,
+    exchange: Optional[str] = None,
+    market: Optional[str] = None,
+    symbol: Optional[str] = None,
+    as_of: Any = None,
+) -> str:
+    cfg = get_config()
+    fallback = _market_time_or_default(cfg.get(fallback_key, default), default)
+    symbol_key = str(symbol or "").upper()
+    exchange_key = str(exchange or "").strip().upper()
+    if not exchange_key:
+        exchange_key = "BSE" if "SENSEX" in symbol_key else "NSE"
+    normalized_exchange = _EXCHANGE_ALIASES.get(exchange_key, exchange_key)
+    if market is None:
+        normalized_market = (
+            "FNO"
+            if exchange_key in _FNO_EXCHANGES or "_FUT_" in symbol_key or "_OPT_" in symbol_key
+            else "CASH"
+        )
+    else:
+        market_key = str(market).strip().upper()
+        normalized_market = (
+            "FNO"
+            if market_key in {"FNO", "FO", "DERIVATIVES", "DERIVATIVE"}
+            else market_key
+        )
+
+    try:
+        target_date = _market_hours_date(as_of)
+    except ValueError:
+        return fallback
+
+    schedules = cfg.get("market_hours", []) or []
+    if isinstance(schedules, dict):
+        schedules = schedules.get("schedules", []) or []
+    applicable = []
+    for schedule in schedules if isinstance(schedules, list) else []:
+        if not isinstance(schedule, dict) or not schedule.get("effective_date"):
+            continue
+        try:
+            effective_date = _market_hours_date(schedule["effective_date"])
+        except ValueError:
+            continue
+        if effective_date <= target_date:
+            applicable.append((effective_date, schedule))
+
+    for _, schedule in sorted(applicable, key=lambda item: item[0], reverse=True):
+        exchanges = schedule.get("exchanges") or {}
+        exchange_hours = exchanges.get(normalized_exchange) or exchanges.get("DEFAULT") or {}
+        market_hours = exchange_hours.get(normalized_market) or exchange_hours.get("DEFAULT") or {}
+        session_time = market_hours.get(time_key) if isinstance(market_hours, dict) else None
+        if session_time:
+            return _market_time_or_default(session_time, fallback)
+    return fallback
+
+
+def get_market_open_time(
+    exchange: Optional[str] = None,
+    market: Optional[str] = None,
+    symbol: Optional[str] = None,
+    as_of: Any = None,
+    default: str = "09:15:00",
+) -> str:
+    """Return the effective open time for an exchange and market."""
+    return _get_market_session_time(
+        "open_time",
+        "market_open_time",
+        default,
+        exchange=exchange,
+        market=market,
+        symbol=symbol,
+        as_of=as_of,
+    )
+
+
+def get_market_close_time(
+    exchange: Optional[str] = None,
+    market: Optional[str] = None,
+    symbol: Optional[str] = None,
+    as_of: Any = None,
+    default: str = "15:30:00",
+) -> str:
+    """Return the effective close time for an exchange and market."""
+    return _get_market_session_time(
+        "close_time",
+        "market_close_time",
+        default,
+        exchange=exchange,
+        market=market,
+        symbol=symbol,
+        as_of=as_of,
+    )
+
+
+def is_within_market_hours(
+    timestamp: dt.datetime,
+    exchange: Optional[str] = None,
+    market: Optional[str] = None,
+    symbol: Optional[str] = None,
+    market_open_time: Optional[str] = None,
+    market_close_time: Optional[str] = None,
+) -> bool:
+    """Return whether a timestamp is inside its effective trading session."""
+    open_time = market_open_time or get_market_open_time(
+        exchange=exchange, market=market, symbol=symbol, as_of=timestamp
+    )
+    close_time = market_close_time or get_market_close_time(
+        exchange=exchange, market=market, symbol=symbol, as_of=timestamp
+    )
+    open_t = dt.datetime.strptime(open_time, "%H:%M:%S").time()
+    close_t = dt.datetime.strptime(close_time, "%H:%M:%S").time()
+    return open_t <= timestamp.time() < close_t
+
+
 def get_fno_freeze_limit(broker_name: str, underlying: str) -> Optional[int]:
     """Return max contracts per FNO order for (broker, underlying).
 
