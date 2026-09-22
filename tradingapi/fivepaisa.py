@@ -2359,7 +2359,13 @@ class FivePaisa(BrokerBase):
                     return order_info
                 return self._apply_broker_side_terminal_resolution(order, order_info, message=reason or order.message)
 
-            def get_orderinfo_from_orders(exch_order_id: str, order: Order, broker_order_id: str) -> OrderInfo:
+            def get_orderinfo_from_orders(
+                exch_order_id: str,
+                order: Order,
+                broker_order_id: str,
+                *,
+                missing_as_cancelled: bool = False,
+            ) -> OrderInfo:
                 """Get order info from order book."""
                 try:
                     if self.api is None:
@@ -2533,7 +2539,7 @@ class FivePaisa(BrokerBase):
                         order_price=order.price,
                         fill_size=0,
                         fill_price=0,
-                        status=OrderStatus.UNDEFINED,
+                        status=OrderStatus.CANCELLED if missing_as_cancelled else OrderStatus.UNDEFINED,
                         broker_order_id=order.broker_order_id,
                         exchange_order_id=order.exch_order_id,
                         broker=self.broker,
@@ -2702,7 +2708,14 @@ class FivePaisa(BrokerBase):
                                 broker=self.broker,
                             )
                         else:
-                            return get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
+                            # No executions: if the order is also gone from the book,
+                            # it was cancelled/expired unfilled — not an open position.
+                            return get_orderinfo_from_orders(
+                                order.exch_order_id,
+                                order,
+                                broker_order_id,
+                                missing_as_cancelled=True,
+                            )
                     except Exception as e:
                         context = create_error_context(
                             broker_order_id=broker_order_id,

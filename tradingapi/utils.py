@@ -204,89 +204,57 @@ def publish_trades_to_redis(
         int: Number of trade rows published, or 0 if nothing was published.
     """
     try:
-        today = dt.date.today().strftime("%Y-%m-%d")
         trades = get_pnl_table(broker, strategy_name, refresh_status=True)
 
         if trades is None or trades.empty:
-            trading_logger.log_info(
-                f"No trades found for {strategy_name} to publish",
+            relevant_trades = empty_trades.copy()
+        else:
+            relevant_trades = trades
+            try:
+                if "entry_time" in trades.columns and "exit_time" in trades.columns:
+                    today_start = dt.datetime.combine(dt.date.today(), dt.time.min)
+                    today_end = dt.datetime.combine(dt.date.today(), dt.time.max)
+                    entry_today = safe_datetime_compare(trades.entry_time, today_start, ">=") & safe_datetime_compare(
+                        trades.entry_time, today_end, "<="
+                    )
+                    exit_today = safe_datetime_compare(trades.exit_time, today_start, ">=") & safe_datetime_compare(
+                        trades.exit_time, today_end, "<="
+                    )
+                    today_trades = entry_today | exit_today
+                    entry_before_today = safe_datetime_compare(trades.entry_time, today_start, "<")
+                    if "entry_quantity" in trades.columns and "exit_quantity" in trades.columns:
+                        has_open_position = trades["entry_quantity"] + trades["exit_quantity"] != 0
+                        exit_time_normalized = trades.exit_time.fillna("").astype(str).replace("NaT", "").replace("nan", "")
+                        exit_time_empty = (
+                            (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
+                        )
+                        still_open = has_open_position | exit_time_empty
+                    else:
+                        exit_time_normalized = trades.exit_time.fillna("").astype(str).replace("NaT", "").replace("nan", "")
+                        exit_time_empty = (
+                            (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
+                        )
+                        still_open = exit_time_empty
+                    relevant_trades = trades[today_trades | (entry_before_today & still_open)]
+            except Exception as e:
+                trading_logger.log_warning(
+                    f"Error filtering trades for {strategy_name}: {e}",
+                    {"strategy_name": strategy_name, "error": str(e)},
+                )
+                relevant_trades = trades
+            if relevant_trades is None or relevant_trades.empty:
+                relevant_trades = empty_trades.copy()
+
+        if not publish:
+            trading_logger.log_debug(
+                f"Skipping publish for {strategy_name} (publish=False)",
                 {"strategy_name": strategy_name},
             )
-            return 0
-
-        # Filter to relevant trades: today's trades + open positions from earlier days
-        # This matches the logic used by pnl_publisher._initial_load
-        relevant_trades = trades
-        try:
-            if "entry_time" in trades.columns and "exit_time" in trades.columns:
-                # Today's trades (entered or exited today)
-                # Use date boundaries for comparison (start of today to end of today)
-                today_start = dt.datetime.combine(dt.date.today(), dt.time.min)
-                today_end = dt.datetime.combine(dt.date.today(), dt.time.max)
-                entry_today = safe_datetime_compare(trades.entry_time, today_start, ">=") & safe_datetime_compare(
-                    trades.entry_time, today_end, "<="
-                )
-                exit_today = safe_datetime_compare(trades.exit_time, today_start, ">=") & safe_datetime_compare(
-                    trades.exit_time, today_end, "<="
-                )
-                today_trades = entry_today | exit_today
-
-                # Open trades from earlier days (entered before today, still have open position)
-                entry_before_today = safe_datetime_compare(trades.entry_time, today_start, "<")
-
-                # Check if position is still open
-                if "entry_quantity" in trades.columns and "exit_quantity" in trades.columns:
-                    # Primary check: actual open position quantity
-                    has_open_position = trades["entry_quantity"] + trades["exit_quantity"] != 0
-                    # Fallback check: exit_time status (empty string '', None, 0, or >= today)
-                    exit_time_normalized = trades.exit_time.fillna("").astype(str).replace("NaT", "").replace("nan", "")
-                    exit_time_empty = (
-                        (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
-                    )
-                    # A trade is still open if it has no exit recorded OR has open quantity
-                    # (don't consider trades with exit times as "still open", even if exit was today)
-                    exit_time_still_open = exit_time_empty
-                    still_open = has_open_position | exit_time_still_open
-                else:
-                    # Fallback if quantity columns missing
-                    exit_time_normalized = trades.exit_time.fillna("").astype(str).replace("NaT", "").replace("nan", "")
-                    exit_time_empty = (
-                        (exit_time_normalized == "") | (exit_time_normalized == "0") | (trades.exit_time == 0)
-                    )
-                    # A trade is still open if it has no exit recorded
-                    # (don't consider trades with exit times as "still open", even if exit was today)
-                    still_open = exit_time_empty
-
-                open_from_earlier = entry_before_today & still_open
-
-                # Combine: today's trades OR open trades from earlier days
-                relevant_mask = today_trades | open_from_earlier
-                relevant_trades = trades[relevant_mask]
-        except Exception as e:
-            trading_logger.log_warning(
-                f"Error filtering trades for {strategy_name}: {e}",
-                {"strategy_name": strategy_name, "error": str(e)},
-            )
-            relevant_trades = trades
-
-        if not publish or relevant_trades.empty:
-            if not publish:
-                trading_logger.log_debug(
-                    f"Skipping publish for {strategy_name} (publish=False)",
-                    {"strategy_name": strategy_name},
-                )
-                # Populate trades_out if provided
-                if trades_out is not None:
-                    trades_out.append(relevant_trades)
-            else:
-                trading_logger.log_info(
-                    f"No relevant trades to publish for {strategy_name} (relevant_trades is empty)",
-                    {"strategy_name": strategy_name, "today": today},
-                )
+            if trades_out is not None:
+                trades_out.append(relevant_trades)
             return 0
 
         publish_channel = channel or strategy_name
-
         try:
             pnl_json = relevant_trades.to_json(orient="split")
             broker.redis_o.publish(publish_channel, pnl_json)
@@ -793,6 +761,17 @@ def get_pnl_table(
                     # exit_keys empty - set defaults, don't skip trade
                     exit_quantity = 0
                     exit_price = 0.0
+
+                if entry_quantity == 0 and exit_quantity == 0:
+                    trading_logger.log_info(
+                        "Skipping unfilled order in P&L table",
+                        {
+                            "int_order_id": int_order_id,
+                            "strategy": strategy,
+                            "symbol": effective_symbol,
+                        },
+                    )
+                    continue
 
                 # Validate quantity consistency
                 if abs(exit_quantity) > abs(entry_quantity):
@@ -2176,10 +2155,12 @@ def update_order_status(
             # Broker confirmed terminal zero-fill — safe to prune.
             delete_broker_order_id(broker, internal_order_id, broker_order_id)
         else:
-            # UNDEFINED/OPEN/PENDING with fill_size=0 is often a failed/wrong-account
-            # lookup; never delete Redis state in that case.
+            # UNDEFINED/OPEN/PENDING with fill_size=0: do not delete (lookup can be
+            # wrong-account), but Redis order_size is not a fill — zero it so EOD
+            # MTM/expiry does not treat the working order as a position.
+            broker.redis_o.hset(broker_order_id, "quantity", "0")
             trading_logger.log_warning(
-                "EOD skip delete for ambiguous zero-fill order status",
+                "EOD skip delete for ambiguous zero-fill order status; quantity set to 0",
                 {
                     "internal_order_id": internal_order_id,
                     "broker_order_id": broker_order_id,

@@ -1119,7 +1119,8 @@ def fork_partial_trades_in_dataframe(pnl: pd.DataFrame, date_str: str) -> pd.Dat
     for idx, row in partial_trades.iterrows():
         entry_quantity = float(row["entry_quantity"])
         exit_quantity = float(row["exit_quantity"])
-        closed_quantity = -exit_quantity
+        # Closed size only; keeping original entry_quantity double-counts the open fork.
+        closed_entry_quantity = -exit_quantity
         open_quantity = entry_quantity + exit_quantity
 
         entry_keys_str = str(row.get("entry_keys", ""))
@@ -1138,7 +1139,8 @@ def fork_partial_trades_in_dataframe(pnl: pd.DataFrame, date_str: str) -> pd.Dat
         forked_entry_keys = [f"{ek}F{fork_num}" for ek in entry_keys] if entry_keys else []
 
         closed_row = row.copy()
-        closed_row["exit_quantity"] = closed_quantity
+        closed_row["entry_quantity"] = closed_entry_quantity
+        closed_row["exit_quantity"] = exit_quantity
         new_rows.append(closed_row)
 
         open_row = row.copy()
@@ -1155,7 +1157,9 @@ def fork_partial_trades_in_dataframe(pnl: pd.DataFrame, date_str: str) -> pd.Dat
         new_rows.append(open_row)
         rows_to_drop.append(idx)
         trading_logger.log_debug(
-            f"  Forked {row.get('int_order_id', 'unknown')}: closed_qty={closed_quantity}, open_qty={open_quantity}, fork_suffix=F{fork_num}"
+            f"  Forked {row.get('int_order_id', 'unknown')}: "
+            f"closed_entry={closed_entry_quantity}, exit={exit_quantity}, "
+            f"open_qty={open_quantity}, fork_suffix=F{fork_num}"
         )
 
     pnl = pnl.drop(index=rows_to_drop)
