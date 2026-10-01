@@ -4106,7 +4106,10 @@ def place_combo_order(
                 temp_order.is_stoploss_order = True
             trading_logger.log_info(f"{symbol} {exch} {slice_qty} {side} slice={idx}/{len(slices)}")
             if entry:
-                temp = transmit_entry_order(execution_broker, strategy, temp_order, paper=paper, mds=mds)
+                temp = transmit_entry_order(
+                    execution_broker, strategy, temp_order, paper=paper,
+                    price_broker=price_broker, mds=mds,
+                )
                 out[symbol] = temp
             else:
                 transmit_exit_order(
@@ -4115,6 +4118,7 @@ def place_combo_order(
                     temp_order,
                     validate_db_position,
                     paper=paper,
+                    price_broker=price_broker,
                     mds=mds,
                 )
             if idx < len(slices):
