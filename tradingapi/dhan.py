@@ -201,6 +201,8 @@ def _extract_dhan_error(response: Any) -> str:
 def _extract_dhan_error_details(response: Any) -> Dict[str, Any]:
     details: Dict[str, Any] = {
         "status": None,
+        "http_status": None,
+        "response_body": None,
         "error_code": None,
         "error_type": None,
         "error_message": None,
@@ -210,6 +212,8 @@ def _extract_dhan_error_details(response: Any) -> Dict[str, Any]:
         return details
 
     details["status"] = response.get("status")
+    details["http_status"] = response.get("http_status")
+    details["response_body"] = response.get("response_body")
     remarks = response.get("remarks")
     data = response.get("data")
 
@@ -231,6 +235,12 @@ def _extract_dhan_error_details(response: Any) -> Dict[str, Any]:
     if not details["error_message"]:
         details["error_message"] = _extract_dhan_error(response)
     return details
+
+
+def _is_dhan_auth_error(details: Dict[str, Any]) -> bool:
+    code = str(details.get("error_code") or "").upper()
+    error_type = str(details.get("error_type") or "").lower()
+    return code == "DH-901" or error_type == "invalid_authentication"
 
 
 def _symbol_supports_oi(long_symbol: str) -> bool:
@@ -595,7 +605,7 @@ class Dhan(BrokerBase):
             context = create_error_context(redis_db=redis_db, broker_name=self.account_key, error=str(e))
             raise BrokerConnectionError(f"Unexpected error connecting to Dhan: {str(e)}", context)
 
-    def _load_access_token(self) -> str:
+    def _load_access_token(self, force_refresh: bool = False) -> str:
         """
         Load access token from file, refreshing via TOTP if stale or missing.
 
@@ -603,11 +613,14 @@ class Dhan(BrokerBase):
         1. Token file exists and was written today → use it directly
         2. TOTP_TOKEN configured → do a fresh login and write to file
         3. ACCESS_TOKEN in config → use it as a last resort (no auto-refresh)
+
+        force_refresh skips the file and the static config token. A DH-901 means
+        today's file is already rejected, so only a new TOTP login is usable.
         """
         token_path = config.get(f"{self.account_key}.USERTOKEN")
 
         # Check if today's token is already on disk
-        if token_path and os.path.exists(token_path):
+        if not force_refresh and token_path and os.path.exists(token_path):
             mod_date = dt.datetime.fromtimestamp(os.path.getmtime(token_path)).date()
             if mod_date == dt.datetime.now().date():
                 with open(token_path, "r") as f:
@@ -625,6 +638,15 @@ class Dhan(BrokerBase):
             token = self._fresh_login_totp(client_id, pin, totp_token, token_path)
             if token:
                 return token
+            if force_refresh:
+                raise AuthenticationError(
+                    f"Dhan rejected the access token and TOTP login failed for {self.account_key}"
+                )
+
+        if force_refresh:
+            raise AuthenticationError(
+                f"Dhan rejected the access token for {self.account_key} and TOTP login is not configured"
+            )
 
         # Last resort: static token in config
         token = config.get(f"{self.account_key}.ACCESS_TOKEN")
@@ -638,8 +660,36 @@ class Dhan(BrokerBase):
         raise AuthenticationError(
             f"Could not obtain Dhan access token for {self.account_key}. Configure TOTP_TOKEN+PIN or ACCESS_TOKEN."
         )
-    
-    
+
+    def _refresh_access_token(self) -> None:
+        """Replace the live client after Dhan rejects the current access token."""
+        client_id = config.get(f"{self.account_key}.CLIENT_ID")
+        if not client_id:
+            raise AuthenticationError(f"{self.account_key}.CLIENT_ID not configured")
+        access_token = self._load_access_token(force_refresh=True)
+        self._stream_credentials = {"client_id": str(client_id), "access_token": str(access_token)}
+        self.api = dhanhq_sdk(client_id, access_token)
+        self._last_is_connected_result = None
+        self._last_is_connected_check_ts = 0.0
+        trading_logger.log_info("Refreshed Dhan access token", {"broker": self.account_key})
+
+    def _submit_order(self, payload: Dict[str, Any]) -> Any:
+        """Place one order. On DH-901, log in again and retry once."""
+        if self.api is None:
+            raise BrokerConnectionError("Dhan API client not initialized")
+        kwargs = {k: v for k, v in payload.items() if v is not None}
+        out = self.api.place_order(**kwargs)
+        if out and out.get("status") == "success":
+            return out
+        if _is_dhan_auth_error(_extract_dhan_error_details(out)):
+            trading_logger.log_warning(
+                "Dhan access token rejected; refreshing and retrying order",
+                {"broker": self.account_key, "response": out},
+            )
+            self._refresh_access_token()
+            out = self.api.place_order(**kwargs)
+        return out
+
     def _fresh_login_totp(self, client_id: str, pin: str, totp_secret: str, token_path: Optional[str]) -> Optional[str]:
         """
         Obtain a fresh Dhan access token using TOTP, mirroring FivePaisa's _fresh_login logic.
@@ -1085,7 +1135,11 @@ class Dhan(BrokerBase):
             "to_date": to_date,
         })
         response = self.api.session.post(url, headers=self.api.header, timeout=self.api.timeout, data=json.dumps(payload))
-        return self.api._parse_response(response)
+        parsed = self.api._parse_response(response)
+        if parsed.get("status") != "success":
+            parsed["http_status"] = response.status_code
+            parsed["response_body"] = response.text[:1000].strip()
+        return parsed
 
     def _persist_order_to_redis(self, order: Order, side_hint: Optional[str] = None) -> None:
         broker_order_id = str(getattr(order, "broker_order_id", "") or "").strip()
@@ -1266,10 +1320,7 @@ class Dhan(BrokerBase):
                         tag=order.internal_order_id[:20] if order.internal_order_id else None,
                     )
 
-                    if self.api is None:
-                        raise BrokerConnectionError("Dhan API client not initialized")
-
-                    out = self.api.place_order(**{k: v for k, v in payload.items() if v is not None})
+                    out = self._submit_order(payload)
                     trading_logger.log_info(
                         "Dhan place_order response",
                         {"response": json.dumps(out, default=str), "long_symbol": order.long_symbol},
