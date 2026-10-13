@@ -3931,6 +3931,7 @@ def place_combo_order(
     validate_db_position: bool = True,
     paper: bool = True,
     freeze_limit_lots: Optional[int] = None,
+    exit_int_order_id: str = "",
 ) -> dict[str, Any]:
     """Place a combo order with broker with enhanced error handling.
 
@@ -3946,6 +3947,7 @@ def place_combo_order(
         price_types: List of price types for each symbol
         validate_db_position: Whether to validate database position
         paper: Whether this is a paper trade
+        exit_int_order_id: Restrict all exit legs/slices to this internal order; empty uses FIFO.
 
     Returns:
         dict: Dictionary with symbol to internal order ID mapping
@@ -3972,6 +3974,10 @@ def place_combo_order(
         dict: for entry orders a dict containing symbol:int order id is returned. dict is empty for exit orders
     """
 
+    if exit_int_order_id and (
+        entry or not validate_db_position or not exit_int_order_id.startswith(f"{strategy}_")
+    ):
+        raise ValueError("exit_int_order_id requires a validated exit for the same strategy")
     if price_broker is None:
         price_broker = [execution_broker]
     if not isinstance(symbols, list):
@@ -4120,6 +4126,7 @@ def place_combo_order(
                     paper=paper,
                     price_broker=price_broker,
                     mds=mds,
+                    int_order_id=exit_int_order_id,
                 )
             if idx < len(slices):
                 time.sleep(5)

@@ -243,6 +243,10 @@ def _is_dhan_auth_error(details: Dict[str, Any]) -> bool:
     return code == "DH-901" or error_type == "invalid_authentication"
 
 
+def _is_dhan_no_data_error(details: Dict[str, Any]) -> bool:
+    return str(details.get("error_code") or "").upper() == "DH-907"
+
+
 def _symbol_supports_oi(long_symbol: str) -> bool:
     return "_FUT_" in long_symbol or "_OPT_" in long_symbol
 
@@ -1913,15 +1917,20 @@ class Dhan(BrokerBase):
                     historical_data_list.sort(key=lambda x: x.date)
                 else:
                     _hist_err = _extract_dhan_error_details(data)
-                    trading_logger.log_error(
-                        "No data from Dhan historical API",
-                        None,
-                        {
-                            "symbol": long_symbol,
-                            **_hist_err,
-                        },
-                    )
-                    self._audit_dhan_call("error", {
+                    _hist_context = {"symbol": long_symbol, **_hist_err}
+                    _is_no_data = _is_dhan_no_data_error(_hist_err)
+                    if _is_no_data:
+                        trading_logger.log_info(
+                            "No historical candles available from Dhan",
+                            _hist_context,
+                        )
+                    else:
+                        trading_logger.log_error(
+                            "No data from Dhan historical API",
+                            None,
+                            _hist_context,
+                        )
+                    self._audit_dhan_call("no_data" if _is_no_data else "error", {
                         "call_type": "historical",
                         "symbol": long_symbol,
                         "security_id": security_id,

@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from tradingapi.dhan import Dhan, _extract_dhan_error_details, _is_dhan_auth_error
+from tradingapi.dhan import (
+    Dhan,
+    _extract_dhan_error_details,
+    _is_dhan_auth_error,
+    _is_dhan_no_data_error,
+)
 
 
 class _Response:
@@ -43,6 +48,14 @@ def test_historical_failure_includes_http_diagnostics():
     details = _extract_dhan_error_details(result)
     assert details["http_status"] == 502
     assert details["response_body"] == "upstream unavailable"
+
+
+def test_dhan_907_is_expected_no_data():
+    details = _extract_dhan_error_details(
+        {"status": "failure", "remarks": {"error_code": "DH-907"}}
+    )
+
+    assert _is_dhan_no_data_error(details)
 
 
 def test_auth_error_refreshes_token_and_retries_order():
