@@ -964,6 +964,38 @@ def contains_earlier_date(
     return now > expiry_dt
 
 
+def _combo_leg_names(symbol_value: str) -> set:
+    """Leg names in a symbol. A combo uses every leg, not only the first."""
+    value = str(symbol_value or "").strip()
+    if not value:
+        return set()
+    if "?" not in value and ":" not in value:
+        return {value}
+    try:
+        return set(parse_combo_symbol(value).keys())
+    except Exception:
+        name = value.split(":", 1)[0].split("?", 1)[0].strip()
+        return {name} if name else set()
+
+
+def symbol_matches_order(requested_symbol: str, stored_symbol: str) -> bool:
+    """Match an exit request to a stored parent symbol.
+
+    A one-leg request may hit a combo that contains that leg.
+    A combo request matches only the same set of legs, so two strangles
+    that share one strike are not both closed.
+    """
+    if requested_symbol == stored_symbol:
+        return True
+    requested_legs = _combo_leg_names(requested_symbol)
+    stored_legs = _combo_leg_names(stored_symbol)
+    if not requested_legs or not stored_legs:
+        return False
+    if len(requested_legs) == 1:
+        return requested_legs <= stored_legs
+    return requested_legs == stored_legs
+
+
 @log_execution_time
 @validate_inputs(
     strategy=lambda x: isinstance(x, str) and len(x.strip()) > 0,
@@ -990,31 +1022,8 @@ def get_orders_by_symbol(broker, strategy: str, long_symbol: str, broker_entry_s
     try:
         int_order_ids = []
 
-        def _normalize_leg_symbol(symbol_value: str) -> str:
-            value = str(symbol_value or "").strip()
-            if not value:
-                return ""
-            if ":" in value:
-                value = value.split(":", 1)[0]
-            if "?" in value:
-                value = value.split("?", 1)[0]
-            return value.strip()
-
         def _symbol_matches(requested_symbol: str, stored_symbol: str) -> bool:
-            """Match exact symbols and allow single-leg lookup within combo parents."""
-            if requested_symbol == stored_symbol:
-                return True
-            requested_leg = _normalize_leg_symbol(requested_symbol)
-            stored_leg = _normalize_leg_symbol(stored_symbol)
-            if requested_leg and requested_leg == stored_leg:
-                return True
-            if "?" in stored_symbol:
-                try:
-                    combo_legs = parse_combo_symbol(stored_symbol)
-                    return requested_leg in combo_legs
-                except Exception:
-                    return False
-            return False
+            return symbol_matches_order(requested_symbol, stored_symbol)
 
         # Scan for internal order IDs
         try:
@@ -1903,7 +1912,9 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
             exit_keys.append(broker_key)
         new_orders = " ".join(exit_keys)
         cast(bool, broker.redis_o.hset(order.orderRef, "exit_keys", new_orders))
-        cast(bool, broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol))
+        existing_symbol = cast(str, broker.redis_o.hget(order.internal_order_id, "long_symbol") or "")
+        if not existing_symbol:
+            cast(bool, broker.redis_o.hset(order.internal_order_id, "long_symbol", long_symbol))
 
     broker.redis_o.hmset(str(order.broker_order_id), {key: str(val) for key, val in order.to_dict().items()})
     update_order_status(broker, order.internal_order_id, str(order.broker_order_id), eod=False)
@@ -4166,7 +4177,7 @@ def calculate_mtm(brokers: list[BrokerBase], pnl: pd.DataFrame, mds: Optional[st
                 exchange=exchange,
                 mds=mds,
             )
-            if all(not math.isnan(attr) for attr in [quote.bid, quote.ask]):
+            if all(not math.isnan(attr) and attr != 0 for attr in [quote.bid, quote.ask]):
                 mtm_price = (quote.bid + quote.ask) / 2
             else:
                 mtm_price = quote.last if not math.isnan(quote.last) else quote.prior_close
