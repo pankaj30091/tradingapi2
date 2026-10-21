@@ -1860,6 +1860,44 @@ class FlatTrade(BrokerBase):
                 )
         self._wait_for_market_data_rate_limit_local(self._historical_rate_limit_interval_secs)
 
+    def _get_time_price_series_with_retry(
+        self,
+        *,
+        exchange: str,
+        token: str,
+        starttime: float,
+        endtime: float,
+        interval: int,
+        symbol: str,
+    ) -> Optional[List]:
+        for attempt in range(1, 4):
+            if self.api is None:
+                raise BrokerConnectionError("API client not initialized")
+            try:
+                self._wait_for_historical_rate_limit()
+                return self.api.get_time_price_series(
+                    exchange=exchange,
+                    token=token,
+                    starttime=starttime,
+                    endtime=endtime,
+                    interval=interval,
+                )
+            except json.JSONDecodeError as error:
+                trading_logger.log_warning(
+                    "JSON decode error in get_time_price_series",
+                    {
+                        "long_symbol": symbol,
+                        "exchange": exchange,
+                        "attempt": attempt,
+                        "max_attempts": 3,
+                        "error": str(error),
+                    },
+                )
+                if attempt == 3:
+                    raise
+                time.sleep(0.4 * attempt)
+        return None
+
     def _wait_for_stream_request_rate_limit(self):
         limiter_redis = self._get_rate_limit_redis()
         if limiter_redis is not None:
@@ -1999,11 +2037,16 @@ class FlatTrade(BrokerBase):
             # Determine the format of symbols and create a DataFrame
             if isinstance(symbols, str):
                 exchange = self.map_exchange_for_api(symbols, exchange)
+                lookup_symbol = (
+                    "NIFTY_IND___"
+                    if periodicity == "1d" and symbols == "NSENIFTY_IND___"
+                    else symbols
+                )
                 # Use refresh_symbol_map if available, otherwise use default mapping
                 if refresh_symbol_map and exchange in refresh_symbol_map:
-                    scripCode = refresh_symbol_map[exchange].get(symbols)
+                    scripCode = refresh_symbol_map[exchange].get(lookup_symbol)
                 else:
-                    scripCode = self.exchange_mappings[exchange]["symbol_map"].get(symbols)
+                    scripCode = self.exchange_mappings[exchange]["symbol_map"].get(lookup_symbol)
                 if scripCode:
                     symbols_pd = pd.DataFrame([{"long_symbol": symbols, "Scripcode": scripCode}])
                 else:
@@ -2039,10 +2082,7 @@ class FlatTrade(BrokerBase):
                 resolved_market_open_time = market_open_time or get_market_open_time(
                     exchange=exchange, symbol=row_outer["long_symbol"], as_of=date_start
                 )
-                s = row_outer["long_symbol"].replace("/", "-")
-                row_outer["long_symbol"] = "NSENIFTY" + s[s.find("_") :] if s.startswith("NIFTY_") else s
-                # we do the above remapping for downloading permin data to database for legacy reasons.
-                # once NSENIFTY is amended to NIFTY in databae, we can remove this line.
+                row_outer["long_symbol"] = row_outer["long_symbol"].replace("/", "-")
 
                 # Parse date_start (accepts datetime, date, or string) -> datetime for API
                 date_start_parsed = None
@@ -2074,19 +2114,22 @@ class FlatTrade(BrokerBase):
                         raise BrokerConnectionError("API client not initialized")
                     data: Optional[List] = None
                     if periodicity.endswith("m"):
-                        self._wait_for_historical_rate_limit()
-                        data = self.api.get_time_price_series(
+                        data = self._get_time_price_series_with_retry(
                             exchange=exch,
                             token=str(row_outer["Scripcode"]),
                             starttime=date_start_dt.timestamp(),
                             endtime=date_end_dt.timestamp(),
                             interval=extract_number(periodicity),
+                            symbol=row_outer["long_symbol"],
                         )
                     elif periodicity == "1d":
-                        if row_outer["long_symbol"] == "NSENIFTY_IND___":
-                            row_outer["long_symbol"] = "NIFTY_IND___"
+                        lookup_symbol = (
+                            "NIFTY_IND___"
+                            if row_outer["long_symbol"] == "NSENIFTY_IND___"
+                            else row_outer["long_symbol"]
+                        )
                         trading_symbol = self.exchange_mappings[exchange]["tradingsymbol_map"].get(
-                            row_outer["long_symbol"]
+                            lookup_symbol
                         )
 
                         def _timeout_handler(signum, frame) -> None:
