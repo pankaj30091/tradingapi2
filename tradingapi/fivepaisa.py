@@ -298,6 +298,38 @@ def save_symbol_data(saveToFolder: bool = False):
         raise
 
 
+def _margin_float(row: Dict, key: str, default: float = 0.0) -> float:
+    try:
+        value = row.get(key, default)
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _cash_and_collateral_from_margin(row: Dict) -> tuple:
+    """Cash available plus collateral from a FivePaisa margin row.
+
+    Cash is ledger plus pay-in. Collateral is the larger of TotalCollateralValue
+    and mutual-fund collateral plus CollateralValueAfterHairCut. The total is
+    the figure that matches free margin plus margin already blocked.
+    """
+    if "Ledgerbalance" not in row:
+        raise KeyError("Ledgerbalance")
+    cash = _margin_float(row, "Ledgerbalance") + _margin_float(row, "FundsPayln")
+    split = _margin_float(row, "MFCollateralValueAfterHaircut") + _margin_float(
+        row, "CollateralValueAfterHairCut"
+    )
+    collateral = max(split, _margin_float(row, "TotalCollateralValue"))
+    if collateral <= 0.0:
+        for field in ("Collateral", "collateral", "CollateralValue", "collateral_value"):
+            collateral = _margin_float(row, field)
+            if collateral > 0.0:
+                break
+    return cash, collateral
+
+
 class FivePaisa(BrokerBase):
     """
     FivePaisa broker implementation with enhanced error handling and logging.
@@ -1207,26 +1239,10 @@ class FivePaisa(BrokerBase):
             if not margin_data or len(margin_data) == 0:
                 raise MarketDataError("No margin data available")
 
-            ledger_balance = float(margin_data[0]["Ledgerbalance"])
-            funds_payln = float(margin_data[0]["FundsPayln"])
-            cash = ledger_balance + funds_payln
-
-            # Get collateral value (FivePaisa has both MF and regular collateral)
-            collateral = 0.0
-            try:
-                mf_collateral = float(margin_data[0].get("MFCollateralValueAfterHaircut", 0))
-                regular_collateral = float(margin_data[0].get("CollateralValueAfterHairCut", 0))
-                collateral = mf_collateral + regular_collateral
-            except (ValueError, TypeError, KeyError):
-                # If specific fields not found, try alternative field names
-                collateral_fields = ["Collateral", "collateral", "CollateralValue", "collateral_value"]
-                for field in collateral_fields:
-                    if field in margin_data[0]:
-                        try:
-                            collateral = float(margin_data[0][field])
-                            break
-                        except (ValueError, TypeError):
-                            continue
+            row = margin_data[0]
+            cash, collateral = _cash_and_collateral_from_margin(row)
+            ledger_balance = float(row["Ledgerbalance"])
+            funds_payln = _margin_float(row, "FundsPayln")
 
             used = 0.0
             used_fields = [
