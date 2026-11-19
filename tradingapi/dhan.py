@@ -609,6 +609,17 @@ class Dhan(BrokerBase):
             context = create_error_context(redis_db=redis_db, broker_name=self.account_key, error=str(e))
             raise BrokerConnectionError(f"Unexpected error connecting to Dhan: {str(e)}", context)
 
+    def _read_todays_access_token(self, token_path: Optional[str]) -> Optional[str]:
+        """Return today's USERTOKEN contents, or None if missing/stale/empty."""
+        if not token_path or not os.path.exists(token_path):
+            return None
+        mod_date = dt.datetime.fromtimestamp(os.path.getmtime(token_path)).date()
+        if mod_date != dt.datetime.now().date():
+            return None
+        with open(token_path, "r") as f:
+            token = f.read().strip()
+        return token or None
+
     def _load_access_token(self, force_refresh: bool = False) -> str:
         """
         Load access token from file, refreshing via TOTP if stale or missing.
@@ -618,30 +629,67 @@ class Dhan(BrokerBase):
         2. TOTP_TOKEN configured → do a fresh login and write to file
         3. ACCESS_TOKEN in config → use it as a last resort (no auto-refresh)
 
-        force_refresh skips the file and the static config token. A DH-901 means
-        today's file is already rejected, so only a new TOTP login is usable.
+        Concurrent jobs share a Redis lock so only one process hits generateAccessToken;
+        losers re-read the file the winner wrote. force_refresh skips the file and the
+        static config token. A DH-901 means today's file is already rejected, so only a
+        new TOTP login is usable.
         """
         token_path = config.get(f"{self.account_key}.USERTOKEN")
 
-        # Check if today's token is already on disk
-        if not force_refresh and token_path and os.path.exists(token_path):
-            mod_date = dt.datetime.fromtimestamp(os.path.getmtime(token_path)).date()
-            if mod_date == dt.datetime.now().date():
-                with open(token_path, "r") as f:
-                    token = f.read().strip()
-                if token:
-                    trading_logger.log_info("Loaded today's token from file", {"broker": self.account_key})
-                    return token
+        if not force_refresh:
+            token = self._read_todays_access_token(token_path)
+            if token:
+                trading_logger.log_info("Loaded today's token from file", {"broker": self.account_key})
+                return token
 
-        # Try TOTP-based fresh login
         totp_token = config.get(f"{self.account_key}.TOTP_TOKEN")
         client_id = config.get(f"{self.account_key}.CLIENT_ID")
         pin = config.get(f"{self.account_key}.PIN")
 
         if totp_token and client_id and pin:
-            token = self._fresh_login_totp(client_id, pin, totp_token, token_path)
-            if token:
-                return token
+            distributed_lock = None
+            lock_acquired = False
+            try:
+                lock_redis = redis.Redis(db=0, encoding="utf-8", decode_responses=True)
+                distributed_lock = lock_redis.lock(
+                    f"dhan:totp-refresh:{self.account_key}",
+                    timeout=300,
+                    blocking_timeout=310,
+                )
+                lock_acquired = bool(distributed_lock.acquire(blocking=True))
+            except Exception as e:
+                trading_logger.log_warning(
+                    "Distributed Dhan TOTP lock unavailable; generating token without it",
+                    {"broker": self.account_key, "error": str(e)},
+                )
+
+            try:
+                # Winner may have written the file while we waited for the lock.
+                if not force_refresh:
+                    token = self._read_todays_access_token(token_path)
+                    if token:
+                        trading_logger.log_info(
+                            "Loaded today's token from file after lock wait",
+                            {"broker": self.account_key},
+                        )
+                        return token
+
+                token = self._fresh_login_totp(
+                    client_id,
+                    pin,
+                    totp_token,
+                    token_path,
+                    reuse_existing=not force_refresh,
+                )
+                if token:
+                    return token
+            finally:
+                if lock_acquired and distributed_lock is not None:
+                    try:
+                        distributed_lock.release()
+                    except Exception:
+                        pass
+
             if force_refresh:
                 raise AuthenticationError(
                     f"Dhan rejected the access token and TOTP login failed for {self.account_key}"
@@ -694,7 +742,14 @@ class Dhan(BrokerBase):
             out = self.api.place_order(**kwargs)
         return out
 
-    def _fresh_login_totp(self, client_id: str, pin: str, totp_secret: str, token_path: Optional[str]) -> Optional[str]:
+    def _fresh_login_totp(
+        self,
+        client_id: str,
+        pin: str,
+        totp_secret: str,
+        token_path: Optional[str],
+        reuse_existing: bool = True,
+    ) -> Optional[str]:
         """
         Obtain a fresh Dhan access token using TOTP, mirroring FivePaisa's _fresh_login logic.
 
@@ -703,7 +758,8 @@ class Dhan(BrokerBase):
             body: { dhanClientId, pin, totp }
 
         Retries up to 5 times with 40-second waits (same as FivePaisa) to handle
-        TOTP window boundaries.
+        TOTP window boundaries. On Dhan's 2-minute rate limit, prefers reusing a
+        token another process just wrote (unless reuse_existing is False).
         """
         import pyotp
 
@@ -741,8 +797,20 @@ class Dhan(BrokerBase):
                         "TOTP login returned no token",
                         {"attempt": attempt, "status_code": resp.status_code, "response": data},
                     )
+                    # Another process may already have minted today's token.
+                    if reuse_existing:
+                        reused = self._read_todays_access_token(token_path)
+                        if reused:
+                            trading_logger.log_info(
+                                "Reusing token written by another process after TOTP rate limit",
+                                {"broker": self.account_key, "attempt": attempt},
+                            )
+                            return reused
                     if attempt < max_attempts:
-                        time.sleep(40)
+                        msg = str((data or {}).get("message") or "").lower()
+                        # Dhan allows one generateAccessToken per client every 2 minutes.
+                        sleep_secs = 125 if "once every 2 minutes" in msg else 40
+                        time.sleep(sleep_secs)
 
             except Exception as e:
                 trading_logger.log_error(
