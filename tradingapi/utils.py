@@ -1163,7 +1163,7 @@ def get_open_position_by_order(
         """Helper function to get positions from broker order IDs."""
         try:
             for key in keys:
-                if not key:
+                if not key or str(key).strip() == "0":
                     trading_logger.log_warning(
                         "Empty key found in broker order IDs", {"int_order_id": int_order_id, "keys": keys}
                     )
@@ -1704,6 +1704,44 @@ def transmit_entry_order(
     return int_order_id
 
 
+def _get_confirmed_open_position_by_order(broker: BrokerBase, internal_order_id: str) -> Dict[str, Position]:
+    """Return a live order's net positions using only broker-confirmed fills.
+
+    Redis retains submitted order quantities so that working orders can be
+    managed.  Those quantities must never be used to construct a live exit.
+    """
+    positions: Dict[str, Position] = {}
+    order_mapping = cast(dict[str, Any], broker.redis_o.hgetall(internal_order_id))
+    for field in ("entry_keys", "exit_keys"):
+        for broker_order_id in str(order_mapping.get(field) or "").split():
+            if not broker_order_id or broker_order_id == "0":
+                continue
+            order_data = cast(dict[str, Any], broker.redis_o.hgetall(broker_order_id))
+            if not order_data:
+                continue
+            try:
+                order = Order(**order_data)
+                fills = broker.get_order_info(broker_order_id=broker_order_id, order=order)
+                fill_size = _order_info_fill_size(fills)
+            except Exception as exc:
+                trading_logger.log_error(
+                    "Skipping unconfirmed leg while preparing exit",
+                    exc,
+                    {"internal_order_id": internal_order_id, "broker_order_id": broker_order_id},
+                )
+                continue
+            if fill_size <= 0:
+                continue
+            position = positions.setdefault(order.long_symbol, Position())
+            position.symbol = order.long_symbol
+            signed_size = int(fill_size) if order.order_type in ("BUY", "COVER") else -int(fill_size)
+            fill_price = float(fills.fill_price or order.price or 0)
+            position.value += fill_price * signed_size
+            position.size += signed_size
+            position.price = position.value / position.size if position.size else 0
+    return {symbol: position for symbol, position in positions.items() if position.size}
+
+
 def transmit_exit_order(
     broker: BrokerBase,
     strategy: str,
@@ -1784,7 +1822,15 @@ def transmit_exit_order(
         for internal_order_id in exit_candidates:
             if any(quantities_remaining):
                 cancel_internal_order_id(broker, internal_order_id)
-                actual_positions = get_open_position_by_order(broker, internal_order_id)
+                # A stored entry quantity is an order quantity, not evidence of a
+                # fill.  In particular, a rejected leg of a combo may still be
+                # present in Redis until its status is refreshed.  Live exits
+                # must therefore be based only on broker-confirmed fills.
+                actual_positions = (
+                    _get_confirmed_open_position_by_order(broker, internal_order_id)
+                    if not paper
+                    else get_open_position_by_order(broker, internal_order_id)
+                )
                 loop_quantities_remaining = deepcopy(quantities_remaining)
                 for exit_symbol, quantity, price_type, additional_info, trigger_price in zip(
                     exit_symbols, loop_quantities_remaining, price_types, additional_infos, trigger_prices
@@ -1892,6 +1938,10 @@ def _process_broker_order_update(broker: BrokerBase, order: Order, long_symbol: 
         trading_logger.log_error(
             f"Order not placed for {order.long_symbol}. Status was {order.status}. Message was {order.message}. Mother symbol was: {long_symbol}"
         )
+        return ""
+
+    if str(order.broker_order_id or "").strip() in ("", "0"):
+        trading_logger.log_error(f"Cannot persist order with invalid broker ID: {order.internal_order_id}")
         return ""
 
     if order.order_type in ["BUY", "SHORT"]:

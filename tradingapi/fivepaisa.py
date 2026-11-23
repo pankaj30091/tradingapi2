@@ -401,6 +401,38 @@ class FivePaisa(BrokerBase):
             context = create_error_context(broker_type="FivePaisa", config_keys=list(kwargs.keys()), error=str(e))
             raise BrokerConnectionError(f"Failed to initialize FivePaisa broker: {str(e)}", context)
 
+    def _fetch_trade_info(self, requests_list):
+        """Validate the HTTP response before decoding trade information."""
+        from py5paisa.const import HEADERS
+
+        api = self.api
+        if api is None:
+            raise BrokerConnectionError("API client not initialized")
+        payload = {
+            "head": {"key": api.USER_KEY, "requestCode": "5PTrdInfo"},
+            "body": {"ClientCode": api.client_code, "TradeInformationList": requests_list},
+        }
+        headers = dict(HEADERS)
+        headers["Authorization"] = f"Bearer {api.access_token or api.Jwt_token}"
+        headers["5Paisa-API-Uid"] = api.APIUID
+        response = None
+        try:
+            response = api.session.post(api.TRADE_INFO_ROUTE, json=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            body = result.get("body") if isinstance(result, dict) else None
+            if not isinstance(body, dict) or not isinstance(body.get("TradeDetail"), list):
+                raise ValueError("Missing TradeDetail list")
+            return body
+        except (httpx.HTTPError, ValueError) as error:
+            trading_logger.log_warning(
+                "TradeInformation unavailable; falling back to OrderBook",
+                {"url": api.TRADE_INFO_ROUTE,
+                 "http_status": response.status_code if response is not None else None,
+                 "error_type": type(error).__name__},
+            )
+            return None
+
     def _configure_api_proxy_session(self, force_refresh: bool = False):
         try:
             if self.api is None or not hasattr(self.api, "session"):
@@ -1896,7 +1928,8 @@ class FivePaisa(BrokerBase):
                         order.price_type = new_price
                         order.quantity = new_quantity
                         order.price = new_price
-                        order.broker_order_id = str(out.get("BrokerOrderID", ""))
+                        response_id = str(out.get("BrokerOrderID") or "").strip()
+                        order.broker_order_id = response_id if response_id not in ("", "0") else str(broker_order_id)
 
                         # Get updated order info
                         try:
@@ -1910,7 +1943,7 @@ class FivePaisa(BrokerBase):
 
                         # Update broker order ID
                         try:
-                            self._update_broker_order_id(order.internal_order_id, broker_order_id, out["BrokerOrderID"])
+                            self._update_broker_order_id(order.internal_order_id, broker_order_id, order.broker_order_id)
                         except Exception as e:
                             trading_logger.log_warning(
                                 "Failed to update broker order ID",
@@ -2094,12 +2127,13 @@ class FivePaisa(BrokerBase):
 
                                 if out and "BrokerOrderID" in out:
                                     # Convert broker_order_id to string for consistency
-                                    order.broker_order_id = str(out["BrokerOrderID"])
+                                    response_id = str(out["BrokerOrderID"] or "").strip()
+                                    order.broker_order_id = response_id if response_id not in ("", "0") else str(broker_order_id)
 
                                     # Update broker order ID
                                     try:
                                         self._update_broker_order_id(
-                                            order.internal_order_id, broker_order_id, out["BrokerOrderID"]
+                                            order.internal_order_id, broker_order_id, order.broker_order_id
                                         )
                                     except Exception as e:
                                         trading_logger.log_warning(
@@ -2221,6 +2255,12 @@ class FivePaisa(BrokerBase):
             ValidationError: If parameters are invalid
             RedisError: If Redis operations fail
         """
+        old_broker_order_id = str(old_broker_order_id).strip()
+        new_broker_order_id = str(new_broker_order_id or "").strip()
+        if new_broker_order_id in ("", "0") or old_broker_order_id in ("", "0"):
+            raise ValidationError("Cannot remap an invalid broker order ID")
+        if old_broker_order_id == new_broker_order_id:
+            return
         try:
             trading_logger.log_debug(
                 "Updating broker order ID",
@@ -2243,8 +2283,8 @@ class FivePaisa(BrokerBase):
             new_exit_keys = None
 
             # Check if broker_order_id is in entry_keys
-            if entry_keys and str(old_broker_order_id) in entry_keys:
-                new_entry_keys = entry_keys.replace(str(old_broker_order_id), str(new_broker_order_id))
+            if entry_keys and old_broker_order_id in entry_keys.split():
+                new_entry_keys = " ".join(new_broker_order_id if k == old_broker_order_id else k for k in entry_keys.split())
                 trading_logger.log_debug(
                     "Found broker order ID in entry keys",
                     {
@@ -2261,8 +2301,8 @@ class FivePaisa(BrokerBase):
                     context = create_error_context(internal_order_id=internal_order_id, error=str(e))
                     raise RedisError(f"Failed to retrieve exit keys: {str(e)}", context)
 
-                if exit_keys and str(old_broker_order_id) in exit_keys:
-                    new_exit_keys = exit_keys.replace(str(old_broker_order_id), str(new_broker_order_id))
+                if exit_keys and old_broker_order_id in exit_keys.split():
+                    new_exit_keys = " ".join(new_broker_order_id if k == old_broker_order_id else k for k in exit_keys.split())
                     trading_logger.log_debug(
                         "Found broker order ID in exit keys",
                         {
@@ -2685,7 +2725,7 @@ class FivePaisa(BrokerBase):
                         ]
                         if self.api is None:
                             raise BrokerConnectionError("API client not initialized")
-                        trade_info = self.api.fetch_trade_info(req_list_)
+                        trade_info = self._fetch_trade_info(req_list_)
                         if trade_info is None:
                             return get_orderinfo_from_orders(order.exch_order_id, order, broker_order_id)
                         trade_details = cast(List[Dict[str, Any]], trade_info["TradeDetail"])
